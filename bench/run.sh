@@ -37,9 +37,11 @@ build() {
     cp "build/$ARCH/rel/em_echo" "$BIN/em-uring"
     (
         cd bench/rust
-        # glommio's bundled liburing needs struct open_how, which newer toolchains no longer pull in
-        export CFLAGS="${CFLAGS:-} -include linux/openat2.h"
-        cargo build --release --locked -p tokio_echo -p monoio_echo -p glommio_echo -p client >&2
+        local pkgs=(-p tokio_echo -p monoio_echo -p glommio_echo -p client)
+        # glommio's bundled liburing misses struct open_how with some headers (Fedora 44);
+        # on others (Ubuntu 24.04) forcing it in is a redefinition. Only add it when needed.
+        cargo build --release --locked "${pkgs[@]}" >&2 ||
+            CFLAGS="${CFLAGS:-} -include linux/openat2.h" cargo build --release --locked "${pkgs[@]}" >&2
         cp target/release/tokio_echo ../../$BIN/tokio-epoll
         cp target/release/monoio_echo ../../$BIN/monoio
         cp target/release/glommio_echo ../../$BIN/glommio-uring
