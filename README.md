@@ -33,8 +33,8 @@ Lý do đầy đủ nằm trong [DESIGN.md](DESIGN.md).
 
 ## Nguyên tắc thiết kế
 
-- **Chỉ Linux, chỉ io_uring**, kernel ≥ 6.1. Không fallback lặng lẽ sang epoll: io_uring
-  bị chặn (seccomp, sysctl) thì báo lỗi rõ ràng.
+- **Chỉ Linux**, backend chính io_uring (kernel ≥ 6.1). Backend epoll (M3.5) cho môi trường
+  chặn io_uring như seccomp mặc định của Docker/k8s. Chọn tường minh, không fallback lặng lẽ.
 - **Mỗi core một worker, fiber không bao giờ di chuyển giữa các core.** Rust không cần
   `Send`, TLS an toàn, cache tốt.
 - **Lệnh I/O nằm trên stack của fiber**, không cấp phát cho mỗi lệnh. Fiber chỉ chạy tiếp
