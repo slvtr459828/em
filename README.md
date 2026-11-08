@@ -71,6 +71,10 @@ qemu-user không giả lập io_uring nên không dùng được để test.
 Nếu `vm.max_map_count` thấp (mặc định 65530 trên Debian/Ubuntu), mỗi fiber tốn 2 vùng nhớ
 nên trần là khoảng 32 nghìn fiber. Muốn nhiều hơn thì tăng sysctl này.
 
+Trên một số kernel, bộ nhớ ring io_uring tính vào `RLIMIT_MEMLOCK` (theo UID, mặc định
+8 MiB). Mỗi worker tốn khoảng 40 KiB nên 8 MiB đủ cho khoảng 200 worker. Thiếu thì `em_run`
+trả `-ENOMEM`, khi đó tăng `ulimit -l`.
+
 ## Tài liệu
 
 - [DESIGN.md](DESIGN.md): các quyết định đã chốt, cái giá và điều kiện xét lại.

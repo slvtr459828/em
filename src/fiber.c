@@ -15,7 +15,13 @@
 
 #define FIBER_SZ ((sizeof(em_fiber) + 15u) & ~(size_t)15u)
 #define MAP_RESERVE 1024u /* VMAs left for libs, heap, etc. */
-#define RING_ENTRIES 4096u
+/* Ring memory counts against RLIMIT_MEMLOCK on some kernels (seen on 7.0), per
+ * UID, and is released asynchronously after close. Default limit is 8 MiB, so
+ * a ring must stay small: SQ 256 + CQ 1024 is ~40 KiB, ~200 workers per 8 MiB.
+ * SQ only bounds one submit batch; a full CQ overflows into the kernel's
+ * NODROP list (slower, still correct). Revisit with M5 benchmark numbers. */
+#define SQ_ENTRIES 256u
+#define CQ_ENTRIES 1024u
 
 #define W em_W
 __thread em_worker em_W;
@@ -277,9 +283,9 @@ static int worker_init(em_worker *w, struct em_rt *rt, int id)
     memset(&p, 0, sizeof p);
     p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
               IORING_SETUP_SUBMIT_ALL | IORING_SETUP_CQSIZE;
-    p.cq_entries = 2 * RING_ENTRIES;
-    int rc = io_uring_queue_init_params(RING_ENTRIES, &w->ring, &p);
-    if (rc < 0) { fprintf(stderr, "DEBUG worker %d: ring init %d\n", id, rc); return rc; }
+    p.cq_entries = CQ_ENTRIES;
+    int rc = io_uring_queue_init_params(SQ_ENTRIES, &w->ring, &p);
+    if (rc < 0) return rc;
     rt->slot[id].ring_fd = w->ring.ring_fd;
     return 0;
 }

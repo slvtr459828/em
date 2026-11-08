@@ -45,11 +45,15 @@ int main(void)
         run_seed = (uint64_t)run + 1;
         cancels = run % 4 != 3;
         int r = em_run(N, main_fn, NULL);
+        /* Closed rings release their RLIMIT_MEMLOCK charge asynchronously, so
+         * back-to-back em_run can briefly get -ENOMEM from ring setup (nothing
+         * else here can fail with it). A real server calls em_run once. */
+        for (int tries = 0; r == -ENOMEM && tries < 1000; tries++) {
+            usleep(1000);
+            r = em_run(N, main_fn, NULL);
+        }
         if (cancels ? r != -ECANCELED : r != 0 && r != -ECANCELED) { /* nobody fails */
             fprintf(stderr, "run %d (cancels=%d): em_run = %d\n", run, cancels, r);
-            usleep(200000); /* DEBUG: does the resource come back? */
-            fprintf(stderr, "retry after 200ms: em_run(1) = %d, em_run(%d) = %d\n",
-                    em_run(1, main_fn, NULL), N, em_run(N, main_fn, NULL));
             return 1;
         }
         cancelled += r == -ECANCELED;
