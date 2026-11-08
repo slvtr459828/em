@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <assert.h>
 #include <errno.h>
+#include <sched.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -18,8 +19,9 @@
 
 #define W em_W
 __thread em_worker em_W;
-size_t em_dbg_mmap_count;
-size_t em_dbg_munmap_count;
+_Atomic size_t em_dbg_mmap_count;
+_Atomic size_t em_dbg_munmap_count;
+size_t em_dbg_map_cap;
 size_t em_dbg_inflight(void) { return W.inflight; }
 
 extern void em_tramp(void);
@@ -71,16 +73,25 @@ static em_fiber *fiber_get(em_worker *w)
     if (f) {
         w->free = f->next;
     } else {
-        if (w->nmapped >= w->cap) return NULL;
+        /* Process-wide cap, reserved before mmap so concurrent workers can't
+         * overshoot it. Only this path (and fiber_unmap) touches the atomic. */
+        struct em_rt *rt = w->rt;
+        if (atomic_fetch_add(&rt->nmapped, 1) >= rt->cap) {
+            atomic_fetch_sub(&rt->nmapped, 1);
+            return NULL;
+        }
         char *base = mmap(NULL, EM_MAP_SIZE, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
-        if (base == MAP_FAILED) return NULL;
+        if (base == MAP_FAILED) {
+            atomic_fetch_sub(&rt->nmapped, 1);
+            return NULL;
+        }
         if (mprotect(base, EM_GUARD_SIZE, PROT_NONE) != 0) {
             munmap(base, EM_MAP_SIZE);
+            atomic_fetch_sub(&rt->nmapped, 1);
             return NULL;
         }
         em_dbg_mmap_count++;
-        w->nmapped++;
         f = (em_fiber *)(base + EM_MAP_SIZE - FIBER_SZ);
     }
 #ifdef __SANITIZE_ADDRESS__
@@ -209,20 +220,58 @@ static size_t read_max_map_count(void)
     return v;
 }
 
-static void fiber_unmap(em_fiber *f)
+static void fiber_unmap(em_worker *w, em_fiber *f)
 {
 #ifdef __SANITIZE_ADDRESS__
     __asan_unpoison_memory_region(f->bottom, f->size); /* don't leave stale redzones for the next mapping */
 #endif
     munmap(map_base(f), EM_MAP_SIZE);
+    atomic_fetch_sub(&w->rt->nmapped, 1);
     em_dbg_munmap_count++;
 }
 
-int em_run(int (*main_fn)(void *), void *arg)
+int em_worker_id(void) { return W.id; }
+int em_worker_count(void) { return W.rt ? W.rt->n : 0; }
+
+/* ---- cross-worker cancel -------------------------------------------------
+ * A msg_ring SQE posts a CQE (user_data EM_MSG_CANCEL) straight into the target
+ * worker's ring; the target cancels its root when it reaps it (io.c).
+ * Target rings stay open until EVERY worker has finished (see worker_main), so
+ * ring_fd[k] is always a valid ring here: a worker that already finished its
+ * root just never looks at the CQE, and ring teardown discards it. */
+static void cancel_others(em_worker *w)
+{
+    struct em_rt *rt = w->rt;
+    for (int k = 0; k < rt->n; k++) {
+        if (k == w->id) continue;
+        struct io_uring_sqe *sqe = em_sqe_get(w);
+        io_uring_prep_msg_ring(sqe, rt->slot[k].ring_fd, 0, EM_MSG_CANCEL, 0);
+        io_uring_sqe_set_data64(sqe, EM_MSG_SENT);
+        w->msg_inflight++;
+    }
+    em_io_submit(w); /* now, not at the next reap: the caller may run for a long time or exit */
+}
+
+void em_cancel_all(void)
 {
     em_worker *w = &W;
-    if (w->cap) return -EBUSY; /* nested em_run from inside a fiber */
+    if (!w->rt) return;
+    cancel_others(w);
+    em_scope_cancel_all(w, w->root);
+}
+
+/* ---- worker lifecycle ---------------------------------------------------- */
+
+static int worker_init(em_worker *w, struct em_rt *rt, int id)
+{
     memset(w, 0, sizeof *w);
+    w->rt = rt;
+    w->id = id;
+
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(rt->slot[id].cpu, &one);
+    if (sched_setaffinity(0, sizeof one, &one) != 0) return -errno;
 
     struct io_uring_params p;
     memset(&p, 0, sizeof p);
@@ -231,13 +280,36 @@ int em_run(int (*main_fn)(void *), void *arg)
     p.cq_entries = 2 * RING_ENTRIES;
     int rc = io_uring_queue_init_params(RING_ENTRIES, &w->ring, &p);
     if (rc < 0) return rc;
+    rt->slot[id].ring_fd = w->ring.ring_fd;
+    return 0;
+}
 
-    size_t m = read_max_map_count();
-    w->cap = m > MAP_RESERVE ? (m - MAP_RESERVE) / 2 : 0; /* 2 VMAs per fiber */
+static void worker_exit(em_worker *w, int ring_ok)
+{
+    while (w->free) {
+        em_fiber *f = w->free;
+        w->free = f->next;
+        fiber_unmap(w, f);
+    }
+    if (ring_ok) io_uring_queue_exit(&w->ring);
+    w->rt = NULL;
+}
 
+/* The first error in time wins; whoever wins tells everyone else to stop. */
+static void publish_result(em_worker *w, int r)
+{
+    int none = 0;
+    if (r && atomic_compare_exchange_strong(&w->rt->first_err, &none, r)) cancel_others(w);
+}
+
+/* Scheduler loop of one worker, then the shutdown handshake. */
+static void worker_main(em_worker *w)
+{
+    struct em_rt *rt = w->rt;
     em_scope root = {0};
+    w->root = &root;
     int deadlocked = 0;
-    rc = em_spawn(&root, main_fn, arg);
+    int rc = em_spawn(&root, rt->main_fn, rt->arg);
     while (rc == 0) {
         em_fiber *f;
         while ((f = rq_pop(w))) {
@@ -264,12 +336,117 @@ int em_run(int (*main_fn)(void *), void *arg)
         }
         em_io_reap(w);
     }
-    while (w->free) {
-        em_fiber *f = w->free;
-        w->free = f->next;
-        fiber_unmap(f);
+    publish_result(w, deadlocked ? -EDEADLK : rc ? rc : root.first_err ? root.first_err :
+                      root.cancelled ? -ECANCELED : 0);
+    /* Our msg_ring SQEs must complete before the ring can go away, and no ring
+     * may go away before every sender is past this point (below). */
+    while (w->msg_inflight) em_io_reap(w);
+    w->root = NULL;
+}
+
+static void sem_wait_n(sem_t *s, int n)
+{
+    while (n > 0) {
+        if (sem_wait(s) == 0) n--;
+        else assert(errno == EINTR);
     }
-    io_uring_queue_exit(&w->ring);
-    w->cap = 0;
-    return deadlocked ? -EDEADLK : rc ? rc : root.first_err;
+}
+
+static void sem_post_n(sem_t *s, int n)
+{
+    while (n-- > 0) {
+        int r = sem_post(s);
+        assert(r == 0);
+        (void)r;
+    }
+}
+
+static void note_error(struct em_rt *rt, int e)
+{
+    int none = 0;
+    atomic_compare_exchange_strong(&rt->first_err, &none, e);
+}
+
+static void *worker_thread(void *p)
+{
+    struct em_slot *s = p;
+    struct em_rt *rt = s->rt;
+    em_worker *w = &W;
+    int e = worker_init(w, rt, s->id);
+    if (e) note_error(rt, e);
+    sem_post_n(&rt->up, 1);   /* ready */
+    sem_wait_n(&rt->go, 1); /* go (or abort) */
+    if (!rt->abort) {
+        worker_main(w);
+        sem_post_n(&rt->up, 1);   /* finished: my ring may now be closed */
+        sem_wait_n(&rt->release, 1); /* every worker has finished */
+    }
+    worker_exit(w, e == 0);
+    return NULL;
+}
+
+/* k-th (wrapping) CPU of the allowed set */
+static int nth_cpu(const cpu_set_t *set, int k)
+{
+    k %= CPU_COUNT(set);
+    for (int c = 0;; c++)
+        if (CPU_ISSET(c, set) && k-- == 0) return c;
+}
+
+int em_run(int nworkers, int (*main_fn)(void *), void *arg)
+{
+    em_worker *w = &W;
+    if (w->rt) return -EBUSY; /* nested em_run from inside a worker */
+    if (nworkers < 0) return -EINVAL;
+
+    cpu_set_t orig;
+    if (sched_getaffinity(0, sizeof orig, &orig) != 0) return -errno;
+    int n = nworkers ? nworkers : CPU_COUNT(&orig);
+
+    struct em_rt *rt = calloc(1, sizeof *rt + (size_t)n * sizeof rt->slot[0]);
+    if (!rt) return -ENOMEM;
+    if (sem_init(&rt->up, 0, 0) != 0 || sem_init(&rt->go, 0, 0) != 0 ||
+        sem_init(&rt->release, 0, 0) != 0) {
+        int e = -errno;
+        free(rt);
+        return e;
+    }
+    rt->n = n;
+    rt->main_fn = main_fn;
+    rt->arg = arg;
+    size_t m = read_max_map_count();
+    rt->cap = em_dbg_map_cap ? em_dbg_map_cap
+                             : m > MAP_RESERVE ? (m - MAP_RESERVE) / 2 : 0; /* 2 VMAs per fiber */
+    for (int i = 0; i < n; i++) {
+        rt->slot[i] = (struct em_slot){ .rt = rt, .id = i, .cpu = nth_cpu(&orig, i) };
+    }
+
+    /* Threads first, so they inherit the caller's mask and signal mask. */
+    int started = 0;
+    for (int i = 1; i < n; i++) {
+        int e = pthread_create(&rt->slot[i].th, NULL, worker_thread, &rt->slot[i]);
+        if (e) { note_error(rt, -e); break; }
+        started++;
+    }
+
+    int e0 = worker_init(w, rt, 0);
+    if (e0) note_error(rt, e0);
+    sem_wait_n(&rt->up, started); /* every ring exists and is published */
+    rt->abort = atomic_load(&rt->first_err) != 0;
+    sem_post_n(&rt->go, started);
+    if (!rt->abort) {
+        worker_main(w);
+        sem_wait_n(&rt->up, started); /* everyone finished, nobody will send any more */
+        sem_post_n(&rt->release, started);
+    }
+    worker_exit(w, e0 == 0);
+    for (int i = 1; i <= started; i++) pthread_join(rt->slot[i].th, NULL);
+
+    if (sched_setaffinity(0, sizeof orig, &orig) != 0) note_error(rt, -errno);
+    int r = atomic_load(&rt->first_err);
+    sem_destroy(&rt->up);
+    sem_destroy(&rt->go);
+    sem_destroy(&rt->release);
+    free(rt);
+    return r;
 }

@@ -22,18 +22,31 @@ struct em_scope {
     em_fiber *owner;       /* fiber that opened it (LIFO check) */
 };
 
-/* Runs main_fn as the first fiber, in the root scope, on the calling thread.
- * Returns the root scope's result (0, or the first nonzero fiber result);
- * -EDEADLK if a deadlock was detected (even if every fiber unwound cleanly);
- * -EBUSY if called from inside a fiber; -ENOMEM if the first fiber cannot be
- * created. If the io_uring ring cannot be created the kernel error is returned
- * and nothing runs, no fallback:
+/* Runs main_fn as the first fiber of EVERY worker (one app copy per core).
+ * nworkers = 0: the number of CPUs this process may run on (sched_getaffinity).
+ * The calling thread is worker 0; nworkers-1 more threads are created. Worker i
+ * is pinned to the i-th allowed CPU; with more workers than allowed CPUs the
+ * assignment wraps round-robin. The caller's affinity is restored on return.
+ * The whole process is one scope: when any worker's root ends with an error,
+ * every other root is cancelled.
+ * Returns 0, or the first error in time across workers (a worker whose root
+ * was cancelled by em_cancel_all and had no other error reports -ECANCELED;
+ * a deadlocked worker reports -EDEADLK, even if its fibers unwound cleanly);
+ * -EBUSY if called from inside a worker; -EINVAL if nworkers < 0; -ENOMEM if a
+ * first fiber cannot be created. If a ring cannot be created the kernel error
+ * is returned and nothing runs, no fallback:
  *   -EPERM   kernel.io_uring_disabled sysctl or seccomp policy,
  *   -ENOSYS  kernel or seccomp has no io_uring,
  *   -EINVAL  kernel < 6.1 (does not know the setup flags). */
-int       em_run(int (*main_fn)(void *), void *arg);
+int       em_run(int nworkers, int (*main_fn)(void *), void *arg);
+/* Valid only inside em_run (0 / 0 outside). */
+int       em_worker_id(void);
+int       em_worker_count(void);
+/* Cancels the root scope of every worker (graceful shutdown). Callable from any
+ * fiber; a no-op outside em_run. */
+void      em_cancel_all(void);
 
-/* Valid only inside em_run. 0 or -ENOMEM (map cap reached / mmap failed).
+/* Valid only inside em_run. 0 or -ENOMEM (process-wide map cap reached / mmap failed).
  * The fiber belongs to scope s until it returns; a nonzero return cancels s. */
 int       em_spawn(em_scope *s, int (*fn)(void *), void *arg);
 void      em_yield(void);
@@ -64,9 +77,18 @@ int       em_tcp_listen(const struct sockaddr *a, socklen_t n, int backlog);
 int       em_accept(int lfd);
 int       em_connect(const struct sockaddr *a, socklen_t n);
 ssize_t   em_recv(int fd, void *buf, size_t len);        /* 0 = EOF */
+ssize_t   em_read(int fd, void *buf, size_t len);        /* any fd (signalfd, eventfd, pipe) */
 ssize_t   em_send(int fd, const void *buf, size_t len);  /* may send less */
 int       em_send_all(int fd, const void *buf, size_t len);
 int       em_shutdown(int fd, int how);
+/* UDP socket bound to a. SO_REUSEPORT is set unless the port is 0 (client
+ * socket: an ephemeral port must stay unique, or replies would be spread over
+ * sockets that share it). */
+int       em_udp_bind(const struct sockaddr *a, socklen_t n);
+/* src/srclen may be NULL. *srclen is the capacity on entry, the address length
+ * on return. A datagram longer than len is truncated. */
+ssize_t   em_recvfrom(int fd, void *buf, size_t len, struct sockaddr *src, socklen_t *srclen);
+ssize_t   em_sendto(int fd, const void *buf, size_t len, const struct sockaddr *dst, socklen_t n);
 /* Cancels other fibers' ops on fd (they get -ECANCELED), then closes. Not
  * cancellable itself: always closes fd. */
 int       em_close(int fd);

@@ -20,7 +20,7 @@ static int main_fn(void *arg)
 
 int main(void)
 {
-    assert(em_run(main_fn, NULL) == -EDEADLK);
+    assert(em_run(1, main_fn, NULL) == -EDEADLK);
     printf("deadlock: em_run returned -EDEADLK\n");
     return 0;
 }

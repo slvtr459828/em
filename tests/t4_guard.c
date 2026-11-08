@@ -34,7 +34,7 @@ int main(void)
     if (pid == 0) {
         setrlimit(RLIMIT_CORE, &(struct rlimit){0, 0}); /* no core file (qemu writes one into cwd) */
         if (!freopen("/dev/null", "w", stderr)) _exit(2); /* mute the expected ASan report */
-        em_run(main_fn, NULL);
+        em_run(1, main_fn, NULL);
         _exit(0); /* reached only if overflow went undetected */
     }
     int st;

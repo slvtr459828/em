@@ -105,7 +105,7 @@ int main(void)
     getrlimit(RLIMIT_NOFILE, &rl);
     rl.rlim_cur = rl.rlim_max; /* 2 fds per connection */
     setrlimit(RLIMIT_NOFILE, &rl);
-    assert(em_run(main_fn, NULL) == 0);
+    assert(em_run(1, main_fn, NULL) == 0);
     assert(done_clients == NCONN);
     printf("echo: %d connections x %u bytes verified\n", NCONN, BYTES);
     return 0;

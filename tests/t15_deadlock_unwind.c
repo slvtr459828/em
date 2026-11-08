@@ -45,12 +45,12 @@ static int main_stuck(void *arg)
 
 int main(void)
 {
-    assert(em_run(main_clean, NULL) == -EDEADLK);
+    assert(em_run(1, main_clean, NULL) == -EDEADLK);
     for (int i = 0; i < 3; i++) assert(woke_res[i] == -ECANCELED);
     assert(em_dbg_mmap_count == em_dbg_munmap_count);
     printf("deadlock unwind: %zu mmaps == %zu munmaps\n", em_dbg_mmap_count, em_dbg_munmap_count);
 
-    assert(em_run(main_stuck, NULL) == -EDEADLK);
+    assert(em_run(1, main_stuck, NULL) == -EDEADLK);
     assert(em_dbg_mmap_count == em_dbg_munmap_count);
     printf("deadlock re-park: %zu mmaps == %zu munmaps\n", em_dbg_mmap_count, em_dbg_munmap_count);
     return 0;

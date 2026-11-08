@@ -42,7 +42,7 @@ int main(void)
     assert(pid >= 0);
     if (pid == 0) {
         install_filter();
-        int rc = em_run(main_fn, NULL);
+        int rc = em_run(1, main_fn, NULL);
         _exit(rc == -EPERM && !ran ? 0 : 1);
     }
     int st;

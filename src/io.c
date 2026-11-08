@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <netinet/in.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #include "internal.h"
 
@@ -37,6 +39,14 @@ struct io_uring_sqe *em_sqe_get(em_worker *w)
     return io_uring_get_sqe(&w->ring);
 }
 
+/* Push queued SQEs to the kernel now. Transient errors are left for the next
+ * submit (em_io_reap / em_sqe_get / the shutdown drain all submit). */
+void em_io_submit(em_worker *w)
+{
+    int r = io_uring_submit(&w->ring);
+    if (r < 0 && r != -EBUSY && r != -EAGAIN && r != -EINTR) fatal("io_uring_submit", r);
+}
+
 /* Fiber f is EM_IOWAIT, so its op's CQE has not been reaped and its frame is
  * live (I5): cancel by user_data. The CQE of the cancel itself is ignored. */
 void em_io_interrupt(em_worker *w, em_fiber *f)
@@ -56,8 +66,20 @@ void em_io_reap(em_worker *w)
     }
     struct io_uring_cqe *cqe;
     unsigned head, n = 0;
+    int cancel_root = 0;
     io_uring_for_each_cqe(&w->ring, head, cqe) {
         n++;
+        if (cqe->user_data & 1) { /* not an op pointer */
+            if (cqe->user_data == EM_MSG_CANCEL) {
+                cancel_root = 1; /* acted on below, once every CQE of the batch is reaped */
+            } else {
+                assert(cqe->user_data == EM_MSG_SENT);
+                w->msg_inflight--;
+                /* Rings outlive all senders, so a failure here means a lost cancel. */
+                if (cqe->res < 0) fatal("msg_ring", cqe->res);
+            }
+            continue;
+        }
         em_op *op = io_uring_cqe_get_data(cqe);
         if (!op) continue; /* link timeout / async cancel */
         op->res = cqe->res;
@@ -66,6 +88,7 @@ void em_io_reap(em_worker *w)
         em_make_ready(w, op->f);
     }
     io_uring_cq_advance(&w->ring, n);
+    if (cancel_root && w->root) em_scope_cancel_all(w, w->root);
 }
 
 /* Effective deadline of the calling fiber, 0 = none. */
@@ -142,6 +165,7 @@ int em_tcp_listen(const struct sockaddr *a, socklen_t n, int backlog)
     if (fd < 0) return -errno;
     int one = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) < 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) < 0 || /* every worker listens; kernel spreads */
         bind(fd, a, n) < 0 || listen(fd, backlog) < 0) {
         int e = errno;
         close(fd);
@@ -185,6 +209,15 @@ ssize_t em_recv(int fd, void *buf, size_t len)
     return op_end(sqe, 0);
 }
 
+ssize_t em_read(int fd, void *buf, size_t len)
+{
+    struct io_uring_sqe *sqe;
+    int e = op_begin(0, &sqe);
+    if (e) return e;
+    io_uring_prep_read(sqe, fd, buf, len, (uint64_t)-1); /* -1: current position (pipes, signalfd, ...) */
+    return op_end(sqe, 0);
+}
+
 ssize_t em_send(int fd, const void *buf, size_t len)
 {
     struct io_uring_sqe *sqe;
@@ -224,4 +257,52 @@ int em_close(int fd)
     op_begin(OP_UNCANCELLABLE, &sqe);
     io_uring_prep_close(sqe, fd);
     return op_end(sqe, OP_UNCANCELLABLE);
+}
+
+int em_udp_bind(const struct sockaddr *a, socklen_t n)
+{
+    int fd = socket(a->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return -errno;
+    int one = 1;
+    in_port_t port = 0;
+    if (a->sa_family == AF_INET) port = ((const struct sockaddr_in *)a)->sin_port;
+    else if (a->sa_family == AF_INET6) port = ((const struct sockaddr_in6 *)a)->sin6_port;
+    /* Port 0 = client: with SO_REUSEPORT the kernel may hand out an ephemeral
+     * port another reuseport socket already holds, and replies would be hashed
+     * between the two. */
+    if ((port && setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) < 0) ||
+        bind(fd, a, n) < 0) {
+        int e = errno;
+        close(fd);
+        return -e;
+    }
+    return fd;
+}
+
+/* msghdr and iovec live in this frame until the CQE (I1); the payload goes
+ * straight between the kernel and the caller's buffer. */
+ssize_t em_recvfrom(int fd, void *buf, size_t len, struct sockaddr *src, socklen_t *srclen)
+{
+    struct io_uring_sqe *sqe;
+    int e = op_begin(0, &sqe);
+    if (e) return e;
+    struct iovec iov = { buf, len };
+    struct msghdr mh = { .msg_name = src, .msg_namelen = (src && srclen) ? *srclen : 0,
+                         .msg_iov = &iov, .msg_iovlen = 1 };
+    io_uring_prep_recvmsg(sqe, fd, &mh, 0);
+    int r = op_end(sqe, 0);
+    if (r >= 0 && src && srclen) *srclen = mh.msg_namelen;
+    return r;
+}
+
+ssize_t em_sendto(int fd, const void *buf, size_t len, const struct sockaddr *dst, socklen_t n)
+{
+    struct io_uring_sqe *sqe;
+    int e = op_begin(0, &sqe);
+    if (e) return e;
+    struct iovec iov = { (void *)(uintptr_t)buf, len }; /* iovec is not const-aware; the kernel only reads */
+    struct msghdr mh = { .msg_name = (void *)(uintptr_t)dst, .msg_namelen = n,
+                         .msg_iov = &iov, .msg_iovlen = 1 };
+    io_uring_prep_sendmsg(sqe, fd, &mh, MSG_NOSIGNAL);
+    return op_end(sqe, 0);
 }

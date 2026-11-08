@@ -71,6 +71,6 @@ int main(void)
     rng = seed;
     printf("cancel race: seed=%llu (SEED=%llu to replay)\n", (unsigned long long)seed, (unsigned long long)seed);
     fflush(stdout);
-    assert(em_run(main_fn, NULL) == 0);
+    assert(em_run(1, main_fn, NULL) == 0);
     return 0;
 }

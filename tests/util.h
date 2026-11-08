@@ -5,9 +5,20 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include "../include/em.h"
+
+/* Worker count for multi-worker tests; fixed so results don't depend on the
+ * runner's core count (workers wrap round-robin over the allowed CPUs). */
+static inline int test_workers(void)
+{
+    const char *e = getenv("EM_TEST_WORKERS");
+    int n = e ? atoi(e) : 4;
+    assert(n >= 1);
+    return n;
+}
 
 static inline uint64_t xs_next(uint64_t *s)
 {

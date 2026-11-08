@@ -49,7 +49,8 @@ Lý do đầy đủ nằm trong [DESIGN.md](DESIGN.md).
 |---|---|---|
 | M1 | Fiber, context switch x86_64 + aarch64, scheduler một worker | Xong |
 | M2 | io_uring, TCP, scope, deadline, hủy | Xong |
-| M3 | Nhiều worker, `SO_REUSEPORT`, UDP | |
+| M3 | Nhiều worker, `SO_REUSEPORT`, UDP | Xong |
+| M3.5 | Backend epoll (chọn tường minh auto/uring/epoll) | |
 | M4 | Crate Rust `em` (`std::io::Read`/`Write`, không `async`) | |
 | M5 | Benchmark so với monoio, tokio | |
 

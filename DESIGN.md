@@ -9,11 +9,12 @@ một bộ ngữ nghĩa (hủy, timeout, scope, buffer), binding mỏng theo idi
 |---|---|---|---|
 | D1 | Fiber stackful của em chỉ cho C/C++/Rust/Python. Java = virtual thread park/unpark. JS = Promise. | JS vẫn `await`, Java không dùng fiber em | Không — đây là giới hạn của JVM/V8 |
 | D2 | Thread-per-core, fiber **không bao giờ** di chuyển giữa worker | Tải có thể lệch giữa core | Đo được core nóng/nguội lệch kéo dài dưới tải thật |
-| D3 | Chỉ Linux, chỉ io_uring. Kernel tối thiểu 6.1 LTS | Không chạy trên mac/Windows/kernel cũ | Có nhu cầu triển khai ngoài Linux |
+| D3 | Chỉ Linux. Backend chính io_uring, kernel tối thiểu 6.1 LTS (backend epoll: xem D8) | Không chạy trên mac/Windows | Có nhu cầu triển khai ngoài Linux |
 | D4 | Binding đầu tiên: Rust | — | — |
 | D5 | v0 chỉ TCP + UDP + timer. TLS/HTTP làm sau, dạng sans-IO cắm vào | — | — |
 | D6 | Không hook syscall. Code chặn phải gọi `em_offload` | Gọi thư viện blocking mà quên offload → đứng cả worker | — |
 | D7 | Stack fiber cố định (mmap + guard page), không growable | Đệ quy sâu → SIGSEGV ở guard page (rõ ràng, không hỏng bộ nhớ) | — |
+| D8 | (2026-11-08) Thêm backend epoll ở M3.5, chọn tường minh: `auto` (thử io_uring, không được thì epoll, báo lại backend đang chạy) / `uring` / `epoll`. Không fallback lặng lẽ. API công khai không đổi | Hai backend, bộ test chạy gấp đôi; epoll cần timer heap riêng | em hướng tới người dùng ngoài; Docker/k8s seccomp mặc định chặn io_uring. Xét bỏ khi seccomp mặc định cho phép io_uring |
 
 ## Mô hình dữ liệu cốt lõi
 

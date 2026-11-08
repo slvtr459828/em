@@ -33,7 +33,7 @@ static int main_fn(void *arg)
 
 int main(void)
 {
-    assert(em_run(main_fn, NULL) == 0);
+    assert(em_run(1, main_fn, NULL) == 0);
     assert(nrun == N);
     for (int i = 0; i < N; i++) assert(order[i] == i);
     printf("many: %d fibers parked/unparked, FIFO order ok\n", N);

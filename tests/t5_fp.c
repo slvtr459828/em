@@ -39,7 +39,7 @@ static int main_fn(void *arg)
 
 int main(void)
 {
-    assert(em_run(main_fn, NULL) == 0);
+    assert(em_run(1, main_fn, NULL) == 0);
     assert(a_ok && b_ok);
     assert(fegetround() == FE_TONEAREST); /* scheduler context untouched */
     printf("fp: rounding mode isolated per fiber\n");

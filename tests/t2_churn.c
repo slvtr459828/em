@@ -24,7 +24,7 @@ static int main_fn(void *arg)
 
 int main(void)
 {
-    assert(em_run(main_fn, NULL) == 0);
+    assert(em_run(1, main_fn, NULL) == 0);
     printf("churn: %d fibers, %zu mmaps (max concurrent %d)\n", N, em_dbg_mmap_count, MAX_CONCURRENT);
     assert(em_dbg_mmap_count <= MAX_CONCURRENT);
     return 0;
