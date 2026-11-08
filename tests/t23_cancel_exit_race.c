@@ -32,6 +32,7 @@ static int main_fn(void *arg)
     if (delay > 100000 && delay % 3 == 0 && !(id == 0 && cancels)) return 0; /* some finish at once */
     int r = delay ? em_sleep_until(em_now() + delay) : 0;
     if (id == 0 && cancels) em_cancel_all();
+    if (r && r != -ECANCELED) fprintf(stderr, "worker %d: sleep %lld ns -> %d\n", id, (long long)delay, r);
     return r;
 }
 
@@ -44,8 +45,10 @@ int main(void)
         run_seed = (uint64_t)run + 1;
         cancels = run % 4 != 3;
         int r = em_run(N, main_fn, NULL);
-        if (cancels) assert(r == -ECANCELED);
-        else assert(r == 0 || r == -ECANCELED); /* can't be anything else: nobody fails */
+        if (cancels ? r != -ECANCELED : r != 0 && r != -ECANCELED) { /* nobody fails */
+            fprintf(stderr, "run %d (cancels=%d): em_run = %d\n", run, cancels, r);
+            return 1;
+        }
         cancelled += r == -ECANCELED;
     }
     assert(em_dbg_mmap_count == em_dbg_munmap_count);
