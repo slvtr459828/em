@@ -48,7 +48,7 @@ Lý do đầy đủ nằm trong [DESIGN.md](DESIGN.md).
 | Mốc | Nội dung | Trạng thái |
 |---|---|---|
 | M1 | Fiber, context switch x86_64 + aarch64, scheduler một worker | Xong |
-| M2 | io_uring, TCP, scope, deadline, hủy | Xong (x86_64; aarch64 chưa có môi trường test io_uring) |
+| M2 | io_uring, TCP, scope, deadline, hủy | Xong |
 | M3 | Nhiều worker, `SO_REUSEPORT`, UDP | |
 | M4 | Crate Rust `em` (`std::io::Read`/`Write`, không `async`) | |
 | M5 | Benchmark so với monoio, tokio | |
@@ -60,17 +60,12 @@ Sau v0: TLS, HTTP, binding Java/JS/Python.
 Cần: Linux ≥ 6.1, gcc, make, liburing-devel. Test ASan cần thêm libasan và libubsan.
 
 ```bash
-make test         # x86_64 -O2
+make test         # -O2
 make test-asan    # AddressSanitizer + UBSan
-make test-arm64   # aarch64 qua qemu-user trong podman
 ```
 
-`make test-arm64` cần `qemu-user-static-aarch64` và image test:
-
-```bash
-sudo dnf install -y qemu-user-static-aarch64 && sudo systemctl restart systemd-binfmt
-podman build --arch arm64 -t em-arm64 -f tools/arm64.Containerfile tools
-```
+CI chạy cả hai lệnh trên x86_64 và arm64 (runner ARM thật của GitHub) mỗi lần push.
+qemu-user không giả lập io_uring nên không dùng được để test.
 
 Nếu `vm.max_map_count` thấp (mặc định 65530 trên Debian/Ubuntu), mỗi fiber tốn 2 vùng nhớ
 nên trần là khoảng 32 nghìn fiber. Muốn nhiều hơn thì tăng sysctl này.

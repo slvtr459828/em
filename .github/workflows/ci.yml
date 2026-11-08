@@ -1,0 +1,22 @@
+name: ci
+on: [push, pull_request]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liburing-dev
+      - name: env
+        # t3 runs 100k fibers = 200k VMAs; the Ubuntu default (65530) caps em at ~32k
+        run: |
+          uname -r
+          sudo sysctl -w vm.max_map_count=1048576
+          sysctl kernel.io_uring_disabled 2>/dev/null || true
+      - run: make test
+      - run: make test-asan

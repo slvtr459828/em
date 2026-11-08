@@ -11,13 +11,12 @@ else
 ASM := src/ctx_aarch64.S
 endif
 
-# per-arch build dirs: the repo is shared with the arm64 container
 B_REL  := build/$(ARCH)/rel
 B_ASAN := build/$(ARCH)/asan
 CF_REL  := -std=gnu11 -O2 -g $(WARN) -Iinclude
 CF_ASAN := -std=gnu11 -O1 -g $(WARN) -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer
 
-.PHONY: all test test-asan test-arm64 clean
+.PHONY: all test test-asan clean
 all: $(B_REL)/libem.a
 
 # $(1)=build dir $(2)=cflags
@@ -43,9 +42,6 @@ test: $(addprefix $(B_REL)/,$(notdir $(TESTS)))
 
 test-asan: $(addprefix $(B_ASAN)/,$(notdir $(TESTS)))
 	@$(call run_tests,$(B_ASAN))
-
-test-arm64:
-	podman run --rm --arch arm64 -v $$PWD:/src:Z -w /src em-arm64 make test
 
 clean:
 	rm -rf build
