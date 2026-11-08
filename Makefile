@@ -18,7 +18,7 @@ B_ASAN := build/$(ARCH)/asan
 CF_REL  := -std=gnu11 -O2 -g -D_FORTIFY_SOURCE=3 $(WARN) -Iinclude
 CF_ASAN := -std=gnu11 -O1 -g $(WARN) -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer
 
-.PHONY: all test test-asan clean
+.PHONY: all test test-asan bench-em clean
 all: $(B_REL)/libem.a
 
 # $(1)=build dir $(2)=cflags
@@ -44,6 +44,10 @@ test: $(addprefix $(B_REL)/,$(notdir $(TESTS)))
 
 test-asan: $(addprefix $(B_ASAN)/,$(notdir $(TESTS)))
 	@$(call run_tests,$(B_ASAN))
+
+bench-em: $(B_REL)/em_echo
+$(B_REL)/em_echo: bench/em_echo.c $(B_REL)/libem.a
+	$(CC) $(CF_REL) $< $(B_REL)/libem.a -luring -lm -lpthread -o $@
 
 clean:
 	rm -rf build

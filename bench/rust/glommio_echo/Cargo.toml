@@ -1,0 +1,8 @@
+[package]
+name = "glommio_echo"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+glommio = "0.9"
+futures-lite = "2"

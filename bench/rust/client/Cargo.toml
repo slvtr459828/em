@@ -1,0 +1,7 @@
+[package]
+name = "client"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.54", features = ["rt", "net", "io-util", "time"] }

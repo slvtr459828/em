@@ -1,0 +1,40 @@
+name: bench
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: seconds per run
+        default: "10"
+      rounds:
+        description: interleaved rounds (median is reported)
+        default: "3"
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    # 7 servers x 6 cells x rounds x (duration + ~1 s) = ~21 min at the defaults
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liburing-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bench/rust
+      - name: bench
+        # max_map_count: em maps stacks per fiber. nofile/memlock (glommio) are raised on this
+        # shell, which bench/run.sh inherits; prlimit under sudo may exceed the hard limit.
+        run: |
+          sudo sysctl -w vm.max_map_count=1048576
+          sudo prlimit --pid $$ --nofile=1048576:1048576 --memlock=unlimited:unlimited
+          DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/run.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ matrix.os }}
+          path: bench/out/

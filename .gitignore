@@ -1,2 +1,4 @@
 build/
 *.core
+bench/out/
+bench/rust/target/
