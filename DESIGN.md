@@ -57,6 +57,26 @@ khi có rất nhiều connection nhàn rỗi.
 - Hủy lan từ scope xuống con. Mọi op chặn là điểm hủy; hủy trả lỗi `ECANCELED` lên người gọi.
 - Deadline = `IORING_OP_LINK_TIMEOUT` gắn vào op. Không có timer wheel riêng.
 
+## Quy tắc code (dùng khi review)
+
+Thứ cần giữ: đường đi dữ liệu ngắn, rõ, kiểm soát được, nhanh. Hình thức (thụt lề, ngoặc)
+không bàn — để formatter lo.
+
+1. **em không copy payload.** Kernel ghi thẳng vào buffer của người gọi và đọc thẳng từ đó.
+   Copy chỉ được phép trong binding, kèm lý do ở chỗ copy.
+2. **Một lệnh I/O = một SQE (+ link timeout nếu có) = một CQE = một lần đánh thức.** Giữa
+   CQE và fiber không có hàng đợi, callback hay lớp trung gian nào ngoài run queue.
+3. **Không cấp phát, không lock, không atomic trên đường nóng** (nộp lệnh, gặt CQE, chuyển
+   fiber, spawn tái dùng). Giao tiếp giữa worker chỉ qua `MSG_RING`.
+4. **Mỗi tài nguyên đúng một chủ:** scope sở hữu fiber, fiber sở hữu op, `em_close` sở hữu
+   việc đóng fd. Không đếm tham chiếu.
+5. **Trạng thái tường minh:** mọi trạng thái của fiber/op là giá trị enum, chuyển trạng thái
+   ở số ít chỗ đọc được. Không có cờ ngầm suy ra trạng thái.
+6. **Đường nóng đọc được từ trên xuống trong một file**, không gián tiếp qua con trỏ hàm
+   (trừ entry của fiber).
+7. **Tuyên bố hiệu năng phải kèm số đo.** Layout dữ liệu và số bước thì nghĩ từ lúc thiết
+   kế; tối ưu vi mô thì chỉ khi benchmark chỉ ra.
+
 ## Phạm vi v0
 
 C core (worker, fiber, scope, tcp connect/accept/recv/send/shutdown, udp sendto/recvfrom,
