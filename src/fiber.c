@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include "internal.h"
 
 #ifdef __SANITIZE_ADDRESS__
@@ -158,6 +159,8 @@ int em_spawn(em_scope *s, int (*fn)(void *), void *arg)
     f->state = EM_READY;
     f->wake_res = 0;
     f->cur_op = NULL;
+    f->wfd = -1;
+    f->heap_idx = -1;
     f->home = f->cur_scope = s;
     f->sib_prev = NULL;
     f->sib_next = s->children;
@@ -242,22 +245,30 @@ int em_worker_id(void) { return W.id; }
 int em_worker_count(void) { return W.rt ? W.rt->n : 0; }
 
 /* ---- cross-worker cancel -------------------------------------------------
- * A msg_ring SQE posts a CQE (user_data EM_MSG_CANCEL) straight into the target
- * worker's ring; the target cancels its root when it reaps it (io.c).
- * Target rings stay open until EVERY worker has finished (see worker_main), so
- * ring_fd[k] is always a valid ring here: a worker that already finished its
- * root just never looks at the CQE, and ring teardown discards it. */
+ * io_uring: a msg_ring SQE posts a CQE (user_data EM_MSG_CANCEL) straight into
+ * the target worker's ring; the target cancels its root when it reaps it
+ * (io_uring.c). epoll: a write to the target's eventfd, which its epoll reports
+ * (io_epoll.c). Either way the target's ring/eventfd stays open until EVERY
+ * worker has finished (see worker_main), so wake_fd of slot k is always valid
+ * here: a worker that already finished its root just never looks at the
+ * message, and teardown discards it. */
 static void cancel_others(em_worker *w)
 {
     struct em_rt *rt = w->rt;
     for (int k = 0; k < rt->n; k++) {
         if (k == w->id) continue;
-        struct io_uring_sqe *sqe = em_sqe_get(w);
-        io_uring_prep_msg_ring(sqe, rt->slot[k].ring_fd, 0, EM_MSG_CANCEL, 0);
+        if (w->epoll) {
+            uint64_t one = 1;
+            /* EAGAIN = counter saturated = a cancel is already pending */
+            if (write(rt->slot[k].wake_fd, &one, sizeof one) < 0 && errno != EAGAIN) abort();
+            continue;
+        }
+        struct io_uring_sqe *sqe = ur_sqe_get(w);
+        io_uring_prep_msg_ring(sqe, rt->slot[k].wake_fd, 0, EM_MSG_CANCEL, 0);
         io_uring_sqe_set_data64(sqe, EM_MSG_SENT);
         w->msg_inflight++;
     }
-    em_io_submit(w); /* now, not at the next reap: the caller may run for a long time or exit */
+    if (!w->epoll) ur_submit(w); /* now, not at the next reap: the caller may run for a long time or exit */
 }
 
 void em_cancel_all(void)
@@ -275,11 +286,19 @@ static int worker_init(em_worker *w, struct em_rt *rt, int id)
     memset(w, 0, sizeof *w);
     w->rt = rt;
     w->id = id;
+    w->epoll = rt->epoll;
 
     cpu_set_t one;
     CPU_ZERO(&one);
     CPU_SET(rt->slot[id].cpu, &one);
     if (sched_setaffinity(0, sizeof one, &one) != 0) return -errno;
+
+    if (w->epoll) {
+        int e = ep_init(w);
+        if (e) return e;
+        rt->slot[id].wake_fd = w->evfd;
+        return 0;
+    }
 
     struct io_uring_params p;
     memset(&p, 0, sizeof p);
@@ -288,18 +307,20 @@ static int worker_init(em_worker *w, struct em_rt *rt, int id)
     p.cq_entries = CQ_ENTRIES;
     int rc = io_uring_queue_init_params(SQ_ENTRIES, &w->ring, &p);
     if (rc < 0) return rc;
-    rt->slot[id].ring_fd = w->ring.ring_fd;
+    rt->slot[id].wake_fd = w->ring.ring_fd;
     return 0;
 }
 
-static void worker_exit(em_worker *w, int ring_ok)
+static void worker_exit(em_worker *w, int init_ok)
 {
     while (w->free) {
         em_fiber *f = w->free;
         w->free = f->next;
         fiber_unmap(w, f);
     }
-    if (ring_ok) io_uring_queue_exit(&w->ring);
+    if (init_ok) {
+        if (w->epoll) ep_exit(w); else io_uring_queue_exit(&w->ring);
+    }
     w->rt = NULL;
 }
 
@@ -342,13 +363,13 @@ static void worker_main(em_worker *w)
             em_scope_cancel_all(w, &root);
             continue;
         }
-        em_io_reap(w);
+        if (w->epoll) ep_reap(w); else ur_reap(w);
     }
     publish_result(w, deadlocked ? -EDEADLK : rc ? rc : root.first_err ? root.first_err :
                       root.cancelled ? -ECANCELED : 0);
     /* Our msg_ring SQEs must complete before the ring can go away, and no ring
      * may go away before every sender is past this point (below). */
-    while (w->msg_inflight) em_io_reap(w);
+    while (w->msg_inflight) ur_reap(w); /* io_uring only: epoll sends none */
     w->root = NULL;
 }
 
@@ -401,11 +422,40 @@ static int nth_cpu(const cpu_set_t *set, int k)
         if (CPU_ISSET(c, set) && k-- == 0) return c;
 }
 
+/* EM_BACKEND=auto|uring|epoll (default auto), read once per em_run. Returns 0
+ * (io_uring), 1 (epoll) or -EINVAL. auto probes with a throwaway ring and
+ * switches to epoll only when io_uring is unavailable (blocked or absent); the
+ * answer holds for the whole run. A forced backend is never second-guessed:
+ * if it cannot start, worker_init reports why. */
+static int pick_backend(void)
+{
+    const char *e = getenv("EM_BACKEND");
+    if (e && strcmp(e, "auto") != 0) {
+        if (strcmp(e, "uring") == 0) return 0;
+        if (strcmp(e, "epoll") == 0) return 1;
+        return -EINVAL;
+    }
+    struct io_uring probe;
+    struct io_uring_params p;
+    memset(&p, 0, sizeof p);
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+    int rc = io_uring_queue_init_params(2, &probe, &p);
+    if (rc == 0) {
+        io_uring_queue_exit(&probe);
+        return 0;
+    }
+    return rc == -EPERM || rc == -ENOSYS || rc == -EACCES || rc == -ENOMEM;
+}
+
+const char *em_backend(void) { return W.epoll ? "epoll" : "uring"; }
+
 int em_run(int nworkers, int (*main_fn)(void *), void *arg)
 {
     em_worker *w = &W;
     if (w->rt) return -EBUSY; /* nested em_run from inside a worker */
     if (nworkers < 0) return -EINVAL;
+    int backend = pick_backend();
+    if (backend < 0) return backend;
 
     cpu_set_t orig;
     if (sched_getaffinity(0, sizeof orig, &orig) != 0) return -errno;
@@ -420,6 +470,7 @@ int em_run(int nworkers, int (*main_fn)(void *), void *arg)
         return e;
     }
     rt->n = n;
+    rt->epoll = backend;
     rt->main_fn = main_fn;
     rt->arg = arg;
     size_t m = read_max_map_count();

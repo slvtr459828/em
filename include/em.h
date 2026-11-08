@@ -37,8 +37,18 @@ struct em_scope {
  * is returned and nothing runs, no fallback:
  *   -EPERM   kernel.io_uring_disabled sysctl or seccomp policy,
  *   -ENOSYS  kernel or seccomp has no io_uring,
- *   -EINVAL  kernel < 6.1 (does not know the setup flags). */
+ *   -EINVAL  kernel < 6.1 (does not know the setup flags).
+ * Backend: env EM_BACKEND = auto (default) | uring | epoll, read once here; any
+ * other value returns -EINVAL. auto uses io_uring, and epoll only if io_uring
+ * is unavailable (setup fails with EPERM/ENOSYS/EACCES/ENOMEM, e.g. the default
+ * Docker/k8s seccomp profile). The choice is made once, before any worker
+ * starts, is the same for every worker and never changes. uring / epoll force
+ * that backend; if it cannot start, the error above is returned. */
 int       em_run(int nworkers, int (*main_fn)(void *), void *arg);
+/* "uring" or "epoll": the backend of the current run. Valid only inside em_run.
+ * Meant for logging. Same API and semantics on both; epoll differences are
+ * noted at em_read and em_close, and its timers have 1 ms resolution. */
+const char *em_backend(void);
 /* Valid only inside em_run (0 / 0 outside). */
 int       em_worker_id(void);
 int       em_worker_count(void);
@@ -77,7 +87,11 @@ int       em_tcp_listen(const struct sockaddr *a, socklen_t n, int backlog);
 int       em_accept(int lfd);
 int       em_connect(const struct sockaddr *a, socklen_t n);
 ssize_t   em_recv(int fd, void *buf, size_t len);        /* 0 = EOF */
-ssize_t   em_read(int fd, void *buf, size_t len);        /* any fd (signalfd, eventfd, pipe) */
+/* Any fd (signalfd, eventfd, pipe). On epoll the first call on an fd sets
+ * O_NONBLOCK on it (the flag lives on the open file description, so dups see
+ * it), and a regular file is read synchronously: it blocks the worker for the
+ * page-cache read. */
+ssize_t   em_read(int fd, void *buf, size_t len);
 ssize_t   em_send(int fd, const void *buf, size_t len);  /* may send less */
 int       em_send_all(int fd, const void *buf, size_t len);
 int       em_shutdown(int fd, int how);
@@ -90,7 +104,12 @@ int       em_udp_bind(const struct sockaddr *a, socklen_t n);
 ssize_t   em_recvfrom(int fd, void *buf, size_t len, struct sockaddr *src, socklen_t *srclen);
 ssize_t   em_sendto(int fd, const void *buf, size_t len, const struct sockaddr *dst, socklen_t n);
 /* Cancels other fibers' ops on fd (they get -ECANCELED), then closes. Not
- * cancellable itself: always closes fd. */
+ * cancellable itself: always closes fd. fds em created may be closed any way.
+ * An fd created outside em and used with em must be closed with this, on the
+ * worker that uses it: on epoll a plain close() leaves per-fd state that the
+ * next outside fd with the same number would inherit (its first wait would
+ * never wake). A dup of fd keeps the file (and its epoll registration) alive
+ * after em_close. */
 int       em_close(int fd);
 
 #endif

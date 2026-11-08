@@ -22,3 +22,19 @@ jobs:
           sysctl kernel.io_uring_disabled 2>/dev/null || true
       - run: make test
       - run: make test-asan
+
+  # D8: the default Docker seccomp profile blocks io_uring. Run the suite the way
+  # a container user would: no --privileged, no --security-opt. auto must pick epoll.
+  docker-epoll:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: env
+        # not namespaced: the container sees the host value (t3 needs it, see above)
+        run: sudo sysctl -w vm.max_map_count=1048576
+      - name: make test in a default-seccomp container
+        run: |
+          docker run --rm -e EM_BACKEND=auto -v "$PWD":/src -w /src ubuntu:24.04 bash -ec '
+            apt-get update
+            apt-get install -y --no-install-recommends gcc make libc6-dev liburing-dev
+            make test BACKENDS=auto'

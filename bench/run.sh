@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Echo benchmark: em vs tokio, monoio, compio, glommio. See plans/bench.md.
+# Echo benchmark: em (io_uring and epoll backends) vs tokio, monoio, compio, glommio. See plans/bench.md.
 # env: DURATION (s per run, 10), ROUNDS (3), OUT (output dir, bench/out)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -9,7 +9,7 @@ ROUNDS=${ROUNDS:-3}
 OUT=${OUT:-bench/out}
 ARCH=$(uname -m)
 BIN=build/$ARCH/bench
-SERVERS=(em-uring monoio-uring compio-uring glommio-uring tokio-epoll monoio-epoll compio-epoll)
+SERVERS=(em-uring monoio-uring compio-uring glommio-uring tokio-epoll monoio-epoll compio-epoll em-epoll)
 CONNS=(16 256 1024)
 SIZES=(128 4096)
 SRV_CPUS=0 # one server CPU (a single number: see cpu_ticks), 1 worker; client gets 3 CPUs: plans/bench.md
@@ -38,6 +38,7 @@ build() {
     make bench-em >&2
     mkdir -p "$BIN"
     cp "build/$ARCH/rel/em_echo" "$BIN/em-uring"
+    cp "build/$ARCH/rel/em_echo" "$BIN/em-epoll"
     (
         cd bench/rust
         local pkgs=(-p tokio_echo -p monoio_echo -p glommio_echo -p client)
@@ -59,6 +60,7 @@ build() {
 
 start() { # server port: launches pinned in the background, waits until it accepts
     local cmd=("$BIN/$1" "$2" "$WORKERS")
+    case $1 in em-*) cmd=(env "EM_BACKEND=${1#em-}" "${cmd[@]}") ;; esac # same binary, backend forced
     case $1 in monoio-*) cmd=("$BIN/monoio" "$2" "${1#monoio-}" "$WORKERS") ;; esac
     taskset -c $SRV_CPUS "${cmd[@]}" >/dev/null &
     pid=$!

@@ -56,7 +56,8 @@ khi có rất nhiều connection nhàn rỗi.
 
 - `em_scope`: fiber con spawn trong scope; ra khỏi scope = chờ hết con.
 - Hủy lan từ scope xuống con. Mọi op chặn là điểm hủy; hủy trả lỗi `ECANCELED` lên người gọi.
-- Deadline = `IORING_OP_LINK_TIMEOUT` gắn vào op. Không có timer wheel riêng.
+- Deadline = `IORING_OP_LINK_TIMEOUT` gắn vào op. Không có timer wheel riêng. (Backend epoll
+  dùng min-heap theo worker, xem plans/m3.5.md.)
 
 ## Quy tắc code (dùng khi review)
 
@@ -67,8 +68,11 @@ không bàn — để formatter lo.
    Copy chỉ được phép trong binding, kèm lý do ở chỗ copy.
 2. **Một lệnh I/O = một SQE (+ link timeout nếu có) = một CQE = một lần đánh thức.** Giữa
    CQE và fiber không có hàng đợi, callback hay lớp trung gian nào ngoài run queue.
+   Bản epoll: **một lệnh I/O = một lần thử syscall; nếu `EAGAIN` thì thêm một lần đợi rồi
+   một lần thử lại.** Giữa sự kiện epoll và fiber không có tầng trung gian nào ngoài danh
+   sách đợi của fd và run queue.
 3. **Không cấp phát, không lock, không atomic trên đường nóng** (nộp lệnh, gặt CQE, chuyển
-   fiber, spawn tái dùng). Giao tiếp giữa worker chỉ qua `MSG_RING`.
+   fiber, spawn tái dùng). Giao tiếp giữa worker chỉ qua `MSG_RING` (epoll: ghi vào eventfd của worker đích).
 4. **Mỗi tài nguyên đúng một chủ:** scope sở hữu fiber, fiber sở hữu op, `em_close` sở hữu
    việc đóng fd. Không đếm tham chiếu.
 5. **Trạng thái tường minh:** mọi trạng thái của fiber/op là giá trị enum, chuyển trạng thái

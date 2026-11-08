@@ -50,7 +50,7 @@ Lý do đầy đủ nằm trong [DESIGN.md](DESIGN.md).
 | M1 | Fiber, context switch x86_64 + aarch64, scheduler một worker | Xong |
 | M2 | io_uring, TCP, scope, deadline, hủy | Xong |
 | M3 | Nhiều worker, `SO_REUSEPORT`, UDP | Xong |
-| M3.5 | Backend epoll (chọn tường minh auto/uring/epoll) | |
+| M3.5 | Backend epoll (chọn tường minh auto/uring/epoll) | Xong |
 | M4 | Crate Rust `em` (`std::io::Read`/`Write`, không `async`) | |
 | M5 | Benchmark so với monoio, tokio | |
 
@@ -65,6 +65,9 @@ make test         # -O2
 make test-asan    # AddressSanitizer + UBSan
 ```
 
+Mỗi lệnh chạy toàn bộ test hai lần, một lần với `EM_BACKEND=uring`, một lần với
+`EM_BACKEND=epoll`. Muốn chạy một backend thôi: `make test BACKENDS=epoll`.
+
 CI chạy cả hai lệnh trên x86_64 và arm64 (runner ARM thật của GitHub) mỗi lần push.
 qemu-user không giả lập io_uring nên không dùng được để test.
 
@@ -74,6 +77,41 @@ nên trần là khoảng 32 nghìn fiber. Muốn nhiều hơn thì tăng sysctl 
 Trên một số kernel, bộ nhớ ring io_uring tính vào `RLIMIT_MEMLOCK` (theo UID, mặc định
 8 MiB). Mỗi worker tốn khoảng 40 KiB nên 8 MiB đủ cho khoảng 200 worker. Thiếu thì `em_run`
 trả `-ENOMEM`, khi đó tăng `ulimit -l`.
+
+## Backend: io_uring hay epoll
+
+em có hai backend I/O với cùng API và cùng ngữ nghĩa (hủy, deadline, scope). Chọn bằng biến
+môi trường, đọc một lần trong `em_run`:
+
+| `EM_BACKEND` | Hành vi |
+|---|---|
+| `auto` (mặc định) | Dùng io_uring; nếu `io_uring_setup` bị chặn hoặc không có (`EPERM`/`ENOSYS`/`EACCES`/`ENOMEM`) thì cả process dùng epoll |
+| `uring` | Ép io_uring. Không tạo được thì `em_run` trả lỗi, không fallback |
+| `epoll` | Ép epoll |
+| giá trị khác | `em_run` trả `-EINVAL` |
+
+Backend được chọn **một lần lúc khởi động** và không đổi nữa. `em_backend()` trả `"uring"` hoặc
+`"epoll"` để app log ra.
+
+**Docker/k8s:** profile seccomp mặc định của Docker và containerd gần đây chặn `io_uring_setup`,
+nên trong container thường thì `em_run` với io_uring trả `-EPERM`. Với `auto`, em tự chạy bằng
+epoll trong trường hợp đó, không cần cấu hình gì. Muốn io_uring trong container thì phải nới
+seccomp (và chấp nhận bề mặt tấn công lớn hơn của kernel); muốn chắc chắn dùng epoll thì đặt
+`EM_BACKEND=epoll` trong manifest, không cần build lại. CI có một job chạy `make test` trong
+container `ubuntu:24.04` với seccomp mặc định để giữ kịch bản này luôn xanh.
+
+Khác biệt của epoll cần biết:
+
+- Mỗi lệnh I/O thử syscall nonblocking trước, chỉ đợi khi `EAGAIN`. Socket do em tạo
+  (`listen`, `accept`, `connect`, `udp_bind`) là nonblocking; `recv/send` luôn kèm `MSG_DONTWAIT`.
+- `em_read` bật `O_NONBLOCK` trên fd ở lần đầu (cờ nằm trên file description nên các bản dup
+  cũng thấy). Đọc file thường chặn worker trong lúc đọc page cache; offload là việc của v0.1 (D6).
+- Timer có độ phân giải 1 ms (không bao giờ nổ sớm).
+- fd do em tạo thì đóng cách nào cũng được. fd tạo ngoài em (signalfd, pipe...) mà đã dùng
+  với em thì phải đóng bằng `em_close` trên worker đang dùng nó; `close()` thẳng để lại trạng
+  thái đăng ký cũ mà fd ngoài em tiếp theo cùng số sẽ thừa hưởng (lần đợi đầu không bao giờ thức).
+- Một fiber luôn có dữ liệu sẵn sẽ nhường sau mỗi 128 lệnh xong ngay, để fiber khác và timer
+  không bị đói.
 
 ## Tài liệu
 

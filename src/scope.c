@@ -35,7 +35,7 @@ static void interrupt(em_worker *w, em_fiber *f)
 {
     switch (f->state) {
     case EM_IOWAIT:
-        em_io_interrupt(w, f);
+        if (w->epoll) ep_interrupt(w, f); else ur_interrupt(w, f);
         break;
     case EM_PARKED:
         f->wake_res = -ECANCELED;

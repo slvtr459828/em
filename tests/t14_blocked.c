@@ -7,8 +7,6 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include "../include/em.h"
-#include <assert.h>
 
 #if defined(__x86_64__)
 #define AUDIT_ARCH_EM AUDIT_ARCH_X86_64
@@ -16,8 +14,43 @@
 #define AUDIT_ARCH_EM AUDIT_ARCH_AARCH64
 #endif
 
+#include <stdlib.h>
+#include <string.h>
+#include "util.h"
+
 static int ran;
 static int main_fn(void *arg) { (void)arg; ran = 1; return 0; }
+
+static int client(void *arg)
+{
+    uint16_t port = (uint16_t)(uintptr_t)arg;
+    int fd = connect_local(port);
+    char b[4];
+    if (fd < 0 || em_send_all(fd, "ping", 4) != 0 || em_recv(fd, b, 4) != 4 || memcmp(b, "pong", 4) != 0)
+        return -EIO;
+    return em_close(fd);
+}
+
+/* echo over loopback: listen/accept/connect/recv/send on whatever backend runs */
+static int echo_fn(void *arg)
+{
+    (void)arg;
+    assert(strcmp(em_backend(), "epoll") == 0);
+    uint16_t port;
+    int lfd = listen_local(&port);
+    em_scope s;
+    em_scope_open(&s, 0);
+    assert(em_spawn(&s, client, (void *)(uintptr_t)port) == 0);
+    int fd = em_accept(lfd);
+    char b[4];
+    assert(fd >= 0 && em_recv(fd, b, 4) == 4 && memcmp(b, "ping", 4) == 0);
+    assert(em_send_all(fd, "pong", 4) == 0);
+    em_close(fd);
+    em_close(lfd);
+    assert(em_scope_close(&s) == 0);
+    ran = 1;
+    return 0;
+}
 
 static void install_filter(void)
 {
@@ -35,19 +68,29 @@ static void install_filter(void)
     assert(prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &p) == 0);
 }
 
-int main(void)
+/* Runs in a child with io_uring_setup blocked (the default Docker/k8s seccomp
+ * profile does the same). 0 = child exited 0. */
+static int run_blocked(const char *backend, int (*fn)(void *), int expect_rc)
 {
     fflush(NULL);
     pid_t pid = fork();
     assert(pid >= 0);
     if (pid == 0) {
         install_filter();
-        int rc = em_run(1, main_fn, NULL);
-        _exit(rc == -EPERM && !ran ? 0 : 1);
+        setenv("EM_BACKEND", backend, 1);
+        int rc = em_run(1, fn, NULL);
+        _exit(rc == expect_rc && (expect_rc == 0) == ran ? 0 : 1);
     }
     int st;
     assert(waitpid(pid, &st, 0) == pid);
-    assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
-    printf("blocked: em_run returned -EPERM under seccomp\n");
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
+int main(void)
+{
+    assert(run_blocked("uring", main_fn, -EPERM)); /* forced io_uring: error, no fallback */
+    printf("blocked: EM_BACKEND=uring -> -EPERM under seccomp\n");
+    assert(run_blocked("auto", echo_fn, 0));       /* auto: falls back to epoll, echo works */
+    printf("blocked: EM_BACKEND=auto -> epoll, echo ok\n");
     return 0;
 }
