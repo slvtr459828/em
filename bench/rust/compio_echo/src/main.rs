@@ -1,4 +1,4 @@
-// Echo server for bench/run.sh: argv[1] = port. 2 threads, each with its own
+// Echo server for bench/run.sh: argv[1] = port, argv[2] = threads (1). Each thread has its own
 // runtime (driver picked by the uring/epoll feature) and SO_REUSEPORT listener.
 use compio::buf::{IntoInner, IoBuf};
 use compio::io::{AsyncRead, AsyncWriteExt};
@@ -13,8 +13,9 @@ async fn listen(port: u16) -> TcpListener {
 }
 
 fn main() {
-    let port: u16 = std::env::args().nth(1).expect("usage: compio_echo port").parse().unwrap();
-    let ts: Vec<_> = (0..2)
+    let port: u16 = std::env::args().nth(1).expect("usage: compio_echo port [threads]").parse().unwrap();
+    let n: usize = std::env::args().nth(2).map_or(1, |n| n.parse().unwrap());
+    let ts: Vec<_> = (0..n)
         .map(|_| {
             std::thread::spawn(move || {
                 compio::runtime::Runtime::new().unwrap().block_on(async move {

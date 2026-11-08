@@ -1,7 +1,7 @@
 // Closed-loop ping-pong load generator, same for every server.
 // usage: client addr conns size seconds threads
 // Each connection sends `size` bytes, reads exactly `size` back, compares, repeats.
-// Prints round-trips/sec; exits 1 if any echo is short or differs.
+// Prints "total_round_trips round_trips_per_sec"; exits 1 if any echo is short or differs.
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -62,5 +62,5 @@ fn main() {
             }
         }
     }
-    println!("{:.0}", total as f64 / start.elapsed().as_secs_f64());
+    println!("{total} {:.0}", total as f64 / start.elapsed().as_secs_f64());
 }

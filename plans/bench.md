@@ -15,8 +15,19 @@ và cho các trade-off còn treo (kích thước ring, ~11 ns/switch).
   echo, rồi gửi tiếp. Đo số round-trip/giây trong `D` giây. Đây cũng là kiểu monoio dùng để
   benchmark, nên dễ đối chiếu.
 - Ma trận: số connection `C ∈ {16, 256, 1024}` × payload `S ∈ {128, 4096}` byte.
-- **Ghim CPU**: runner có 4 vCPU. Server dùng CPU 0–1 (2 worker/thread), client dùng CPU 2–3.
-  Ở máy local có nhiều core hơn thì vẫn giữ 2 + 2 để số liệu đối chiếu được.
+- **Ghim CPU**: runner có 4 vCPU. Server dùng đúng 1 CPU (CPU 0, 1 worker/thread/executor), client dùng
+  3 CPU còn lại (CPU 1–3, 3 thread). Ở máy local có nhiều core hơn thì vẫn giữ 1 + 3 để số liệu đối chiếu được.
+  Vì sao: lần đo đầu với 2 + 2 làm client bão hòa (CPU client >= 90% ở ~35/42 lần chạy) nên mọi tỉ lệ bị nén
+  về ~1.0x. Cho server 1 CPU đo hiệu quả trên mỗi core, đúng mô hình thread-per-core của em, và 3 CPU client
+  đủ để server là bên bão hòa.
+- **Chỉ số thứ hai: server CPU-µs mỗi round-trip.** `run.sh` đọc thời gian bận của CPU server
+  (dòng `cpu0` trong `/proc/stat`: user+nice+system+irq+softirq+steal) ngay trước và sau lần chạy client,
+  rồi tính `cpu_giây * 1e6 / tổng_round-trip` (client in tổng round-trip). Không dùng utime+stime của tiến
+  trình: trên loopback, stack TCP chạy trong softirq mà kế toán theo tick không tính cho task (~40% CPU 0),
+  nên server bão hòa chỉ hiện ~0.55. CPU 0 chỉ có server chạy nên thời gian bận của nó là chi phí của server
+  (gồm cả phần stack TCP). Thấp hơn là tốt hơn. Chỉ số này vẫn có
+  nghĩa khi server chưa bão hòa, còn rps thì không. CSV có thêm cột `server_cpu` (tỉ lệ CPU duy nhất của
+  server) và `us_per_rt`.
 - **Server được đo** (tên trong bảng = runtime-backend): `em-uring`, `tokio-epoll`,
   `monoio-uring`, `monoio-epoll`, `compio-uring`, `compio-epoll`, `glommio-uring`. Khi M3.5 xong
   thì thêm `em-epoll`. Cùng backend so với nhau mới công bằng: em-uring so với monoio/compio/
@@ -30,18 +41,22 @@ và cho các trade-off còn treo (kích thước ring, ~11 ns/switch).
 
 | Thành phần | Nội dung |
 |---|---|
-| `bench/em_echo.c` | Server echo dùng libem: `em_run(2, ...)`, mỗi worker listen `SO_REUSEPORT`, mỗi connection một fiber |
+| `bench/em_echo.c` | Server echo dùng libem: `em_run(n, ...)`, mỗi worker listen `SO_REUSEPORT`, mỗi connection một fiber |
 | `bench/rust/` | Workspace Cargo, commit `Cargo.lock` |
-| `tokio_echo` | Runtime `multi_thread` 2 worker: cách dùng tokio phổ biến nhất |
-| `monoio_echo` | 2 thread, mỗi thread một runtime + listener `SO_REUSEPORT`: cách monoio khuyên dùng. Hai bản: driver io_uring và driver legacy (epoll) |
-| `compio_echo` | 2 thread, mỗi thread một runtime + `SO_REUSEPORT`. Hai bản: driver io_uring và driver polling (epoll), chọn bằng feature lúc build nên là hai binary |
-| `glommio_echo` | 2 executor ghim 2 CPU + `SO_REUSEPORT`. Chỉ có io_uring |
-| `client` | Một client chung cho mọi server. Tham số `addr C S D threads`, in ra một số: round-trip/giây |
-| `bench/run.sh` | Build, ghim CPU bằng `taskset`, chạy ma trận × `R` vòng, ghi CSV, in bảng markdown |
+| `tokio_echo` | Runtime `multi_thread` `n` worker: cách dùng tokio phổ biến nhất |
+| `monoio_echo` | `n` thread, mỗi thread một runtime + listener `SO_REUSEPORT`: cách monoio khuyên dùng. Hai bản: driver io_uring và driver legacy (epoll) |
+| `compio_echo` | `n` thread, mỗi thread một runtime + `SO_REUSEPORT`. Hai bản: driver io_uring và driver polling (epoll), chọn bằng feature lúc build nên là hai binary |
+| `glommio_echo` | `n` executor ghim vào `n` CPU đầu của tập CPU được phép (đọc `Cpus_allowed_list`, vì `taskset` đã giới hạn) + `SO_REUSEPORT`. Chỉ có io_uring |
+| `client` | Một client chung cho mọi server. Tham số `addr C S D threads`, in ra `tổng_round-trip round-trip/giây` |
+| `bench/run.sh` | Build, ghim CPU bằng `taskset`, chạy ma trận × `R` vòng, ghi CSV, in hai bảng markdown (rps; server µs/round-trip) |
 | `.github/workflows/bench.yml` | Chỉ `workflow_dispatch` (input: duration, rounds), matrix x86_64 + arm64; bảng vào `$GITHUB_STEP_SUMMARY`, CSV vào artifact |
 
-Client phải không phải nút cổ chai. `run.sh` cần báo khi CPU của client gần 100%, vì lúc đó
-tỉ lệ giữa các server bị nén lại và không còn ý nghĩa.
+Server nhận số worker `n` ở argv sau port (mặc định 1); `run.sh` luôn chạy với 1.
+
+Client phải không phải nút cổ chai. `table.py` báo khi CPU của client (trên 3 CPU) >= 90%, vì lúc đó
+tỉ lệ giữa các server bị nén lại và không còn ý nghĩa. Nó cũng ghi chú khi CPU server < 90%: server chưa
+bão hòa nên bảng rps không có nghĩa ở ô đó (bảng µs/round-trip vẫn đọc được). Với `DURATION` ngắn (1 s),
+thời gian dựng connection chiếm phần đáng kể nên server khó đạt ~100%: dùng >= 4 s để đọc số.
 
 ## Xong khi
 

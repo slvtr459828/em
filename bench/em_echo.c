@@ -1,12 +1,10 @@
-/* Echo server for bench/run.sh: argv[1] = port. 2 workers, each listens on the
- * port with SO_REUSEPORT and runs one fiber per connection. */
+/* Echo server for bench/run.sh: argv[1] = port, argv[2] = workers (default 1). Each
+ * worker listens on the port with SO_REUSEPORT and runs one fiber per connection. */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "../include/em.h"
-
-#define WORKERS 2
 
 static struct sockaddr_in addr;
 
@@ -43,10 +41,11 @@ static int worker(void *arg)
 
 int main(int argc, char **argv)
 {
-    if (argc != 2) { fprintf(stderr, "usage: %s port\n", argv[0]); return 2; }
+    if (argc < 2 || argc > 3) { fprintf(stderr, "usage: %s port [workers]\n", argv[0]); return 2; }
+    int workers = argc == 3 ? atoi(argv[2]) : 1;
     addr = (struct sockaddr_in){ .sin_family = AF_INET, .sin_port = htons((uint16_t)atoi(argv[1])),
                                  .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
-    int r = em_run(WORKERS, worker, NULL);
+    int r = em_run(workers, worker, NULL);
     if (r) fprintf(stderr, "em_run: %d\n", r);
     return r != 0;
 }

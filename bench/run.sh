@@ -12,8 +12,11 @@ BIN=build/$ARCH/bench
 SERVERS=(em-uring monoio-uring compio-uring glommio-uring tokio-epoll monoio-epoll compio-epoll)
 CONNS=(16 256 1024)
 SIZES=(128 4096)
-SRV_CPUS=0-1
-CLI_CPUS=2-3
+SRV_CPUS=0 # one server CPU (a single number: see cpu_ticks), 1 worker; client gets 3 CPUs: plans/bench.md
+CLI_CPUS=1-3
+CLI_THREADS=3
+WORKERS=1
+TICKS=$(getconf CLK_TCK)
 
 pid=
 stop() { # kill the running server and reap it
@@ -55,8 +58,8 @@ build() {
 }
 
 start() { # server port: launches pinned in the background, waits until it accepts
-    local cmd=("$BIN/$1" "$2")
-    case $1 in monoio-*) cmd=("$BIN/monoio" "$2" "${1#monoio-}") ;; esac
+    local cmd=("$BIN/$1" "$2" "$WORKERS")
+    case $1 in monoio-*) cmd=("$BIN/monoio" "$2" "${1#monoio-}" "$WORKERS") ;; esac
     taskset -c $SRV_CPUS "${cmd[@]}" >/dev/null &
     pid=$!
     for _ in {1..100}; do
@@ -67,9 +70,20 @@ start() { # server port: launches pinned in the background, waits until it accep
     echo "$1 not listening on $2" >&2
 }
 
+# Busy ticks of the server's CPU from /proc/stat (user+nice+system+irq+softirq+steal). Not the
+# process's utime+stime: on loopback the TCP stack runs in softirq, which tick accounting does not
+# charge to the task (~40% of CPU 0 here), so /proc/<pid>/stat shows ~0.55 for a saturated server.
+# SRV_CPUS is a single CPU that only the server runs on, so its busy time is the server's cost.
+cpu_ticks() {
+    local l u n sy i io irq si st
+    while read -r l u n sy i io irq si st _; do
+        [[ $l == "cpu$SRV_CPUS" ]] && { echo $((u + n + sy + irq + si + st)); return; }
+    done </proc/stat
+}
+
 build
 mkdir -p "$OUT"
-echo "round,server,conns,size,rps,client_cpu" >"$OUT/results.csv"
+echo "round,server,conns,size,rps,client_cpu,server_cpu,us_per_rt" >"$OUT/results.csv"
 port=20000
 TIMEFORMAT='%U %S %R'
 for ((r = 1; r <= ROUNDS; r++)); do
@@ -77,12 +91,17 @@ for ((r = 1; r <= ROUNDS; r++)); do
         port=$((port + 1))
         start "$srv" "$port"
         # bash `time` reports the client's own user+sys; client stderr is kept for errors
-        t=$( { time taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" 2 \
+        t0=$(cpu_ticks)
+        t=$( { time taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" \
                  >"$OUT/rps.tmp"; } 2>&1 ) || { echo "client failed for $srv c=$c s=$s: $t" >&2; exit 1; }
+        t1=$(cpu_ticks)
         stop
         read -r u sy wall <<<"$(tail -n1 <<<"$t")"
-        cpu=$(awk -v u="$u" -v s="$sy" -v w="$wall" 'BEGIN { printf "%.2f", (u + s) / (w * 2) }')
-        echo "$r,$srv,$c,$s,$(<"$OUT/rps.tmp"),$cpu" | tee -a "$OUT/results.csv" >&2
+        read -r total rps <"$OUT/rps.tmp"
+        # client prints "total_round_trips rps"; server CPU is over the same client wall time
+        cols=$(awk -v u="$u" -v s="$sy" -v w="$wall" -v t0="$t0" -v t1="$t1" -v hz="$TICKS" -v n="$total" -v nc="$CLI_THREADS" \
+            'BEGIN { sc = (t1 - t0) / hz; printf "%.2f,%.2f,%.2f", (u + s) / (w * nc), sc / w, sc * 1e6 / n }')
+        echo "$r,$srv,$c,$s,$rps,$cols" | tee -a "$OUT/results.csv" >&2
     done; done; done
 done
 rm -f "$OUT/rps.tmp"

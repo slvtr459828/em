@@ -1,5 +1,5 @@
-// Echo server for bench/run.sh: argv[1] = port, argv[2] = uring|epoll. 2 threads, each
-// with its own runtime (io_uring or legacy/epoll driver) and SO_REUSEPORT listener.
+// Echo server for bench/run.sh: argv[1] = port, argv[2] = uring|epoll, argv[3] = threads (1).
+// Each thread has its own runtime (io_uring or legacy/epoll driver) and SO_REUSEPORT listener.
 use monoio::buf::IoBuf;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{ListenerOpts, TcpListener};
@@ -32,11 +32,12 @@ async fn serve(port: u16) {
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    let (port, uring): (u16, bool) = match a.as_slice() {
-        [_, p, d] if d == "uring" || d == "epoll" => (p.parse().unwrap(), d == "uring"),
-        _ => panic!("usage: monoio_echo port uring|epoll"),
+    let (port, uring): (u16, bool) = match a.get(1..3) {
+        Some([p, d]) if d == "uring" || d == "epoll" => (p.parse().unwrap(), d == "uring"),
+        _ => panic!("usage: monoio_echo port uring|epoll [threads]"),
     };
-    let ts: Vec<_> = (0..2)
+    let n: usize = a.get(3).map_or(1, |n| n.parse().unwrap());
+    let ts: Vec<_> = (0..n)
         .map(|_| {
             std::thread::spawn(move || {
                 if uring {
