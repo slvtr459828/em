@@ -47,6 +47,9 @@ int main(void)
         int r = em_run(N, main_fn, NULL);
         if (cancels ? r != -ECANCELED : r != 0 && r != -ECANCELED) { /* nobody fails */
             fprintf(stderr, "run %d (cancels=%d): em_run = %d\n", run, cancels, r);
+            usleep(200000); /* DEBUG: does the resource come back? */
+            fprintf(stderr, "retry after 200ms: em_run(1) = %d, em_run(%d) = %d\n",
+                    em_run(1, main_fn, NULL), N, em_run(N, main_fn, NULL));
             return 1;
         }
         cancelled += r == -ECANCELED;

@@ -16,6 +16,8 @@ jobs:
         # t3 runs 100k fibers = 200k VMAs; the Ubuntu default (65530) caps em at ~32k
         run: |
           uname -r
+          ulimit -l
+          cat /proc/sys/vm/max_map_count
           sudo sysctl -w vm.max_map_count=1048576
           sysctl kernel.io_uring_disabled 2>/dev/null || true
       - run: make test

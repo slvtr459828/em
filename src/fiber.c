@@ -279,7 +279,7 @@ static int worker_init(em_worker *w, struct em_rt *rt, int id)
               IORING_SETUP_SUBMIT_ALL | IORING_SETUP_CQSIZE;
     p.cq_entries = 2 * RING_ENTRIES;
     int rc = io_uring_queue_init_params(RING_ENTRIES, &w->ring, &p);
-    if (rc < 0) return rc;
+    if (rc < 0) { fprintf(stderr, "DEBUG worker %d: ring init %d\n", id, rc); return rc; }
     rt->slot[id].ring_fd = w->ring.ring_fd;
     return 0;
 }
