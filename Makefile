@@ -13,7 +13,7 @@ endif
 
 B_REL  := build/$(ARCH)/rel
 B_ASAN := build/$(ARCH)/asan
-CF_REL  := -std=gnu11 -O2 -g $(WARN) -Iinclude
+CF_REL  := -std=gnu11 -O2 -g -D_FORTIFY_SOURCE=3 $(WARN) -Iinclude
 CF_ASAN := -std=gnu11 -O1 -g $(WARN) -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer
 
 .PHONY: all test test-asan clean
