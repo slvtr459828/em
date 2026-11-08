@@ -19,7 +19,9 @@
  * UID, and is released asynchronously after close. Default limit is 8 MiB, so
  * a ring must stay small: SQ 256 + CQ 1024 is ~40 KiB, ~200 workers per 8 MiB.
  * SQ only bounds one submit batch; a full CQ overflows into the kernel's
- * NODROP list (slower, still correct). Revisit with M5 benchmark numbers. */
+ * NODROP list (slower, still correct). Measured 2026-11-08, 1 worker, 1024
+ * conns echo: ~500 CQEs per reap (max 1024), no overflow; SQ/CQ 256/1024 vs
+ * 4096/8192 within run-to-run noise. Revisit if a worker holds far more ops. */
 #define SQ_ENTRIES 256u
 #define CQ_ENTRIES 1024u
 
