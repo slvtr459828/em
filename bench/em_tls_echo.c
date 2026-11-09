@@ -9,6 +9,7 @@
 static struct sockaddr_in addr;
 static SSL_CTX *sctx;
 static int nodelay = 1; /* NODELAY=0 turns it off (bench/tls_ab.sh Nagle cell) */
+static int stateful;    /* TLS_TICKETS=stateful */
 
 static int echo(void *arg)
 {
@@ -23,6 +24,10 @@ static int echo(void *arg)
             ssize_t n = em_tls_recv(t, buf, sizeof buf);
             if (n <= 0 || em_tls_send_all(t, buf, (size_t)n) < 0) break;
         }
+        /* The churn client ends with RST, no close_notify: SSL_free would then drop the session from
+         * the server cache (ssl_clear_bad_session) and stateful resumption would almost never hit,
+         * unlike rustls' cache. Mark it shut down so both servers keep their sessions. */
+        if (stateful) SSL_set_shutdown(em_tls_ssl(t), SSL_SENT_SHUTDOWN);
         em_tls_free(t);
     }
     em_close(fd);
@@ -68,6 +73,7 @@ int main(int argc, char **argv)
             SSL_CTX_set_session_cache_mode(sctx, SSL_SESS_CACHE_SERVER);
             SSL_CTX_set_session_id_context(sctx, (const unsigned char *)"em", 2);
             SSL_CTX_set_num_tickets(sctx, 2);
+            stateful = 1;
         } else { fprintf(stderr, "TLS_TICKETS=%s: want 0, stateless or stateful\n", tk); return 2; }
     }
     const char *nd = getenv("NODELAY");
