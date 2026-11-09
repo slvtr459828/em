@@ -41,9 +41,9 @@ jobs:
             sudo apt-get install -y --no-install-recommends linux-tools-common "linux-tools-$(uname -r)" ||
               sudo apt-get install -y --no-install-recommends linux-tools-common linux-tools-azure
             sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
-            sudo mount -o remount,mode=755 /sys/kernel/tracing || sudo chmod -R a+rX /sys/kernel/tracing
             perf --version
-            DURATION=${{ inputs.duration }} bench/profile.sh
+            # tracefs stays root-only, so perf runs under sudo; the servers and client do not
+            PERF="sudo perf" DURATION=${{ inputs.duration }} bench/profile.sh
           else
             DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/run.sh
           fi
