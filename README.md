@@ -54,7 +54,7 @@ Lý do đầy đủ nằm trong [DESIGN.md](DESIGN.md).
 | M4 | Crate Rust `em` (`std::io::Read`/`Write`, không `async`) | Xong |
 | M5 | Đo sâu: syscall/round-trip và `perf`, khoảng nhiễu qua 5 vòng, latency p99, churn connection, soak 600 s với RSS phẳng | Xong |
 | v0.1 | offload + DNS | Xong |
-| v0.2 | TLS: `em_tls` (OpenSSL qua BIO pair, ngoài `libem`); Rust dùng rustls trên `em::TcpStream` | Đang chạy CI |
+| v0.2 | TLS: `em_tls` (OpenSSL qua BIO pair, ngoài `libem`); Rust dùng rustls trên `em::TcpStream` | Xong (CI [42615977691](https://github.com/slvtr459828/em/actions/runs/42615977691)) |
 
 Sau v0.2: HTTP, binding Java/JS/Python.
 
