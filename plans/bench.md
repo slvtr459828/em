@@ -36,6 +36,10 @@ và cho các trade-off còn treo (kích thước ring, ~11 ns/switch).
   Nhiễu VM chia đều cho mọi server thay vì dồn vào một bên.
 - Kết quả là **trung vị** qua các vòng, cùng tỉ lệ so với tokio. Số tuyệt đối trên VM dùng
   chung dao động; tỉ lệ trong cùng job mới là thứ để đọc.
+- **Khoảng nhiễu (M5):** mặc định 5 vòng. Cạnh trung vị, bảng in `[lo–hi]`: nhỏ nhất và lớn nhất
+  của tỉ lệ theo từng vòng (vòng r của server chia vòng r của tokio, hai lần chạy cách nhau vài
+  phút). **Quy tắc đọc:** hai server chỉ được coi là khác nhau ở một ô khi khoảng `[lo–hi]` của
+  chúng không chồng lên nhau. Chồng nhau thì đọc là "ngang".
 
 ## Thành phần
 

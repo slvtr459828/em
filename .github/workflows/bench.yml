@@ -6,8 +6,11 @@ on:
         description: seconds per run
         default: "10"
       rounds:
-        description: interleaved rounds (median is reported)
-        default: "3"
+        description: interleaved rounds (median and min-max of per-round ratios are reported)
+        default: "5"
+      soak:
+        description: seconds of bench/soak.sh (em RSS under connection churn) instead of the bench; 0 = off
+        default: "0"
       profile:
         description: run bench/profile.sh (syscalls per round-trip + perf profile) instead of the bench
         type: boolean
@@ -20,8 +23,8 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    # 7 servers x 6 cells x rounds x (duration + ~1 s) = ~21 min at the defaults
-    timeout-minutes: 60
+    # 10 servers x 6 cells x rounds x (duration + ~1 s) = ~55 min at the defaults
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: deps
@@ -44,6 +47,8 @@ jobs:
             perf --version
             # tracefs stays root-only, so perf runs under sudo; the servers and client do not
             PERF="sudo perf" DURATION=${{ inputs.duration }} bench/profile.sh
+          elif [[ "${{ inputs.soak }}" != 0 ]]; then
+            SOAK=${{ inputs.soak }} bench/soak.sh
           else
             DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/run.sh
           fi

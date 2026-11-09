@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Echo benchmark: em and its Rust crate (io_uring and epoll backends) vs tokio, monoio, compio, glommio. See plans/bench.md.
-# env: DURATION (s per run, 10), ROUNDS (3), OUT (output dir, bench/out)
+# env: DURATION (s per run, 10), ROUNDS (5), OUT (output dir, bench/out)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 DURATION=${DURATION:-10}
-ROUNDS=${ROUNDS:-3}
+ROUNDS=${ROUNDS:-5}
 OUT=${OUT:-bench/out}
 ARCH=$(uname -m)
 BIN=build/$ARCH/bench
@@ -92,26 +92,34 @@ cpu_ticks() {
 
 build
 mkdir -p "$OUT"
-echo "round,server,conns,size,rps,client_cpu,server_cpu,us_per_rt" >"$OUT/results.csv"
+# echo cells, then one churn cell (connect, one 128 B round-trip, RST; 64 concurrent: plans/m5.md)
+CELLS=()
+for c in "${CONNS[@]}"; do for s in "${SIZES[@]}"; do CELLS+=("echo $c $s"); done; done
+CELLS+=("churn 64 128")
+echo "round,mode,server,conns,size,rps,client_cpu,server_cpu,us_per_rt,p50_us,p99_us,p999_us" >"$OUT/results.csv"
 port=20000
 TIMEFORMAT='%U %S %R'
 for ((r = 1; r <= ROUNDS; r++)); do
-    for c in "${CONNS[@]}"; do for s in "${SIZES[@]}"; do for srv in "${SERVERS[@]}"; do
-        port=$((port + 1))
-        start "$srv" "$port"
-        # bash `time` reports the client's own user+sys; client stderr is kept for errors
-        t0=$(cpu_ticks)
-        t=$( { time taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" \
-                 >"$OUT/rps.tmp"; } 2>&1 ) || { echo "client failed for $srv c=$c s=$s: $t" >&2; exit 1; }
-        t1=$(cpu_ticks)
-        stop
-        read -r u sy wall <<<"$(tail -n1 <<<"$t")"
-        read -r total rps <"$OUT/rps.tmp"
-        # client prints "total_round_trips rps"; server CPU is over the same client wall time
-        cols=$(awk -v u="$u" -v s="$sy" -v w="$wall" -v t0="$t0" -v t1="$t1" -v hz="$TICKS" -v n="$total" -v nc="$CLI_THREADS" \
-            'BEGIN { sc = (t1 - t0) / hz; printf "%.2f,%.2f,%.2f", (u + s) / (w * nc), sc / w, sc * 1e6 / n }')
-        echo "$r,$srv,$c,$s,$rps,$cols" | tee -a "$OUT/results.csv" >&2
-    done; done; done
+    for cell in "${CELLS[@]}"; do
+        read -r mode c s <<<"$cell"
+        arg=(); [[ $mode == echo ]] || arg=(churn)
+        for srv in "${SERVERS[@]}"; do
+            port=$((port + 1))
+            start "$srv" "$port"
+            # bash `time` reports the client's own user+sys; client stderr is kept for errors
+            t0=$(cpu_ticks)
+            t=$( { time taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" "${arg[@]}" \
+                     >"$OUT/rps.tmp"; } 2>&1 ) || { echo "client failed for $srv c=$c s=$s: $t" >&2; exit 1; }
+            t1=$(cpu_ticks)
+            stop
+            read -r u sy wall <<<"$(tail -n1 <<<"$t")"
+            read -r total rps p50 p99 p999 <"$OUT/rps.tmp"
+            # client prints "total_round_trips rps p50 p99 p999"; server CPU is over the same client wall time
+            cols=$(awk -v u="$u" -v s="$sy" -v w="$wall" -v t0="$t0" -v t1="$t1" -v hz="$TICKS" -v n="$total" -v nc="$CLI_THREADS" \
+                'BEGIN { sc = (t1 - t0) / hz; printf "%.2f,%.2f,%.2f", (u + s) / (w * nc), sc / w, sc * 1e6 / n }')
+            echo "$r,$mode,$srv,$c,$s,$rps,$cols,$p50,$p99,$p999" | tee -a "$OUT/results.csv" >&2
+        done
+    done
 done
 rm -f "$OUT/rps.tmp"
 
