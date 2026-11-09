@@ -3,17 +3,19 @@
  * (tests/tls_util.h); the bench client accepts any certificate. */
 #include <netinet/tcp.h>
 #include <stdio.h>
+#include <string.h>
 #include "../tests/tls_util.h"
 
 static struct sockaddr_in addr;
 static SSL_CTX *sctx;
+static int nodelay = 1; /* NODELAY=0 turns it off (bench/tls_ab.sh Nagle cell) */
 
 static int echo(void *arg)
 {
     int fd = (int)(intptr_t)arg;
     /* After the handshake the server writes the session tickets and then the echo: without NODELAY
      * Nagle holds the echo behind the unacked tickets until the client's delayed ACK (~40 ms) */
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &(int){ 1 }, sizeof(int));
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &(int){ nodelay }, sizeof(int));
     em_tls *t;
     if (em_tls_accept(&t, sctx, fd) == 0) {
         char buf[16384];
@@ -55,6 +57,21 @@ int main(int argc, char **argv)
     SSL_CTX *cctx;
     tls_test_ctx(&sctx, &cctx);
     SSL_CTX_free(cctx);
+    /* TLS_TICKETS: unset = OpenSSL default (stateless, 2 tickets); 0 = none; stateless; stateful
+     * (NO_TICKET: TLS 1.3 then issues session-ID tickets backed by the server cache) */
+    const char *tk = getenv("TLS_TICKETS");
+    if (tk) {
+        if (!strcmp(tk, "0")) SSL_CTX_set_num_tickets(sctx, 0);
+        else if (!strcmp(tk, "stateless")) SSL_CTX_set_num_tickets(sctx, 2);
+        else if (!strcmp(tk, "stateful")) {
+            SSL_CTX_set_options(sctx, SSL_OP_NO_TICKET);
+            SSL_CTX_set_session_cache_mode(sctx, SSL_SESS_CACHE_SERVER);
+            SSL_CTX_set_session_id_context(sctx, (const unsigned char *)"em", 2);
+            SSL_CTX_set_num_tickets(sctx, 2);
+        } else { fprintf(stderr, "TLS_TICKETS=%s: want 0, stateless or stateful\n", tk); return 2; }
+    }
+    const char *nd = getenv("NODELAY");
+    if (nd && !strcmp(nd, "0")) nodelay = 0;
     int r = em_run(workers, worker, NULL);
     if (r) fprintf(stderr, "em_run: %d\n", r);
     return r != 0;

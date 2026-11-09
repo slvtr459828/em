@@ -2,6 +2,9 @@
 # Echo benchmark: em and its Rust crate (io_uring and epoll backends) vs tokio, monoio, compio, glommio.
 # See plans/bench.md. Then three TLS cells (plans/v0.2.md): em-tls-uring, em-tls-epoll, tokio-rustls.
 # env: DURATION (s per run, 10), ROUNDS (5), OUT (output dir, bench/out)
+#      TLS_PREFIX (an OpenSSL prefix with include/ and lib[64]/: em-tls-* servers are built against it
+#      and run with it on LD_LIBRARY_PATH; bench/tls_libs.sh builds such prefixes)
+#      TLS_TICKETS (0|stateless|stateful), NODELAY (0): passed through to the TLS servers
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -36,13 +39,30 @@ trap 'exit 130' INT TERM
 ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 ulimit -l unlimited 2>/dev/null || echo "warn: cannot raise RLIMIT_MEMLOCK; glommio may fail" >&2
 
+# TLS_PREFIX: tls.c and em_tls_echo.c compiled against the prefix's headers (same flags as the
+# Makefile's rel build) into their own dir; the default build is left alone.
+tls_prefix_lib() { for d in lib64 lib; do [[ -e $TLS_PREFIX/$d/libssl.so ]] && { echo "$TLS_PREFIX/$d"; return; }; done
+                   echo "TLS_PREFIX=$TLS_PREFIX: no lib64/libssl.so or lib/libssl.so" >&2; return 1; }
+build_tls_prefix() {
+    local lib d=build/$ARCH/bench-tlsprefix rel=build/$ARCH/rel
+    lib=$(tls_prefix_lib) || return 1
+    local cf=(-std=gnu11 -O2 -g -D_FORTIFY_SOURCE=3 -Wall -Wextra -Werror -Iinclude -I"$TLS_PREFIX/include")
+    mkdir -p "$d"
+    { cc "${cf[@]}" -c src/tls.c -o "$d/tls.o" && rm -f "$d/libem_tls.a" && ar rcs "$d/libem_tls.a" "$d/tls.o" &&
+      cc "${cf[@]}" -Isrc bench/em_tls_echo.c "$d/libem_tls.a" "$rel/libem.a" -L"$lib" -lssl -lcrypto -luring -lm -lpthread \
+          -o "$d/em_tls_echo"; } >&2 ||
+        { echo "TLS_PREFIX=$TLS_PREFIX: em_tls does not build against it (OpenSSL 3.x only; AWS-LC lacks BIO_nread0/nwrite0, ERR_get_error_all, EVP_EC_gen)" >&2; return 1; }
+}
+
 build() {
     make bench-em bench-em-tls >&2
     mkdir -p "$BIN"
     cp "build/$ARCH/rel/em_echo" "$BIN/em-uring"
     cp "build/$ARCH/rel/em_echo" "$BIN/em-epoll"
-    cp "build/$ARCH/rel/em_tls_echo" "$BIN/em-tls-uring"
-    cp "build/$ARCH/rel/em_tls_echo" "$BIN/em-tls-epoll"
+    local tls_echo=build/$ARCH/rel/em_tls_echo
+    if [[ -n ${TLS_PREFIX:-} ]]; then build_tls_prefix; tls_echo=build/$ARCH/bench-tlsprefix/em_tls_echo; fi
+    cp "$tls_echo" "$BIN/em-tls-uring"
+    cp "$tls_echo" "$BIN/em-tls-epoll"
     (
         cd bench/rust
         local pkgs=(-p tokio_echo -p monoio_echo -p glommio_echo)
@@ -69,7 +89,8 @@ build() {
 
 start() { # server port: launches pinned in the background, waits until it accepts
     local cmd=("$BIN/$1" "$2" "$WORKERS")
-    case $1 in em-tls-*) cmd=(env "EM_BACKEND=${1#em-tls-}" "${cmd[@]}") ;; # same binary, backend forced
+    case $1 in em-tls-*) cmd=(env "EM_BACKEND=${1#em-tls-}" "${cmd[@]}") # same binary, backend forced
+               [[ -z ${TLS_PREFIX:-} ]] || cmd=(env "LD_LIBRARY_PATH=$(tls_prefix_lib)" "${cmd[@]}") ;;
                em-*) cmd=(env "EM_BACKEND=${1#em-}" "${cmd[@]}") ;; esac
     case $1 in emrs-*) cmd=(env "EM_BACKEND=${1#emrs-}" "$BIN/emrs" "$2" "$WORKERS") ;; esac
     case $1 in monoio-*) cmd=("$BIN/monoio" "$2" "${1#monoio-}" "$WORKERS") ;; esac
@@ -94,6 +115,33 @@ cpu_ticks() {
     done </proc/stat
 }
 
+# run_cell srv port mode conns size [client args...]: one server, one client run; sets CELL_ROW to
+# "rps,client_cpu,server_cpu,us_per_rt,p50_us,p99_us,p999_us,resumed" (resumed: "-" for non-TLS cells)
+# and appends the negotiated TLS parameters to $OUT/tls_info.txt. Needs $OUT to exist.
+run_cell() {
+    local srv=$1 port=$2 mode=$3 c=$4 s=$5; shift 5
+    local TIMEFORMAT='%U %S %R' t t0 t1 u sy wall total rps p50 p99 p999 cols tls res
+    start "$srv" "$port"
+    # bash `time` reports the client's own user+sys; client stderr is kept for errors
+    t0=$(cpu_ticks)
+    t=$( { time taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" "$@" \
+             >"$OUT/rps.tmp"; } 2>&1 ) || { echo "client failed for $srv c=$c s=$s: $t" >&2; exit 1; }
+    t1=$(cpu_ticks)
+    stop
+    read -r u sy wall <<<"$(tail -n1 <<<"$t")"
+    read -r total rps p50 p99 p999 <"$OUT/rps.tmp"
+    # client prints "total_round_trips rps p50 p99 p999"; server CPU is over the same client wall time
+    cols=$(awk -v u="$u" -v s="$sy" -v w="$wall" -v t0="$t0" -v t1="$t1" -v hz="$TICKS" -v n="$total" -v nc="$CLI_THREADS" \
+        'BEGIN { sc = (t1 - t0) / hz; printf "%.2f,%.2f,%.2f", (u + s) / (w * nc), sc / w, sc * 1e6 / n }')
+    # TLS cells: the client's second line is "tls <version> <suite> <group> <cert> full=N resumed=M"
+    res=-
+    if tls=$(sed -n 's/^tls //p' "$OUT/rps.tmp") && [[ -n $tls ]]; then
+        echo "$srv $mode: $tls" >>"$OUT/tls_info.txt"
+        res=$(sed 's/.*full=\([0-9]*\) resumed=\([0-9]*\)/\1 \2/' <<<"$tls" | awk '{ printf "%.3f", $2 / ($1 + $2) }')
+    fi
+    CELL_ROW="$rps,$cols,$p50,$p99,$p999,$res"
+}
+
 # bench/profile.sh sources this file for build/start/stop and the settings above.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 
@@ -111,7 +159,6 @@ CELLS+=("echotls 256 128" "echotls 256 4096" "churntls 64 128" "churntlsres 64 1
 echo "round,mode,server,conns,size,rps,client_cpu,server_cpu,us_per_rt,p50_us,p99_us,p999_us,resumed" >"$OUT/results.csv"
 : >"$OUT/tls_info.txt" # what each TLS server negotiated, as the client saw it
 port=20000
-TIMEFORMAT='%U %S %R'
 for ((r = 1; r <= ROUNDS; r++)); do
     for cell in "${CELLS[@]}"; do
         read -r mode c s <<<"$cell"
@@ -119,25 +166,8 @@ for ((r = 1; r <= ROUNDS; r++)); do
         srvs=("${SERVERS[@]}"); [[ $mode == *tls* ]] && srvs=("${TLS_SERVERS[@]}")
         for srv in "${srvs[@]}"; do
             port=$((port + 1))
-            start "$srv" "$port"
-            # bash `time` reports the client's own user+sys; client stderr is kept for errors
-            t0=$(cpu_ticks)
-            t=$( { time taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" "${arg[@]}" \
-                     >"$OUT/rps.tmp"; } 2>&1 ) || { echo "client failed for $srv c=$c s=$s: $t" >&2; exit 1; }
-            t1=$(cpu_ticks)
-            stop
-            read -r u sy wall <<<"$(tail -n1 <<<"$t")"
-            read -r total rps p50 p99 p999 <"$OUT/rps.tmp"
-            # client prints "total_round_trips rps p50 p99 p999"; server CPU is over the same client wall time
-            cols=$(awk -v u="$u" -v s="$sy" -v w="$wall" -v t0="$t0" -v t1="$t1" -v hz="$TICKS" -v n="$total" -v nc="$CLI_THREADS" \
-                'BEGIN { sc = (t1 - t0) / hz; printf "%.2f,%.2f,%.2f", (u + s) / (w * nc), sc / w, sc * 1e6 / n }')
-            # TLS cells: the client's second line is "tls <version> <suite> <group> <cert> full=N resumed=M"
-            res=-
-            if tls=$(sed -n 's/^tls //p' "$OUT/rps.tmp") && [[ -n $tls ]]; then
-                echo "$srv $mode: $tls" >>"$OUT/tls_info.txt"
-                res=$(sed 's/.*full=\([0-9]*\) resumed=\([0-9]*\)/\1 \2/' <<<"$tls" | awk '{ printf "%.3f", $2 / ($1 + $2) }')
-            fi
-            echo "$r,$mode,$srv,$c,$s,$rps,$cols,$p50,$p99,$p999,$res" | tee -a "$OUT/results.csv" >&2
+            run_cell "$srv" "$port" "$mode" "$c" "$s" "${arg[@]}"
+            echo "$r,$mode,$srv,$c,$s,$CELL_ROW" | tee -a "$OUT/results.csv" >&2
         done
     done
 done

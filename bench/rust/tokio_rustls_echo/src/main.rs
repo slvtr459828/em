@@ -13,19 +13,35 @@ fn main() -> std::io::Result<()> {
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
     let key = PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der());
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let cfg = ServerConfig::builder_with_provider(provider)
+    let mut cfg = ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .unwrap()
         .with_no_client_auth()
         .with_single_cert(vec![ck.cert.der().clone()], key.into())
         .unwrap();
+    // TLS_TICKETS: unset = rustls default (stateful: memory cache, 2 tickets); 0 = no tickets;
+    // stateless = Ticketer (encrypted tickets); stateful = the default, spelled out.
+    match std::env::var("TLS_TICKETS").as_deref() {
+        Err(_) => {}
+        Ok("0") => cfg.send_tls13_tickets = 0,
+        Ok("stateless") => {
+            cfg.ticketer = rustls::crypto::ring::Ticketer::new().unwrap();
+            cfg.send_tls13_tickets = 2;
+        }
+        Ok("stateful") => cfg.send_tls13_tickets = 2,
+        Ok(v) => {
+            eprintln!("TLS_TICKETS={v}: want 0, stateless or stateful");
+            std::process::exit(2);
+        }
+    }
+    let nodelay = std::env::var("NODELAY").as_deref() != Ok("0");
     let acceptor = TlsAcceptor::from(Arc::new(cfg));
     tokio::runtime::Builder::new_multi_thread().worker_threads(n).enable_all().build()?.block_on(async {
         let l = TcpListener::bind(("127.0.0.1", port)).await?;
         loop {
             let (s, _) = l.accept().await?;
             let acceptor = acceptor.clone();
-            s.set_nodelay(true)?; // else Nagle holds the echo behind the session tickets for a delayed ACK (~40 ms)
+            s.set_nodelay(nodelay)?; // else Nagle holds the echo behind the session tickets for a delayed ACK (~40 ms)
             tokio::spawn(async move {
                 let Ok(mut s) = acceptor.accept(s).await else { return };
                 let mut buf = [0u8; 16384];

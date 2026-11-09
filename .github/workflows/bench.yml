@@ -15,6 +15,10 @@ on:
         description: run bench/profile.sh (syscalls per round-trip + perf profile) instead of the bench
         type: boolean
         default: false
+      tlsab:
+        description: run bench/tls_ab.sh (em_tls vs tokio-rustls under each ticket mode, and Nagle) instead of the bench
+        type: boolean
+        default: false
 
 jobs:
   bench:
@@ -45,11 +49,25 @@ jobs:
               sudo apt-get install -y --no-install-recommends linux-tools-common linux-tools-azure
             sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
             perf --version
+            # libcrypto/libssl symbols (else the profile is hex addresses): debuginfod for perf, and the
+            # -dbgsym package from ddebs as a fallback. Neither may fail the run.
+            export DEBUGINFOD_URLS=https://debuginfod.ubuntu.com
+            {
+              sudo apt-get install -y --no-install-recommends ubuntu-dbgsym-keyring &&
+              echo "deb [signed-by=/usr/share/keyrings/ubuntu-dbgsym-keyring.gpg] http://ddebs.ubuntu.com $(lsb_release -cs) main restricted universe multiverse" |
+                sudo tee /etc/apt/sources.list.d/ddebs.list >/dev/null &&
+              sudo apt-get update && sudo apt-get install -y --no-install-recommends libssl3t64-dbgsym
+            } || echo "note: libssl3t64-dbgsym not installed; libcrypto symbols rely on debuginfod"
             # tracefs stays root-only, so perf runs under sudo; the servers and client do not
             PERF="sudo perf" DURATION=${{ inputs.duration }} bench/profile.sh
             # TLS echo: em_tls on both backends vs tokio-rustls (own OUT: same cell names as above never clash)
-            PERF="sudo perf" DURATION=${{ inputs.duration }} OUT=bench/out/profile-tls \
-              PROF_SERVERS="em-tls-uring em-tls-epoll tokio-rustls" PROF_CELLS="tls:256:128 tls:256:4096" bench/profile.sh
+            # churn cells, call graphs (who calls ERR_clear_error, malloc, ...) and PMU counters (skipped on VMs)
+            PERF="sudo env DEBUGINFOD_URLS=$DEBUGINFOD_URLS perf" DURATION=${{ inputs.duration }} OUT=bench/out/profile-tls \
+              PROF_SERVERS="em-tls-uring em-tls-epoll tokio-rustls" \
+              PROF_CELLS="tls:256:128 tls:256:4096 churntls:64:128 churntlsres:64:128" \
+              PROF_CALLGRAPH=1 PROF_COUNTERS=1 bench/profile.sh
+          elif [[ "${{ inputs.tlsab }}" == true ]]; then
+            DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/tls_ab.sh
           elif [[ "${{ inputs.soak }}" != 0 ]]; then
             SOAK=${{ inputs.soak }} bench/soak.sh
           else
