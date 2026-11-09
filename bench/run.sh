@@ -115,19 +115,19 @@ cpu_ticks() {
     done </proc/stat
 }
 
-# run_cell srv port mode conns size [client args...]: one server, one client run; sets CELL_ROW to
+# run_cell srv port mode conns size [client args...]: one client run against the server the caller
+# started (the caller stops it, so it can attach perf meanwhile). Sets CELL_ROW to
 # "rps,client_cpu,server_cpu,us_per_rt,p50_us,p99_us,p999_us,resumed" (resumed: "-" for non-TLS cells)
-# and appends the negotiated TLS parameters to $OUT/tls_info.txt. Needs $OUT to exist.
+# and total (round-trips, or connections for churn); appends the negotiated TLS parameters to
+# $OUT/tls_info.txt. Needs $OUT to exist.
 run_cell() {
     local srv=$1 port=$2 mode=$3 c=$4 s=$5; shift 5
-    local TIMEFORMAT='%U %S %R' t t0 t1 u sy wall total rps p50 p99 p999 cols tls res
-    start "$srv" "$port"
+    local TIMEFORMAT='%U %S %R' t t0 t1 u sy wall rps p50 p99 p999 cols tls res
     # bash `time` reports the client's own user+sys; client stderr is kept for errors
     t0=$(cpu_ticks)
     t=$( { time taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" "$@" \
              >"$OUT/rps.tmp"; } 2>&1 ) || { echo "client failed for $srv c=$c s=$s: $t" >&2; exit 1; }
     t1=$(cpu_ticks)
-    stop
     read -r u sy wall <<<"$(tail -n1 <<<"$t")"
     read -r total rps p50 p99 p999 <"$OUT/rps.tmp"
     # client prints "total_round_trips rps p50 p99 p999"; server CPU is over the same client wall time
@@ -142,7 +142,7 @@ run_cell() {
     CELL_ROW="$rps,$cols,$p50,$p99,$p999,$res"
 }
 
-# bench/profile.sh sources this file for build/start/stop and the settings above.
+# bench/profile.sh, tls_ab.sh and tls_ablate.sh source this file for build/start/stop/run_cell and the settings above.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 
 build
@@ -166,7 +166,9 @@ for ((r = 1; r <= ROUNDS; r++)); do
         srvs=("${SERVERS[@]}"); [[ $mode == *tls* ]] && srvs=("${TLS_SERVERS[@]}")
         for srv in "${srvs[@]}"; do
             port=$((port + 1))
+            start "$srv" "$port"
             run_cell "$srv" "$port" "$mode" "$c" "$s" "${arg[@]}"
+            stop
             echo "$r,$mode,$srv,$c,$s,$CELL_ROW" | tee -a "$OUT/results.csv" >&2
         done
     done

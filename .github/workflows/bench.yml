@@ -19,6 +19,10 @@ on:
         description: run bench/tls_ab.sh (em_tls vs tokio-rustls under each ticket mode, and Nagle) instead of the bench
         type: boolean
         default: false
+      tlsablate:
+        description: run bench/tls_ablate.sh (em_tls glue ablation, plans/tls-perf.md step 4) instead of the bench
+        type: boolean
+        default: false
 
 jobs:
   bench:
@@ -68,6 +72,9 @@ jobs:
               PROF_CALLGRAPH=1 PROF_COUNTERS=1 bench/profile.sh
           elif [[ "${{ inputs.tlsab }}" == true ]]; then
             DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/tls_ab.sh
+          elif [[ "${{ inputs.tlsablate }}" == true ]]; then
+            # no perf needed beyond what the runner has: counters are used only when the VM exposes a PMU
+            DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/tls_ablate.sh
           elif [[ "${{ inputs.soak }}" != 0 ]]; then
             SOAK=${{ inputs.soak }} bench/soak.sh
           else

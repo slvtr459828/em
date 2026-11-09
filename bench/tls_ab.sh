@@ -32,7 +32,9 @@ for ((r = 1; r <= ROUNDS; r++)); do
             arg=(churn tls); [[ $mode == churntlsres ]] && arg=(churn tlsres)
             for srv in "${TLS_SERVERS[@]}"; do
                 port=$((port + 1))
+                start "$srv" "$port"
                 run_cell "$srv" "$port" "$mode" 64 128 "${arg[@]}"
+                stop
                 echo "$r,$v,$mode,$srv,64,128,$CELL_ROW" | tee -a "$OUT/results.csv" >&2
             done
         done

@@ -1,0 +1,44 @@
+--- a/src/tls.c
++++ b/src/tls.c
+@@ -35,6 +35,7 @@
+     int       fd;
+     em_fiber *waiter;  /* fiber parked until the flusher is done (at most one: the other direction) */
+     unsigned char reading, writing, flushing, broken;
++    unsigned char rok; /* the last SSL_read returned data: no error/shutdown state to report */
+ };
+ 
+ enum op { ACCEPT, CONNECT, READ, WRITE, SHUTDOWN };
+@@ -117,16 +118,24 @@
+             if (r < 0) return r;
+             continue;
+         }
+-        ERR_clear_error();
+-        int n;
+-        switch (op) {
+-        case ACCEPT:  n = SSL_accept(t->ssl); break;
+-        case CONNECT: n = SSL_connect(t->ssl); break;
+-        case READ:    n = SSL_read(t->ssl, buf, len); break;
+-        case WRITE:   n = SSL_write(t->ssl, buf, len); break;
+-        default:      n = SSL_shutdown(t->ssl); break; /* 0: close_notify sent, peer's not yet seen */
++        /* Nothing buffered anywhere (SSL record layer, input BIO) and no state to report: SSL_read
++         * would only answer WANT_READ, so go straight to the recv. */
++        int skip = op == READ && t->rok && !SSL_has_pending(t->ssl) &&
++                   BIO_ctrl_get_write_guarantee(t->net) == IN_BYTES;
++        int n = -1;
++        if (!skip) {
++            ERR_clear_error();
++            switch (op) {
++            case ACCEPT:  n = SSL_accept(t->ssl); break;
++            case CONNECT: n = SSL_connect(t->ssl); break;
++            case READ:    n = SSL_read(t->ssl, buf, len); break;
++            case WRITE:   n = SSL_write(t->ssl, buf, len); break;
++            default:      n = SSL_shutdown(t->ssl); break; /* 0: close_notify sent, peer's not yet seen */
++            }
+         }
+-        int e = (n > 0 || (op == SHUTDOWN && n == 0)) ? SSL_ERROR_NONE : SSL_get_error(t->ssl, n);
++        if (op == READ) t->rok = n > 0;
++        int e = skip ? SSL_ERROR_WANT_READ
++                     : (n > 0 || (op == SHUTDOWN && n == 0)) ? SSL_ERROR_NONE : SSL_get_error(t->ssl, n);
+         struct saved se;
+         if (e == SSL_ERROR_SSL) save_errors(&se);
+         /* flush BEFORE any wait for input: TLS 1.3 can produce records while reading
