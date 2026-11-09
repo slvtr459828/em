@@ -87,6 +87,9 @@ cpu_ticks() {
     done </proc/stat
 }
 
+# bench/profile.sh sources this file for build/start/stop and the settings above.
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
+
 build
 mkdir -p "$OUT"
 echo "round,server,conns,size,rps,client_cpu,server_cpu,us_per_rt" >"$OUT/results.csv"

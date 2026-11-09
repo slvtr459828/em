@@ -8,6 +8,10 @@ on:
       rounds:
         description: interleaved rounds (median is reported)
         default: "3"
+      profile:
+        description: run bench/profile.sh (syscalls per round-trip + perf profile) instead of the bench
+        type: boolean
+        default: false
 
 jobs:
   bench:
@@ -32,7 +36,17 @@ jobs:
         run: |
           sudo sysctl -w vm.max_map_count=1048576
           sudo prlimit --pid $$ --nofile=1048576:1048576 --memlock=unlimited:unlimited
-          DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/run.sh
+          if [[ "${{ inputs.profile }}" == true ]]; then
+            # perf for the runner's kernel; tracepoints and kernel symbols need these sysctls
+            sudo apt-get install -y --no-install-recommends linux-tools-common "linux-tools-$(uname -r)" ||
+              sudo apt-get install -y --no-install-recommends linux-tools-common linux-tools-azure
+            sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+            sudo mount -o remount,mode=755 /sys/kernel/tracing || sudo chmod -R a+rX /sys/kernel/tracing
+            perf --version
+            DURATION=${{ inputs.duration }} bench/profile.sh
+          else
+            DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/run.sh
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
