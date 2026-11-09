@@ -56,7 +56,10 @@ struct em_fdw {
     em_fiber *rd, *wr;   /* waiters, singly linked through em_fiber.wnext */
     uint8_t   registered; /* EPOLL_CTL_ADD done (once; the kernel drops it when the fd closes) */
     uint8_t   nb;         /* O_NONBLOCK set by em_read */
+    uint8_t   rd_idle;    /* stream drained by a short recv; cleared by the next read event */
+    uint8_t   kind;       /* 0 unknown, EM_FD_STREAM, EM_FD_OTHER (SO_TYPE once; OTHER after EOF/error) */
 };
+enum { EM_FD_STREAM = 1, EM_FD_OTHER = 2 };
 struct em_timer { int64_t deadline; em_fiber *f; };
 enum { EM_WAIT_RD, EM_WAIT_WR };
 

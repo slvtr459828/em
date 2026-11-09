@@ -223,7 +223,14 @@ static void ep_poll(em_worker *w, int block)
         }
         if (fd >= w->nfd) continue; /* stale event of an fd em_close already forgot */
         struct em_fdw *s = &w->fdt[fd];
-        if (m & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) wake_list(w, &s->rd, 0);
+        if (m & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+            s->rd_idle = 0; /* also with no waiter: the next recv must try */
+            /* EOF or error pending: a short recv no longer means drained, and no
+             * further edge will come to clear the mark (t7: FIN in the same edge
+             * as the last bytes). The next recv returns 0 or the error at once. */
+            if (m & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) s->kind = EM_FD_OTHER;
+            wake_list(w, &s->rd, 0);
+        }
         if (m & (EPOLLOUT | EPOLLHUP | EPOLLERR)) wake_list(w, &s->wr, 0);
     }
     if (w->nheap) {
@@ -353,10 +360,42 @@ int ep_connect(const struct sockaddr *a, socklen_t n)
     return fd;
 }
 
+/* A stream recv that returns less than asked has drained the socket: the next
+ * recv would only see EAGAIN (in echo-like loops, one wasted syscall per
+ * round-trip). Remember it and wait first; any data arriving later raises a new
+ * edge, which clears rd_idle. Not for datagram sockets (a short recv says
+ * nothing about the queue) nor once EOF/error was seen (ep_poll sets EM_FD_OTHER). */
+static int stream_fd(em_worker *w, int fd)
+{
+    struct em_fdw *s = &w->fdt[fd];
+    if (!s->kind) {
+        int t = 0;
+        socklen_t l = sizeof t;
+        s->kind = getsockopt(fd, SOL_SOCKET, SO_TYPE, &t, &l) == 0 && t == SOCK_STREAM ? EM_FD_STREAM : EM_FD_OTHER;
+    }
+    return s->kind == EM_FD_STREAM;
+}
+
+/* The mark must be set right after the syscall, before EP_IO's fair() may poll or
+ * yield: an edge consumed in between would otherwise be lost and the next recv
+ * would park forever. errno is only read when r < 0, where nothing is marked. */
+static ssize_t recv_mark(em_worker *w, int fd, void *buf, size_t len)
+{
+    ssize_t r = recv(fd, buf, len, MSG_DONTWAIT);
+    if (r > 0 && (size_t)r < len && !fdt_ensure(w, fd) && stream_fd(w, fd)) w->fdt[fd].rd_idle = 1;
+    return r;
+}
+
 ssize_t ep_recv(int fd, void *buf, size_t len)
 {
+    em_worker *w = &em_W;
     ssize_t r;
-    EP_IO(r, fd, EM_WAIT_RD, recv(fd, buf, len, MSG_DONTWAIT));
+    if ((size_t)fd < w->nfd && w->fdt[fd].rd_idle && w->fdt[fd].registered) {
+        int e = begin();
+        if (!e) e = wait_fd(fd, EM_WAIT_RD);
+        if (e) return e;
+    }
+    EP_IO(r, fd, EM_WAIT_RD, recv_mark(w, fd, buf, len));
     return r;
 }
 

@@ -6,7 +6,7 @@ TESTS := tests/t1_pingpong tests/t2_churn tests/t3_many tests/t4_guard tests/t5_
   tests/t12_close_recv tests/t13_sleep tests/t14_blocked tests/t15_deadlock_unwind \
   tests/t16_reuseport_echo tests/t17_identity tests/t18_failfast_cross tests/t19_cancel_all \
   tests/t20_sigterm tests/t21_udp tests/t22_map_cap tests/t23_cancel_exit_race \
-  tests/t24_fairness tests/t25_udp_waiters tests/t26_close_wakes tests/t27_backend_env tests/t28_timer_heap tests/t29_fd_reuse tests/t30_outside
+  tests/t24_fairness tests/t25_udp_waiters tests/t26_close_wakes tests/t27_backend_env tests/t28_timer_heap tests/t29_fd_reuse tests/t30_outside tests/t31_short_read
 
 ifeq ($(ARCH),x86_64)
 ASM := src/ctx_x86_64.S

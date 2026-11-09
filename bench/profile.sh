@@ -45,7 +45,7 @@ for cell in "${PROF_CELLS[@]}"; do
         head -n 25 "$OUT/$srv-${c}x$s.txt" >&2
     done
 done
-rm -f "$OUT/stat.tmp" "$OUT/rps.tmp" "$OUT/perf.data" # our directory: removable whoever owns them
+rm -f "$OUT/stat.tmp" "$OUT/rps.tmp" "$OUT/perf.data" "$OUT/perf.data.old" # our directory: removable whoever owns them
 python3 -I - "$OUT/syscalls.csv" <<'PY' | tee "$OUT/syscalls.md"
 import csv, sys
 from collections import defaultdict
