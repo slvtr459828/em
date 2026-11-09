@@ -148,3 +148,28 @@ ALL 1.072 / 1.044. Không tập nào đạt ≥ 80% mức lợi của ALL trên 
 ±10–15%, rps không phân giải được vài phần trăm. `instructions:u` cục bộ trên ô 128: G1 -13%,
 G14 -17–20%, G124 -20%, ALL -21%. G1 không đổi hành vi (hàng lỗi rỗng thì không có gì để xoá). Đã áp vào
 `tls.c`; công cụ ablation đã xoá. Xét lại G4 nếu có máy đo rps ổn định hơn nhiễu 5%.
+
+## Kết quả Phần 2 (AWS-LC 5.12.0; tlsab 42660662000, bench 42660671263, profile 42668959769)
+
+CPU server µs mỗi kết nối, em / tokio-rustls cùng run (bench 42660671263, 5 vòng):
+
+| | x86 uring | x86 epoll | arm uring | arm epoll |
+|---|---|---|---|---|
+| churntls (OpenSSL trước đó) | 1.76x | | 2.64x | |
+| churntls AWS-LC | 1.06x | 1.02x | 1.19x | 1.00x |
+| churntlsres AWS-LC | 1.06x | 1.02x | 1.17x | 0.99x |
+| echo 256×128 (OpenSSL r2 → AWS-LC) | 1.09 → 1.01x | 1.30 → 1.17x | 1.21 → 0.97x | 1.82 → 1.15x |
+| echo 256×4096 (OpenSSL r2 → AWS-LC) | 1.07 → 0.94x | 1.31 → 1.12x | 0.95 → 0.93x | 1.30 → 1.08x |
+
+- Tiêu chí ≤ 1.15x: đạt trên x86 và với epoll trên arm. Uring trên arm trượt (1.17–1.19x).
+- Echo không chậm hơn bản OpenSSL ở ô nào: copy một lần mỗi chiều không lộ ra.
+- NODELAY=0 không còn bẫy Nagle (ticket đi chung lần ghi đầu): p50 em 17 ms x86 / 12 ms arm, tokio ~41 ms.
+- Phần dư uring trên arm không nằm ở TLS hay glue. PMU arm, churntls mỗi kết nối:
+  - uring / epoll `instructions:u` 841k / 848k và `instructions:k` 91.5k / 89.0k, gần bằng nhau;
+  - `cycles:k` 166k / 115k (+45%), `cycles:u` 413k / 385k (+7%), `branch-misses:u` +46%.
+  - Cùng lượng việc nhưng tốn thêm chu kỳ. Điểm nóng kernel: `_raw_spin_unlock_irqrestore` từ
+    `sock_def_readable` (loopback rx softirq chạy trong ngữ cảnh gửi), 5.1% so với 3.5%.
+  - Churn không TLS trên arm thì uring rẻ hơn epoll (12.3 so với 13.7 µs), nên đây là tương tác
+    uring–kernel khi mỗi kết nối nặng CPU, không phải đường TLS.
+  - Không xử lý trong plan này. Xét lại nếu uring churn trên máy arm thật (không phải VM) vẫn > 1.1x
+    so với epoll.
