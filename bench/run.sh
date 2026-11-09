@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Echo benchmark: em (io_uring and epoll backends) vs tokio, monoio, compio, glommio. See plans/bench.md.
+# Echo benchmark: em and its Rust crate (io_uring and epoll backends) vs tokio, monoio, compio, glommio. See plans/bench.md.
 # env: DURATION (s per run, 10), ROUNDS (3), OUT (output dir, bench/out)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -9,7 +9,7 @@ ROUNDS=${ROUNDS:-3}
 OUT=${OUT:-bench/out}
 ARCH=$(uname -m)
 BIN=build/$ARCH/bench
-SERVERS=(em-uring monoio-uring compio-uring glommio-uring tokio-epoll monoio-epoll compio-epoll em-epoll)
+SERVERS=(em-uring emrs-uring monoio-uring compio-uring glommio-uring tokio-epoll monoio-epoll compio-epoll em-epoll emrs-epoll)
 CONNS=(16 256 1024)
 SIZES=(128 4096)
 SRV_CPUS=0 # one server CPU (a single number: see cpu_ticks), 1 worker; client gets 3 CPUs: plans/bench.md
@@ -44,8 +44,11 @@ build() {
         local pkgs=(-p tokio_echo -p monoio_echo -p glommio_echo -p client)
         # glommio's bundled liburing misses struct open_how with some headers (Fedora 44);
         # on others (Ubuntu 24.04) forcing it in is a redefinition. Only add it when needed.
+        # em_rs_echo on its own: the CFLAGS retry below would also reach em's build.rs (asm file)
+        cargo build --release --locked -p em_rs_echo >&2
         cargo build --release --locked "${pkgs[@]}" >&2 ||
             CFLAGS="${CFLAGS:-} -include linux/openat2.h" cargo build --release --locked "${pkgs[@]}" >&2
+        cp target/release/em_rs_echo ../../$BIN/emrs
         cp target/release/tokio_echo ../../$BIN/tokio-epoll
         cp target/release/monoio_echo ../../$BIN/monoio
         cp target/release/glommio_echo ../../$BIN/glommio-uring
@@ -61,6 +64,7 @@ build() {
 start() { # server port: launches pinned in the background, waits until it accepts
     local cmd=("$BIN/$1" "$2" "$WORKERS")
     case $1 in em-*) cmd=(env "EM_BACKEND=${1#em-}" "${cmd[@]}") ;; esac # same binary, backend forced
+    case $1 in emrs-*) cmd=(env "EM_BACKEND=${1#emrs-}" "$BIN/emrs" "$2" "$WORKERS") ;; esac
     case $1 in monoio-*) cmd=("$BIN/monoio" "$2" "${1#monoio-}" "$WORKERS") ;; esac
     taskset -c $SRV_CPUS "${cmd[@]}" >/dev/null &
     pid=$!

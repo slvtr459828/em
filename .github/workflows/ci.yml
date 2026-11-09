@@ -22,6 +22,8 @@ jobs:
           sysctl kernel.io_uring_disabled 2>/dev/null || true
       - run: make test
       - run: make test-asan
+      # cargo/rustup come preinstalled on GitHub runners (x86_64 and arm64)
+      - run: make test-rust
 
   # D8: the default Docker seccomp profile blocks io_uring. Run the suite the way
   # a container user would: no --privileged, no --security-opt. auto must pick epoll.

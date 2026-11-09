@@ -149,7 +149,9 @@ void em_fiber_main(void)
     __builtin_unreachable();
 }
 
-int em_spawn(em_scope *s, int (*fn)(void *), void *arg)
+/* The scheduler itself spawns each worker's root fiber with current == NULL, so the
+ * -EPERM guard lives in em_spawn, not here. */
+static int spawn_fiber(em_scope *s, int (*fn)(void *), void *arg)
 {
     em_worker *w = &W;
     em_fiber *f = fiber_get(w);
@@ -173,6 +175,12 @@ int em_spawn(em_scope *s, int (*fn)(void *), void *arg)
     return 0;
 }
 
+int em_spawn(em_scope *s, int (*fn)(void *), void *arg)
+{
+    if (!W.current) return -EPERM;
+    return spawn_fiber(s, fn, arg);
+}
+
 /* A fiber's function returned r (runs on f's stack). */
 void em_fiber_finished(em_worker *w, em_fiber *f, int r)
 {
@@ -194,6 +202,7 @@ void em_yield(void)
 {
     em_worker *w = &W;
     em_fiber *f = w->current;
+    if (!f) return;
     f->state = EM_READY;
     rq_push(w, f);
     em_switch_to_sched(w, f);
@@ -205,6 +214,7 @@ int em_park(void)
 {
     em_worker *w = &W;
     em_fiber *f = w->current;
+    if (!f) return -EPERM;
     if (em_scope_is_cancelled(f)) return -ECANCELED; /* a cancel that landed while we were READY */
     f->wake_res = 0;
     f->state = EM_PARKED;
@@ -338,7 +348,7 @@ static void worker_main(em_worker *w)
     em_scope root = {0};
     w->root = &root;
     int deadlocked = 0;
-    int rc = em_spawn(&root, rt->main_fn, rt->arg);
+    int rc = spawn_fiber(&root, rt->main_fn, rt->arg);
     while (rc == 0) {
         em_fiber *f;
         while ((f = rq_pop(w))) {

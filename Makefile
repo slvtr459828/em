@@ -6,7 +6,7 @@ TESTS := tests/t1_pingpong tests/t2_churn tests/t3_many tests/t4_guard tests/t5_
   tests/t12_close_recv tests/t13_sleep tests/t14_blocked tests/t15_deadlock_unwind \
   tests/t16_reuseport_echo tests/t17_identity tests/t18_failfast_cross tests/t19_cancel_all \
   tests/t20_sigterm tests/t21_udp tests/t22_map_cap tests/t23_cancel_exit_race \
-  tests/t24_fairness tests/t25_udp_waiters tests/t26_close_wakes tests/t27_backend_env tests/t28_timer_heap tests/t29_fd_reuse
+  tests/t24_fairness tests/t25_udp_waiters tests/t26_close_wakes tests/t27_backend_env tests/t28_timer_heap tests/t29_fd_reuse tests/t30_outside
 
 ifeq ($(ARCH),x86_64)
 ASM := src/ctx_x86_64.S
@@ -19,7 +19,7 @@ B_ASAN := build/$(ARCH)/asan
 CF_REL  := -std=gnu11 -O2 -g -D_FORTIFY_SOURCE=3 $(WARN) -Iinclude
 CF_ASAN := -std=gnu11 -O1 -g $(WARN) -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer
 
-.PHONY: all test test-asan bench-em clean
+.PHONY: all test test-asan test-rust bench-em clean
 all: $(B_REL)/libem.a
 
 # $(1)=build dir $(2)=cflags
@@ -49,6 +49,13 @@ test: $(addprefix $(B_REL)/,$(notdir $(TESTS)))
 
 test-asan: $(addprefix $(B_ASAN)/,$(notdir $(TESTS)))
 	@$(call run_tests,$(B_ASAN))
+
+# Rust crate: one em_run per test, so tests run one at a time. The panic test runs once more
+# with RUST_BACKTRACE=1 (the unwinder walks up a fiber stack to em_tramp).
+test-rust:
+	@set -e; cd rust/em; for b in $(BACKENDS); do echo "=== EM_BACKEND=$$b"; \
+	  EM_BACKEND=$$b cargo test --locked -- --test-threads=1; \
+	  EM_BACKEND=$$b RUST_BACKTRACE=1 cargo test --locked --test panic -- --test-threads=1; done
 
 bench-em: $(B_REL)/em_echo
 $(B_REL)/em_echo: bench/em_echo.c $(B_REL)/libem.a

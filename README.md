@@ -51,8 +51,8 @@ Lý do đầy đủ nằm trong [DESIGN.md](DESIGN.md).
 | M2 | io_uring, TCP, scope, deadline, hủy | Xong |
 | M3 | Nhiều worker, `SO_REUSEPORT`, UDP | Xong |
 | M3.5 | Backend epoll (chọn tường minh auto/uring/epoll) | Xong |
-| M4 | Crate Rust `em` (`std::io::Read`/`Write`, không `async`) | |
-| M5 | Benchmark so với monoio, tokio | |
+| M4 | Crate Rust `em` (`std::io::Read`/`Write`, không `async`) | Xong |
+| M5 | Đo sâu: `perf` ở 1024 conn × 4 KiB (em-uring, em-epoll, tokio), lặp bench đo nhiễu x86/arm, latency p99, bench churn connection | |
 
 Sau v0: TLS, HTTP, binding Java/JS/Python.
 
@@ -63,12 +63,13 @@ Cần: Linux ≥ 6.1, gcc, make, liburing-devel. Test ASan cần thêm libasan v
 ```bash
 make test         # -O2
 make test-asan    # AddressSanitizer + UBSan
+make test-rust    # crate Rust, cargo test trên cả hai backend
 ```
 
 Mỗi lệnh chạy toàn bộ test hai lần, một lần với `EM_BACKEND=uring`, một lần với
 `EM_BACKEND=epoll`. Muốn chạy một backend thôi: `make test BACKENDS=epoll`.
 
-CI chạy cả hai lệnh trên x86_64 và arm64 (runner ARM thật của GitHub) mỗi lần push.
+CI chạy cả ba lệnh trên x86_64 và arm64 (runner ARM thật của GitHub) mỗi lần push.
 qemu-user không giả lập io_uring nên không dùng được để test.
 
 Nếu `vm.max_map_count` thấp (mặc định 65530 trên Debian/Ubuntu), mỗi fiber tốn 2 vùng nhớ
@@ -77,6 +78,36 @@ nên trần là khoảng 32 nghìn fiber. Muốn nhiều hơn thì tăng sysctl 
 Trên một số kernel, bộ nhớ ring io_uring tính vào `RLIMIT_MEMLOCK` (theo UID, mặc định
 8 MiB). Mỗi worker tốn khoảng 40 KiB nên 8 MiB đủ cho khoảng 200 worker. Thiếu thì `em_run`
 trả `-ENOMEM`, khi đó tăng `ulimit -l`.
+
+## Rust
+
+Crate `rust/em` bọc API C thành kiểu an toàn: `TcpStream` implement `std::io::Read + Write`
+nên code sync có sẵn chạy nguyên trạng. Không `async`. Socket là `!Send + !Sync` (fiber không
+rời worker), `scope` giống `std::thread::scope` (con được mượn biến, lỗi/panic đầu tiên hủy
+anh em và được trả lên).
+
+```rust
+fn main() -> std::io::Result<()> {
+    em::run(0, || {                                   // chạy trên mọi worker
+        let l = em::TcpListener::bind("0.0.0.0:8080".parse().unwrap())?;
+        em::scope(|s| loop {
+            let mut c = l.accept()?;
+            s.spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = c.read(&mut buf)?;
+                    if n == 0 { return Ok(()); }
+                    c.write_all(&buf[..n])?;
+                }
+            })?;
+        })
+    })
+}
+```
+
+Cần `cargo` và liburing-devel; `build.rs` tự biên dịch phần C. Test: `make test-rust`
+(chạy cả hai backend). Gọi thư viện chặn của std trong fiber sẽ đứng cả worker, xem phần tài
+liệu đầu của crate. Mọi lệnh em gọi ngoài fiber trả `-EPERM`.
 
 ## Backend: io_uring hay epoll
 

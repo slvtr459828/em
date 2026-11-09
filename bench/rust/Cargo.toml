@@ -1,5 +1,5 @@
 [workspace]
-members = ["tokio_echo", "monoio_echo", "compio_echo", "glommio_echo", "client"]
+members = ["em_rs_echo", "tokio_echo", "monoio_echo", "compio_echo", "glommio_echo", "client"]
 resolver = "2"
 
 [profile.release]

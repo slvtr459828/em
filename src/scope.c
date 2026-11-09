@@ -12,6 +12,10 @@ static int64_t min_deadline(int64_t a, int64_t b)
 void em_scope_open(em_scope *s, int64_t deadline_ns)
 {
     em_fiber *f = em_W.current;
+    if (!f) { /* outside a fiber: leave an inert scope; em_scope_close reports -EPERM */
+        *s = (em_scope){0};
+        return;
+    }
     s->parent = f->cur_scope;
     s->deadline = min_deadline(deadline_ns, s->parent->deadline);
     s->cancelled = 0;
@@ -83,6 +87,7 @@ int em_scope_close(em_scope *s)
 {
     em_worker *w = &em_W;
     em_fiber *f = w->current;
+    if (!f) return -EPERM;
     assert(s->owner == f && f->cur_scope == s); /* LIFO on the opener */
     if (s->nchildren) {
         s->closer = f;

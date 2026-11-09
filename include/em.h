@@ -22,6 +22,14 @@ struct em_scope {
     em_fiber *owner;       /* fiber that opened it (LIFO check) */
 };
 
+/* Fiber context. Everything below except em_run, em_now, em_cancel_all and the
+ * em_worker_* / em_backend queries must be called from a fiber. Called anywhere
+ * else (before or after em_run on the calling thread, a thread em did not start,
+ * e.g. through a socket kept in a thread-local past em_run) the calls fail
+ * instead of touching worker state that no longer exists: I/O, em_sleep_until,
+ * em_spawn, em_park and em_scope_close return -EPERM; em_close just close()s fd
+ * (0 or -errno); em_yield does nothing; em_scope_open leaves an inert scope. */
+
 /* Runs main_fn as the first fiber of EVERY worker (one app copy per core).
  * nworkers = 0: the number of CPUs this process may run on (sched_getaffinity).
  * The calling thread is worker 0; nworkers-1 more threads are created. Worker i

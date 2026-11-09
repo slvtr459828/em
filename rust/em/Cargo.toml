@@ -1,0 +1,13 @@
+[package]
+name = "em"
+version = "0.0.0"
+edition = "2021"
+description = "Rust binding of the em C runtime: stackful fibers, thread-per-core, io_uring/epoll"
+publish = false
+build = "build.rs"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+cc = "1"
