@@ -52,7 +52,7 @@ Lý do đầy đủ nằm trong [DESIGN.md](DESIGN.md).
 | M3 | Nhiều worker, `SO_REUSEPORT`, UDP | Xong |
 | M3.5 | Backend epoll (chọn tường minh auto/uring/epoll) | Xong |
 | M4 | Crate Rust `em` (`std::io::Read`/`Write`, không `async`) | Xong |
-| M5 | Đo sâu: `perf` ở 1024 conn × 4 KiB (em-uring, em-epoll, tokio), lặp bench đo nhiễu x86/arm, latency p99, bench churn connection, chạy lâu 10–30 phút với RSS phải phẳng | |
+| M5 | Đo sâu: syscall/round-trip và `perf`, khoảng nhiễu qua 5 vòng, latency p99, churn connection, soak 600 s với RSS phẳng | Xong |
 
 Sau v0: TLS, HTTP, binding Java/JS/Python.
 
@@ -108,6 +108,31 @@ fn main() -> std::io::Result<()> {
 Cần `cargo` và liburing-devel; `build.rs` tự biên dịch phần C. Test: `make test-rust`
 (chạy cả hai backend). Gọi thư viện chặn của std trong fiber sẽ đứng cả worker, xem phần tài
 liệu đầu của crate. Mọi lệnh em gọi ngoài fiber trả `-EPERM`.
+
+## Kết quả đo (M5)
+
+Echo ping-pong, server 1 CPU, client 3 CPU, runner GitHub 4 vCPU, 5 vòng. Tỉ lệ so với
+tokio-epoll, kèm `[min–max]` theo từng vòng; ô nào khoảng chứa 1.00 thì đọc là ngang
+(quy tắc trong `plans/bench.md`). Run: bench [42572531707](https://github.com/slvtr459828/em/actions/runs/42572531707),
+soak [42574922764](https://github.com/slvtr459828/em/actions/runs/42574922764).
+
+| | x86_64 | arm64 |
+|---|---|---|
+| em-uring, round-trip/s | 1.07–1.22x (ngang ở 1024 × 128) | 1.19–1.21x ở 16–256 conn; ngang ở 1024 |
+| em-epoll, round-trip/s | 1.09–1.13x ở 16 và 1024 × 128; ngang ở 256 và 1024 × 4 KiB | 1.03–1.07x; ngang ở 1024 × 4 KiB |
+| p99/p50 ở 1024 conn | em 1.0–1.2; tokio 59–67 | em 1.2–1.3; tokio 102–118 |
+| churn, connection/s | em-epoll 1.18x, em-uring 0.97x | em-uring 1.51x, em-epoll 1.30x |
+| soak 600 s churn (33–53 triệu connection) | RSS và số vùng map phẳng, cả uring và epoll | như x86 |
+
+- **em-epoll** trước M5 chậm hơn tokio 1–14% khi nhiều connection. Nguyên nhân đo được: mỗi
+  round-trip tốn thêm một `recv` trả `EAGAIN` (3.02 syscall so với 2.03 của tokio). Sau khi sửa
+  (một `recv` ngắn trên stream thì đợi edge trước lần đọc sau), em-epoll tốn 2.03, bằng tokio.
+  Profile cho thấy phần userspace của cả hai chỉ 1–4% CPU; còn lại là stack TCP của kernel.
+- **Câu hỏi arm64 ở 1024 × 4 KiB:** em-uring 1.18x `[0.96–1.23]`, là ngang theo quy tắc, không thua.
+- **Đuôi latency của tokio** ở 1024 conn (p99 gấp 60–120 lần p50) là của tokio: các server
+  khác, gồm monoio-epoll dùng cùng client, đều ở 1.0–1.3.
+- **binding Rust:** `emrs-*` nằm trong khoảng nhiễu của `em-*` ở mọi ô, kể cả churn (một
+  `Box` mỗi lần spawn không hiện ra). `em_spawn_copy` vẫn hoãn.
 
 ## Backend: io_uring hay epoll
 
