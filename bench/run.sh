@@ -51,11 +51,11 @@ build_tls_prefix() {
     { cc "${cf[@]}" -c src/tls.c -o "$d/tls.o" && rm -f "$d/libem_tls.a" && ar rcs "$d/libem_tls.a" "$d/tls.o" &&
       cc "${cf[@]}" -Isrc bench/em_tls_echo.c "$d/libem_tls.a" "$rel/libem.a" -L"$lib" -lssl -lcrypto -luring -lm -lpthread \
           -o "$d/em_tls_echo"; } >&2 ||
-        { echo "TLS_PREFIX=$TLS_PREFIX: em_tls does not build against it (OpenSSL 3.x only; AWS-LC lacks BIO_nread0/nwrite0, ERR_get_error_all, EVP_EC_gen)" >&2; return 1; }
+        { echo "TLS_PREFIX=$TLS_PREFIX: em_tls does not build against it (OpenSSL 3.x or AWS-LC)" >&2; return 1; }
 }
 
 build() {
-    make bench-em bench-em-tls >&2
+    make bench-em bench-em-tls TLS_PREFIX= >&2 # the default build: TLS_PREFIX is built separately below
     mkdir -p "$BIN"
     cp "build/$ARCH/rel/em_echo" "$BIN/em-uring"
     cp "build/$ARCH/rel/em_echo" "$BIN/em-epoll"

@@ -21,6 +21,8 @@ VARIANTS=(tickets=default tickets=0 tickets=stateless tickets=stateful nodelay=0
 port=22000
 for ((r = 1; r <= ROUNDS; r++)); do
     for v in "${VARIANTS[@]}"; do
+        # AWS-LC has no stateful TLS 1.3 tickets: em_tls_echo refuses TLS_TICKETS=stateful (exit 2)
+        [[ $v == tickets=stateful && -n ${TLS_PREFIX:-} ]] && grep -qs OPENSSL_IS_AWSLC "$TLS_PREFIX/include/openssl/base.h" && continue
         unset TLS_TICKETS NODELAY
         case $v in
             tickets=default) ;;

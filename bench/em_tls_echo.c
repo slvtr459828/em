@@ -69,6 +69,10 @@ int main(int argc, char **argv)
         if (!strcmp(tk, "0")) SSL_CTX_set_num_tickets(sctx, 0);
         else if (!strcmp(tk, "stateless")) SSL_CTX_set_num_tickets(sctx, 2);
         else if (!strcmp(tk, "stateful")) {
+#ifdef OPENSSL_IS_AWSLC
+            fprintf(stderr, "TLS_TICKETS=stateful: not supported on AWS-LC (no stateful TLS 1.3 tickets)\n");
+            return 2;
+#endif
             SSL_CTX_set_options(sctx, SSL_OP_NO_TICKET);
             SSL_CTX_set_session_cache_mode(sctx, SSL_SESS_CACHE_SERVER);
             SSL_CTX_set_session_id_context(sctx, (const unsigned char *)"em", 2);

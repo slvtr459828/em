@@ -7,7 +7,9 @@
 #   $OUT/tls_lib.md   the same with ratios vs rustls-ring (also appended to $GITHUB_STEP_SUMMARY)
 #   $OUT/speed.txt    openssl speed / bssl speed per library
 # Prefixes: build/$(uname -m)/tlslibs/<name>/{include,lib,bin} (other tools rely on this layout).
-# env: ITERS (5000, per op and variant), OUT (bench/out/tls-lib), LIBS (default: all of $ALL)
+# env: ITERS (5000, per op and variant), OUT (bench/out/tls-lib), LIBS (default: all of $ALL),
+#      BUILD_ONLY=1: build the prefixes of LIBS (cached by .done) and exit; nothing is compiled or run
+#      (CI job awslc and the bench `awslc` input use BUILD_ONLY=1 LIBS=aws-lc-5.12.0, then make TLS_PREFIX=...)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ITERS=${ITERS:-5000}
@@ -64,13 +66,16 @@ BIN=$ROOT/bin
 CFLAGS="-O2 -g -Wall -Wno-deprecated-declarations"
 for n in "${LIBS[@]}"; do
     if [[ $n == system ]]; then
+        [[ -z ${BUILD_ONLY:-} ]] || continue
         cc $CFLAGS $(pkg-config --cflags openssl) bench/tls_lib.c -o "$BIN/tls_lib-system" $(pkg-config --libs openssl)
     else
         build_lib "$n"
+        [[ -z ${BUILD_ONLY:-} ]] || continue
         cc $CFLAGS -I"$ROOT/$n/include" bench/tls_lib.c -o "$BIN/tls_lib-$n" \
             -L"$ROOT/$n/lib" -lssl -lcrypto -Wl,-rpath,"$ROOT/$n/lib"
     fi
 done
+[[ -z ${BUILD_ONLY:-} ]] || { echo "BUILD_ONLY: prefixes in $ROOT" >&2; exit 0; }
 (cd bench/rust && cargo build --release --locked -p tls_lib_rs >&2)
 
 CSV=$OUT/tls_lib.csv

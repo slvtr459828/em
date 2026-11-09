@@ -12,12 +12,31 @@ TESTS := tests/t1_pingpong tests/t2_churn tests/t3_many tests/t4_guard tests/t5_
 
 # em_tls (libem_tls.a, tests t40..t46) needs OpenSSL. Without it libem and its tests still build;
 # `make test` says the TLS tests were skipped. Simulate that: make PKG_CONFIG=false
+# TLS_PREFIX=dir builds against the library installed in dir (include/, lib/ or lib64/) instead of
+# pkg-config's: OpenSSL self-built, or AWS-LC (see include/em_tls.h). Objects go to a build dir named
+# after the prefix, so they never mix with the default build or with another prefix.
 PKG_CONFIG ?= pkg-config
-ifeq ($(shell $(PKG_CONFIG) --exists openssl && echo yes),yes)
-TLS_TESTS := tests/t40_tls_echo tests/t41_tls_duplex tests/t42_tls_verify tests/t43_tls_truncate \
-  tests/t44_tls_cancel tests/t45_tls_workers tests/t46_tls_flushwait
+ifneq ($(TLS_PREFIX),)
+TLS_FOUND := yes
+TLS_LIBDIR := $(firstword $(wildcard $(TLS_PREFIX)/lib64/libssl.* $(TLS_PREFIX)/lib/libssl.*))
+TLS_LIBDIR := $(patsubst %/,%,$(dir $(TLS_LIBDIR)))
+ifeq ($(TLS_LIBDIR),)
+$(error TLS_PREFIX=$(TLS_PREFIX): no lib64/libssl.* or lib/libssl.*)
+endif
+TLS_CF    := -I$(TLS_PREFIX)/include
+TLS_LIBS  := -L$(TLS_LIBDIR) -Wl,-rpath,$(TLS_LIBDIR) -lssl -lcrypto
+# basename for people, cksum of the full path so two prefixes named alike cannot share a dir
+TLS_TAG   := -$(notdir $(patsubst %/,%,$(TLS_PREFIX)))-$(word 1,$(shell echo '$(TLS_PREFIX)' | cksum))
+else
+TLS_FOUND := $(shell $(PKG_CONFIG) --exists openssl && echo yes)
+ifeq ($(TLS_FOUND),yes)
 TLS_CF    := $(shell $(PKG_CONFIG) --cflags openssl)
 TLS_LIBS  := $(shell $(PKG_CONFIG) --libs openssl)
+endif
+endif
+ifeq ($(TLS_FOUND),yes)
+TLS_TESTS := tests/t40_tls_echo tests/t41_tls_duplex tests/t42_tls_verify tests/t43_tls_truncate \
+  tests/t44_tls_cancel tests/t45_tls_workers tests/t46_tls_flushwait
 TESTS     += $(TLS_TESTS)
 endif
 
@@ -27,8 +46,8 @@ else
 ASM := src/ctx_aarch64.S
 endif
 
-B_REL  := build/$(ARCH)/rel
-B_ASAN := build/$(ARCH)/asan
+B_REL  := build/$(ARCH)/rel$(TLS_TAG)
+B_ASAN := build/$(ARCH)/asan$(TLS_TAG)
 CF_REL  := -std=gnu11 -O2 -g -D_FORTIFY_SOURCE=3 $(WARN) -Iinclude
 CF_ASAN := -std=gnu11 -O1 -g $(WARN) -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer
 

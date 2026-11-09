@@ -27,6 +27,30 @@ jobs:
       # cargo/rustup come preinstalled on GitHub runners (x86_64 and arm64)
       - run: make test-rust
 
+  # em_tls against AWS-LC (make TLS_PREFIX): the AWS-LC data path in src/tls.c is only built and
+  # tested here. The cache is shared with bench.yml (same key) and keeps the ~147 MB build to once.
+  awslc:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liburing-dev libssl-dev cmake golang-go
+      - name: env
+        run: sudo sysctl -w vm.max_map_count=1048576
+      - uses: actions/cache@v4
+        with:
+          path: build/*/tlslibs
+          key: tlslibs-${{ runner.arch }}-${{ hashFiles('bench/tls_libs.sh') }}
+      - name: build AWS-LC
+        run: BUILD_ONLY=1 LIBS=aws-lc-5.12.0 bench/tls_libs.sh
+      - run: make test TLS_PREFIX=$PWD/build/$(uname -m)/tlslibs/aws-lc-5.12.0
+      # ASan on em_tls and the tests; AWS-LC itself is not instrumented
+      - run: make test-asan TLS_PREFIX=$PWD/build/$(uname -m)/tlslibs/aws-lc-5.12.0
+
   # D8: the default Docker seccomp profile blocks io_uring. Run the suite the way
   # a container user would: no --privileged, no --security-opt. auto must pick epoll.
   docker-epoll:

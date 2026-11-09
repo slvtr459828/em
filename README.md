@@ -60,7 +60,7 @@ Sau v0.2: HTTP, binding Java/JS/Python.
 
 ## Build và test
 
-Cần: Linux ≥ 6.1, gcc, make, liburing-devel. Test ASan cần thêm libasan và libubsan. TLS (`libem_tls`, test t40–t46) cần thêm OpenSSL ≥ 3.0 (`libssl-dev`/`openssl-devel`, tìm bằng `pkg-config openssl`); thiếu thì `libem` và test của nó vẫn build, còn `make test` in dòng `SKIPPED: TLS tests ...` (không bỏ qua âm thầm).
+Cần: Linux ≥ 6.1, gcc, make, liburing-devel. Test ASan cần thêm libasan và libubsan. TLS (`libem_tls`, test t40–t46) cần thêm OpenSSL ≥ 3.0 (`libssl-dev`/`openssl-devel`, tìm bằng `pkg-config openssl`; hoặc `make TLS_PREFIX=dir` với một prefix OpenSSL/AWS-LC tự build, xem đầu `include/em_tls.h`); thiếu thì `libem` và test của nó vẫn build, còn `make test` in dòng `SKIPPED: TLS tests ...` (không bỏ qua âm thầm).
 
 ```bash
 make test         # -O2

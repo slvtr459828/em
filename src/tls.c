@@ -1,8 +1,11 @@
 /* em_tls: OpenSSL over a BIO pair. See include/em_tls.h for the contract.
  *
- * Data path: em_recv writes straight into the BIO buffer SSL reads from (BIO_nwrite0), SSL_read
- * decrypts into the caller's buffer; SSL_write encrypts into the BIO buffer and em_send sends
- * straight from it (BIO_nread0). No copy beyond the one TLS itself needs.
+ * Data path, OpenSSL: em_recv writes straight into the BIO buffer SSL reads from (BIO_nwrite0),
+ * SSL_read decrypts into the caller's buffer; SSL_write encrypts into the BIO buffer and em_send
+ * sends straight from it (BIO_nread0). No copy into or out of the BIO beyond the one SSL itself
+ * makes. AWS-LC (OPENSSL_IS_AWSLC) has no BIO_nread0/nwrite0: one extra copy each way, between
+ * the BIO and an IN_BYTES array on the fiber's stack (never a shared buffer: io_uring uses it
+ * while the fiber is parked).
  *
  * Fibers only park in em_recv / em_send / em_park, never inside an SSL_* call, and a worker runs
  * one fiber at a time, so SSL_* calls of the reader and the writer never overlap. */
@@ -48,6 +51,10 @@ struct saved {
     unsigned long code[NSAVED];
     char          data[NSAVED][128];
     int           n;
+#ifdef OPENSSL_IS_AWSLC
+    const char   *file[NSAVED];
+    int           line[NSAVED];
+#endif
 };
 
 static void save_errors(struct saved *s)
@@ -56,8 +63,17 @@ static void save_errors(struct saved *s)
     unsigned long c;
     const char *data;
     int flags;
+#ifdef OPENSSL_IS_AWSLC
+    const char *file;
+    int line;
+    while (s->n < NSAVED && (c = ERR_get_error_line_data(&file, &line, &data, &flags)) != 0) {
+        s->code[s->n] = c;
+        s->file[s->n] = file; /* points to a string literal inside the library */
+        s->line[s->n] = line;
+#else
     while (s->n < NSAVED && (c = ERR_get_error_all(NULL, NULL, NULL, &data, &flags)) != 0) {
         s->code[s->n] = c;
+#endif
         s->data[s->n][0] = 0;
         if (data && (flags & ERR_TXT_STRING)) snprintf(s->data[s->n], sizeof s->data[0], "%s", data);
         s->n++;
@@ -68,10 +84,34 @@ static void restore_errors(const struct saved *s)
 {
     ERR_clear_error();
     for (int i = 0; i < s->n; i++) {
+#ifdef OPENSSL_IS_AWSLC
+        ERR_put_error(ERR_GET_LIB(s->code[i]), 0, ERR_GET_REASON(s->code[i]), s->file[i], (unsigned)s->line[i]);
+        if (s->data[i][0]) ERR_add_error_data(1, s->data[i]);
+#else
         ERR_new();
         ERR_set_error(ERR_GET_LIB(s->code[i]), ERR_GET_REASON(s->code[i]), "%s", s->data[i]);
+#endif
     }
 }
+
+#ifdef OPENSSL_IS_AWSLC
+/* Sends everything in the BIO through a stack buffer (AWS-LC counterpart of the BIO_nread0 loop
+ * in flush()). Bytes read out of the BIO cannot go back, so every one of them is sent. A separate
+ * function so its IN_BYTES array is never live together with fill()'s one. */
+__attribute__((noinline)) static int drain(em_tls *t)
+{
+    unsigned char buf[IN_BYTES];
+    int n;
+    while ((n = BIO_read(t->net, buf, sizeof buf)) > 0) {
+        for (int o = 0; o < n;) {
+            ssize_t s = em_send(t->fd, buf + o, (size_t)(n - o));
+            if (s < 0) { t->broken = 1; return (int)s; }
+            o += (int)s;
+        }
+    }
+    return 0;
+}
+#endif
 
 /* Sends everything the SSL has queued, until the BIO is empty (including bytes queued by the
  * other fiber meanwhile). Only one fiber drains at a time. wait: if another fiber is draining,
@@ -90,6 +130,10 @@ static int flush(em_tls *t, int wait)
         if (t->broken) return -EPIPE;
     }
     int r = 0;
+#ifdef OPENSSL_IS_AWSLC
+    t->flushing = 1;
+    r = drain(t);
+#else
     char *p;
     long n;
     t->flushing = 1;
@@ -98,10 +142,27 @@ static int flush(em_tls *t, int wait)
         if (s < 0) { r = (int)s; t->broken = 1; break; }
         BIO_nread(t->net, &p, (int)s);
     }
+#endif
     t->flushing = 0;
     if (t->waiter) em_unpark(t->waiter);
     return r;
 }
+
+#ifdef OPENSSL_IS_AWSLC
+/* Reads from the socket into the BIO (the AWS-LC counterpart of the BIO_nwrite0 block in run()).
+ * Its own function so the IN_BYTES array is never live together with drain()'s one. */
+__attribute__((noinline)) static int fill(em_tls *t)
+{
+    unsigned char in[IN_BYTES];
+    size_t room = BIO_ctrl_get_write_guarantee(t->net);
+    if (room == 0) return -EIO; /* SSL wants input while its input BIO is full: not reachable */
+    ssize_t k = em_recv(t->fd, in, room < sizeof in ? room : sizeof in);
+    if (k < 0) return (int)k;        /* cancelled / deadline: nothing consumed, retryable */
+    if (k == 0) return -ECONNRESET;  /* TCP EOF without close_notify */
+    if (BIO_write(t->net, in, (int)k) != k) return -EIO; /* k <= room: not reachable */
+    return 0;
+}
+#endif
 
 /* One loop for every operation. Returns bytes for READ/WRITE (> 0), 0 for the rest and for
  * close_notify on READ, or -errno. */
@@ -156,6 +217,11 @@ static int run(em_tls *t, enum op op, void *buf, int len)
         case SSL_ERROR_WANT_READ: {
             if (fr < 0) return fr;
             if (op == WRITE || op == SHUTDOWN) return -EPROTO; /* no renegotiation: not reachable */
+#ifdef OPENSSL_IS_AWSLC
+            int fr2 = fill(t);
+            if (fr2 < 0) return fr2;
+            continue;
+#else
             char *p;
             long room = BIO_nwrite0(t->net, &p);
             if (room <= 0) return -EIO; /* SSL wants input while its input BIO is full: not reachable */
@@ -164,6 +230,7 @@ static int run(em_tls *t, enum op op, void *buf, int len)
             if (k == 0) return -ECONNRESET;  /* TCP EOF without close_notify */
             BIO_nwrite(t->net, &p, (int)k);
             continue;
+#endif
         }
         default: /* SYSCALL, WANT_X509_LOOKUP...: no syscalls happen inside SSL_* here */
             return -EIO;
