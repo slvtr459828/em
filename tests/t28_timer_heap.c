@@ -29,12 +29,14 @@ static int main_fn(void *arg)
     uint64_t rng = 88172645463325252ull;
     em_scope s;
     em_scope_open(&s, 0);
-    int64_t base = em_now();
     for (int i = 0; i < N; i++) {
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv[i]) == 0);
-        dl[i] = base + 60000000LL + (int64_t)(xs_next(&rng) % 100) * 1000000LL;
         assert(em_spawn(&s, waiter, (void *)(intptr_t)i) == 0);
     }
+    /* After the setup loop (waiters read dl[i] only when they run, at the yield below), so a
+     * slow host cannot eat the margin before anyone waits. */
+    int64_t base = em_now();
+    for (int i = 0; i < N; i++) dl[i] = base + 60000000LL + (int64_t)(xs_next(&rng) % 100) * 1000000LL;
     em_yield(); /* everyone is waiting */
     for (int i = 0; i < N; i++)
         if (xs_next(&rng) & 1) { assert(em_send(sv[i][1], "x", 1) == 1); }
