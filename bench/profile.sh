@@ -20,6 +20,7 @@ PROF_CELLS=(${PROF_CELLS:-16:4096 1024:4096})
 build
 mkdir -p "$OUT"
 echo "server,conns,size,syscall,per_rt" >"$OUT/syscalls.csv"
+echo "server,conns,size,rps_under_perf" >"$OUT/rps.csv"
 port=21000
 for cell in "${PROF_CELLS[@]}"; do
     arg=(); tag=
@@ -42,10 +43,12 @@ for cell in "${PROF_CELLS[@]}"; do
         # record the server CPU while the client runs (the client itself is not run under perf/sudo)
         "${PERF[@]}" record -q -e cpu-clock -C "$SRV_CPUS" -o "$OUT/perf.data" -- sleep "$DURATION" &
         sp=$!
-        taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" "${arg[@]}" >/dev/null
+        taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" "${arg[@]}" >"$OUT/rps.tmp"
         wait $sp
+        # server CPU time per round-trip (idle included) = 1e6 / rps: a profile share x this = us per round-trip
+        read -r _ rps _ <"$OUT/rps.tmp"; echo "$srv,$c,$s,$rps" >>"$OUT/rps.csv"
         stop
-        "${PERF[@]}" report -q -i "$OUT/perf.data" --no-children --sort comm,dso,sym --percent-limit 0.5 \
+        "${PERF[@]}" report -q -i "$OUT/perf.data" --no-children --sort comm,dso,sym --percent-limit 0.1 \
             >"$OUT/$srv-$tag${c}x$s.txt" 2>/dev/null
         "${PERF[@]}" report -q -i "$OUT/perf.data" --no-children --sort dso >"$OUT/$srv-$tag${c}x$s.dso.txt" 2>/dev/null
         head -n 25 "$OUT/$srv-$tag${c}x$s.txt" >&2
