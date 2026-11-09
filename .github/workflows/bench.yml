@@ -23,6 +23,10 @@ on:
         description: run bench/tls_ablate.sh (em_tls glue ablation, plans/tls-perf.md step 4) instead of the bench
         type: boolean
         default: false
+      tlslib:
+        description: "run bench/tls_libs.sh: TLS library microbench"
+        type: boolean
+        default: false
 
 jobs:
   bench:
@@ -41,6 +45,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench/rust
+      - name: tlslib deps
+        if: inputs.tlslib
+        run: command -v cmake >/dev/null && command -v go >/dev/null || sudo apt-get install -y --no-install-recommends cmake golang-go
+      - uses: actions/cache@v4
+        if: inputs.tlslib
+        with:
+          path: build/*/tlslibs
+          key: tlslibs-${{ runner.arch }}-${{ hashFiles('bench/tls_libs.sh') }}
       - name: bench
         # max_map_count: em maps stacks per fiber. nofile/memlock (glommio) are raised on this
         # shell, which bench/run.sh inherits; prlimit under sudo may exceed the hard limit.
@@ -75,6 +87,8 @@ jobs:
           elif [[ "${{ inputs.tlsablate }}" == true ]]; then
             # no perf needed beyond what the runner has: counters are used only when the VM exposes a PMU
             DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/tls_ablate.sh
+          elif [[ "${{ inputs.tlslib }}" == true ]]; then
+            bench/tls_libs.sh
           elif [[ "${{ inputs.soak }}" != 0 ]]; then
             SOAK=${{ inputs.soak }} bench/soak.sh
           else
