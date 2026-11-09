@@ -140,3 +140,11 @@ Trong `include/em_tls.h` và README:
 - **Trade-off: trùng symbol khi trộn với OpenSSL hệ thống.** Là giới hạn đã tài liệu hoá của tuỳ chọn,
   cách tránh là `BORINGSSL_PREFIX`.
 - **Nợ:** không có nợ mới. Nợ "reader flush" có sẵn được giữ nguyên, kèm kiểm tra trong red team.
+
+## Kết quả Phần 1 (CI 42656222023, 9 vòng; cục bộ có PMU)
+
+rps epoll 256×128 so với base (x86 / arm): G1 1.031 / 1.048, G14 1.078 / 1.022, G124 1.054 / 1.077,
+ALL 1.072 / 1.044. Không tập nào đạt ≥ 80% mức lợi của ALL trên cả hai arch, nên chỉ lấy G1. Min-max của CI
+±10–15%, rps không phân giải được vài phần trăm. `instructions:u` cục bộ trên ô 128: G1 -13%,
+G14 -17–20%, G124 -20%, ALL -21%. G1 không đổi hành vi (hàng lỗi rỗng thì không có gì để xoá). Đã áp vào
+`tls.c`; công cụ ablation đã xoá. Xét lại G4 nếu có máy đo rps ổn định hơn nhiễu 5%.

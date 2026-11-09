@@ -142,7 +142,7 @@ run_cell() {
     CELL_ROW="$rps,$cols,$p50,$p99,$p999,$res"
 }
 
-# bench/profile.sh, tls_ab.sh and tls_ablate.sh source this file for build/start/stop/run_cell and the settings above.
+# bench/profile.sh and tls_ab.sh source this file for build/start/stop/run_cell and the settings above.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 
 build
