@@ -117,3 +117,30 @@ sau khi gộp.
 
 - Trade-off: x86 cục bộ đo chính xác (PMU), arm chỉ có thời gian. Xét lại nếu hai arch vênh nhau.
 - Nợ: không có nợ mới (plan không đổi code thư viện).
+
+## Kết quả (CI 2026-11-09: profile 42647821447, tlsab 42647829619, tlsablate 42649386671, tlslib 42652112934)
+
+Microbench thư viện, ns phía server, tỉ lệ so với rustls-ring (x86 / arm):
+
+| op | OpenSSL 3.0.13 | OpenSSL 3.5.9 | AWS-LC 5.12.0 | system (Ubuntu 3.0.13) |
+|---|---|---|---|---|
+| full, tickets 0 | 1.76 / 2.13 | 1.70 / 2.01 | 0.89 / 1.02 | 1.87 / 2.49 |
+| full, stateless | 1.91 / 2.35 | 2.10 / 2.53 | 0.90 / 1.03 | 2.03 / 2.74 |
+| resume | 1.65 / 2.03 | 1.59 / 1.90 | 0.87 / 1.02 | 1.77 / 2.39 |
+| rec128 | 1.61 / 1.61 | 1.23 / 1.47 | 1.09 / 1.24 | 1.66 / 2.01 |
+| rec4096 | 1.57 / 1.07 | 0.99 / 0.90 | 0.90 / 0.98 | 1.77 / 1.13 |
+
+- H1 sai: cùng chế độ ticket, churn vẫn 1.67–1.76x (x86) / 2.5–2.6x (arm). Phát 2 ticket stateless tốn em
+  36 / 52 µs mỗi kết nối, rustls ~14 µs.
+- H2 đúng: X25519 cùng tốc độ ở mọi thư viện (`openssl speed`/`bssl speed`: ~31.6k/s x86, 24–27k/s arm),
+  nên H3 sai. Profile churn có symbol: OpenSSL tiêu vào malloc/free, rwlock, LH, OSSL_PARAM, ASN.1, không
+  vào primitive. 3.5 không chữa handshake; AWS-LC chữa hết, trên cả hai arch.
+- R1: record nhỏ 3.0 chậm 1.6x; 3.5 và AWS-LC thu hẹp. rec4096 x86 trên 3.0 là AES-GCM chậm hơn (4.5 GB/s
+  so với 9.4 GB/s của 3.5).
+- Bản OpenSSL của Ubuntu chậm hơn bản tự build cùng phiên bản 5–20% (chưa rõ vì sao; không phải phần của em).
+- R2/R3: G1 lợi ổn định ~2–3% mọi ô; ALL +11% (x86) / +6.5% (arm) chỉ trên epoll 256×128; G2–G4 trong nhiễu.
+- R4: biến thể `sys` (chèn syscall) không khác `base` trong microbench. Chưa đo counter tại chỗ (VM không có PMU).
+- H4 sai: em-tls-uring 11 syscall/kết nối, tokio 20. N1 đúng: tắt NODELAY thì p50 ~41 ms ở cả ba server.
+
+Gán: handshake gần như toàn bộ là thư viện (bộ máy OpenSSL 3), record nhỏ phần lớn là thư viện, glue ≤ 10%
+và chỉ ở epoll.
