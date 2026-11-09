@@ -223,7 +223,7 @@ tls.write_all(b"hello")?;           // dev-dependency rustls, crate em không đ
 
 **Chi phí.** Bộ nhớ: **~81 KiB mỗi kết nối TLS idle** (RSS của `bench/em_tls_echo` với 1000
 kết nối idle: 8.4 MiB lúc rảnh, 89 MiB sau đó; đo bằng `bench/rss_tls.sh`; gồm `SSL` của OpenSSL,
-2 × 17 KiB BIO, buffer đọc/ghi của OpenSSL và stack fiber). Chưa tối ưu. CPU: bench có thêm
+BIO 19.5 KiB ghi + 18 KiB đọc, buffer đọc/ghi của OpenSSL và stack fiber). Chưa tối ưu. CPU: bench có thêm
 em-tls-uring/em-tls-epoll/tokio-rustls ở echo 256 × 128, 256 × 4096 và churn 64 × 128, và bảng
 (h) trong `bench/table.py` tính chi phí TLS = µs/round-trip của em-tls trừ của em thường cùng
 ô (chạy bằng workflow `bench`, chưa có số chính thức; số kTLS dựa vào ô 4096, xem `plans/v0.2.md`).

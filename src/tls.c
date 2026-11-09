@@ -16,9 +16,18 @@
 #include "em.h"
 #include "em_tls.h"
 
-#define BIO_BYTES  (17 * 1024) /* per direction: one maximal TLS record */
-#define REC_PLAIN  16384       /* plaintext per SSL_write: one record */
-#define REC_SLACK  512         /* max ciphertext expansion of a record (header, IV, MAC/tag, padding) */
+/* One SSL_write of REC_PLAIN bytes must always fit the out buffer whole (see run()). It is split
+ * into records of max_send_fragment bytes, which the user (SSL_CTX_set_max_send_fragment) or the
+ * peer (max_fragment_length extension) may lower to 512: up to 32 records. REC_OVH bounds one
+ * record's expansion over every cipher OpenSSL offers: header 5 + IV 16 + MAC 48 (SHA384) +
+ * CBC padding 16 = 85 (TLS 1.3: 22; padding stays within the fragment). CTL_ROOM is for the
+ * small records the reader may add meanwhile (alerts, KeyUpdate). */
+#define REC_PLAIN  16384
+#define REC_OVH    96
+#define REC_WORST  (REC_PLAIN + REC_PLAIN / 512 * REC_OVH)
+#define CTL_ROOM   512
+#define OUT_BYTES  (REC_WORST + CTL_ROOM)    /* 19.5 KiB */
+#define IN_BYTES   (16384 + 2048 + 5)       /* largest record a TLS 1.2 peer may send */
 
 struct em_tls {
     SSL      *ssl;
@@ -29,6 +38,8 @@ struct em_tls {
 };
 
 enum op { ACCEPT, CONNECT, READ, WRITE, SHUTDOWN };
+
+unsigned long em_tls_dbg_partial; /* test hook: SSL_write left a record half-written (must stay 0) */
 
 /* Errors queued by a failed SSL_* call, kept across the flush (which parks: another fiber's
  * ERR_clear_error would erase them) and put back before the caller sees -EPROTO. */
@@ -99,8 +110,9 @@ static int run(em_tls *t, enum op op, void *buf, int len)
     for (;;) {
         /* A data record must never be left half-written inside OpenSSL: if the reader then has to
          * send something (KeyUpdate answer), OpenSSL fails it with "bad write retry" or the records
-         * interleave. So SSL_write only starts when the BIO has room for a whole record. */
-        if (op == WRITE && BIO_ctrl_pending(t->net) > BIO_BYTES - REC_PLAIN - REC_SLACK) {
+         * interleave. So SSL_write only starts when the BIO has room for its whole output
+         * (REC_WORST), and never gets WANT_WRITE (counted in em_tls_dbg_partial for t40). */
+        if (op == WRITE && BIO_ctrl_pending(t->net) > OUT_BYTES - REC_WORST) {
             int r = flush(t, 1);
             if (r < 0) return r;
             continue;
@@ -118,7 +130,14 @@ static int run(em_tls *t, enum op op, void *buf, int len)
         struct saved se;
         if (e == SSL_ERROR_SSL) save_errors(&se);
         /* flush BEFORE any wait for input: TLS 1.3 can produce records while reading
-         * (KeyUpdate, alerts); forgetting means both sides wait for each other */
+         * (KeyUpdate, alerts); forgetting means both sides wait for each other.
+         * DEBT: a READ that flushes here parks in em_send while its connection's input is not
+         * being read. Failure: both ends' readers flush at once (simultaneous KeyUpdate answer or
+         * alert under bulk traffic both ways) with both TCP send buffers full and both writers
+         * parked in em_send too: nobody reads, both connections stall until a deadline. Not yet
+         * triggered by any test (OpenSSL 3.5 sends the KeyUpdate answer from SSL_write).
+         * Remove when the reader's flush no longer blocks reading: hand it to a flusher fiber
+         * (or to the writer) and keep reading meanwhile. */
         int fr = flush(t, op != READ || e == SSL_ERROR_WANT_WRITE);
         switch (e) {
         case SSL_ERROR_NONE:
@@ -131,6 +150,7 @@ static int run(em_tls *t, enum op op, void *buf, int len)
             if (fr < 0) return fr;
             return op == READ ? 0 : op == WRITE ? -EPIPE : -ECONNRESET;
         case SSL_ERROR_WANT_WRITE: /* BIO was full; flushed above, retry */
+            if (op == WRITE) em_tls_dbg_partial++;
             if (fr < 0) return fr;
             continue;
         case SSL_ERROR_WANT_READ: {
@@ -165,7 +185,7 @@ static int start(em_tls **out, SSL_CTX *ctx, int fd, const char *host, int clien
     t->fd = fd;
     BIO *in = NULL;
     t->ssl = SSL_new(ctx);
-    if (!t->ssl || !BIO_new_bio_pair(&in, BIO_BYTES, &t->net, BIO_BYTES)) {
+    if (!t->ssl || !BIO_new_bio_pair(&in, OUT_BYTES, &t->net, IN_BYTES)) {
         BIO_free(in);
         destroy(t);
         return -ENOMEM;

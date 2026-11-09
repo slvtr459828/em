@@ -8,6 +8,7 @@
 #define MAXSZ  (64u * 1024u)
 
 static SSL_CTX *sctx, *cctx;
+extern unsigned long em_tls_dbg_partial; /* src/tls.c test hook */
 static _Atomic int port;
 static int nw;
 
@@ -78,11 +79,23 @@ static int main_fn(void *arg)
 int main(void)
 {
     tls_test_ctx(&sctx, &cctx);
-    for (nw = 1; nw <= 2; nw++) {
+    for (int pass = 0; pass < 4; pass++) {
+        nw = pass % 2 + 1;
+        if (pass == 2) {
+            /* largest output per SSL_write: TLS 1.2, CBC + SHA384 (biggest per-record expansion),
+             * 512 B records (32 per call). It must still fit the out buffer whole. */
+            SSL_CTX_set_max_proto_version(cctx, TLS1_2_VERSION);
+            assert(SSL_CTX_set_cipher_list(cctx, "ECDHE-ECDSA-AES256-SHA384:@SECLEVEL=0") == 1);
+            assert(SSL_CTX_set_cipher_list(sctx, "ECDHE-ECDSA-AES256-SHA384:@SECLEVEL=0") == 1);
+            SSL_CTX_set_max_send_fragment(sctx, 512);
+            SSL_CTX_set_max_send_fragment(cctx, 512);
+        }
         atomic_store(&port, 0);
         assert(em_run(nw, main_fn, NULL) == 0);
-        printf("tls echo: %d round-trips over %d worker(s) verified\n", ROUNDS, nw);
+        printf("tls echo: %d round-trips over %d worker(s)%s verified\n", ROUNDS, nw,
+               pass >= 2 ? ", TLS 1.2 CBC-SHA384 512 B records," : "");
     }
+    assert(em_tls_dbg_partial == 0); /* no SSL_write ever left a record half-written */
     SSL_CTX_free(sctx);
     SSL_CTX_free(cctx);
     return 0;
