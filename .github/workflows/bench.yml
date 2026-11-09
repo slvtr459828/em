@@ -15,6 +15,10 @@ on:
         description: run bench/profile.sh (syscalls per round-trip + perf profile) instead of the bench
         type: boolean
         default: false
+      tlsablate:
+        description: run bench/tls_ablate.sh (em_tls glue ablation, plans/tls-perf.md step 4) instead of the bench
+        type: boolean
+        default: false
 
 jobs:
   bench:
@@ -50,6 +54,9 @@ jobs:
             # TLS echo: em_tls on both backends vs tokio-rustls (own OUT: same cell names as above never clash)
             PERF="sudo perf" DURATION=${{ inputs.duration }} OUT=bench/out/profile-tls \
               PROF_SERVERS="em-tls-uring em-tls-epoll tokio-rustls" PROF_CELLS="tls:256:128 tls:256:4096" bench/profile.sh
+          elif [[ "${{ inputs.tlsablate }}" == true ]]; then
+            # no perf needed beyond what the runner has: counters are used only when the VM exposes a PMU
+            DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/tls_ablate.sh
           elif [[ "${{ inputs.soak }}" != 0 ]]; then
             SOAK=${{ inputs.soak }} bench/soak.sh
           else

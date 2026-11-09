@@ -1,0 +1,35 @@
+--- a/src/tls.c
++++ b/src/tls.c
+@@ -35,6 +35,7 @@
+     int       fd;
+     em_fiber *waiter;  /* fiber parked until the flusher is done (at most one: the other direction) */
+     unsigned char reading, writing, flushing, broken;
++    unsigned char dirty; /* an SSL_* call ran since the BIO was last seen empty (flush) */
+ };
+ 
+ enum op { ACCEPT, CONNECT, READ, WRITE, SHUTDOWN };
+@@ -98,6 +99,7 @@
+         if (s < 0) { r = (int)s; t->broken = 1; break; }
+         BIO_nread(t->net, &p, (int)s);
+     }
++    if (!r) t->dirty = 0; /* the loop ended on an empty BIO, no yield since */
+     t->flushing = 0;
+     if (t->waiter) em_unpark(t->waiter);
+     return r;
+@@ -112,7 +114,7 @@
+          * send something (KeyUpdate answer), OpenSSL fails it with "bad write retry" or the records
+          * interleave. So SSL_write only starts when the BIO has room for its whole output
+          * (REC_WORST), and never gets WANT_WRITE (counted in em_tls_dbg_partial for t40). */
+-        if (op == WRITE && BIO_ctrl_pending(t->net) > OUT_BYTES - REC_WORST) {
++        if (op == WRITE && t->dirty && BIO_ctrl_pending(t->net) > OUT_BYTES - REC_WORST) {
+             int r = flush(t, 1);
+             if (r < 0) return r;
+             continue;
+@@ -126,6 +128,7 @@
+         case WRITE:   n = SSL_write(t->ssl, buf, len); break;
+         default:      n = SSL_shutdown(t->ssl); break; /* 0: close_notify sent, peer's not yet seen */
+         }
++        t->dirty = 1;
+         int e = (n > 0 || (op == SHUTDOWN && n == 0)) ? SSL_ERROR_NONE : SSL_get_error(t->ssl, n);
+         struct saved se;
+         if (e == SSL_ERROR_SSL) save_errors(&se);

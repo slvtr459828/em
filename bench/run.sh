@@ -94,7 +94,25 @@ cpu_ticks() {
     done </proc/stat
 }
 
-# bench/profile.sh sources this file for build/start/stop and the settings above.
+# run_cell srv port conns size [client args]: one measured client run against the started server.
+# Sets total rps p50 p99 p999 (client output, left in $OUT/rps.tmp) and cols = "client_cpu,server_cpu,us_per_rt".
+run_cell() {
+    local srv=$1 port=$2 c=$3 s=$4 t t0 t1 u sy wall
+    shift 4
+    local TIMEFORMAT='%U %S %R'
+    # bash `time` reports the client's own user+sys; client stderr is kept for errors
+    t0=$(cpu_ticks)
+    t=$( { time taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" "$@" \
+             >"$OUT/rps.tmp"; } 2>&1 ) || { echo "client failed for $srv c=$c s=$s: $t" >&2; exit 1; }
+    t1=$(cpu_ticks)
+    read -r u sy wall <<<"$(tail -n1 <<<"$t")"
+    read -r total rps p50 p99 p999 <"$OUT/rps.tmp"
+    # client prints "total_round_trips rps p50 p99 p999"; server CPU is over the same client wall time
+    cols=$(awk -v u="$u" -v s="$sy" -v w="$wall" -v t0="$t0" -v t1="$t1" -v hz="$TICKS" -v n="$total" -v nc="$CLI_THREADS" \
+        'BEGIN { sc = (t1 - t0) / hz; printf "%.2f,%.2f,%.2f", (u + s) / (w * nc), sc / w, sc * 1e6 / n }')
+}
+
+# bench/profile.sh and bench/tls_ablate.sh source this file for build/start/stop/run_cell and the settings above.
 [[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 
 build
@@ -111,7 +129,6 @@ CELLS+=("echotls 256 128" "echotls 256 4096" "churntls 64 128" "churntlsres 64 1
 echo "round,mode,server,conns,size,rps,client_cpu,server_cpu,us_per_rt,p50_us,p99_us,p999_us,resumed" >"$OUT/results.csv"
 : >"$OUT/tls_info.txt" # what each TLS server negotiated, as the client saw it
 port=20000
-TIMEFORMAT='%U %S %R'
 for ((r = 1; r <= ROUNDS; r++)); do
     for cell in "${CELLS[@]}"; do
         read -r mode c s <<<"$cell"
@@ -120,17 +137,8 @@ for ((r = 1; r <= ROUNDS; r++)); do
         for srv in "${srvs[@]}"; do
             port=$((port + 1))
             start "$srv" "$port"
-            # bash `time` reports the client's own user+sys; client stderr is kept for errors
-            t0=$(cpu_ticks)
-            t=$( { time taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" "${arg[@]}" \
-                     >"$OUT/rps.tmp"; } 2>&1 ) || { echo "client failed for $srv c=$c s=$s: $t" >&2; exit 1; }
-            t1=$(cpu_ticks)
+            run_cell "$srv" "$port" "$c" "$s" "${arg[@]}"
             stop
-            read -r u sy wall <<<"$(tail -n1 <<<"$t")"
-            read -r total rps p50 p99 p999 <"$OUT/rps.tmp"
-            # client prints "total_round_trips rps p50 p99 p999"; server CPU is over the same client wall time
-            cols=$(awk -v u="$u" -v s="$sy" -v w="$wall" -v t0="$t0" -v t1="$t1" -v hz="$TICKS" -v n="$total" -v nc="$CLI_THREADS" \
-                'BEGIN { sc = (t1 - t0) / hz; printf "%.2f,%.2f,%.2f", (u + s) / (w * nc), sc / w, sc * 1e6 / n }')
             # TLS cells: the client's second line is "tls <version> <suite> <group> <cert> full=N resumed=M"
             res=-
             if tls=$(sed -n 's/^tls //p' "$OUT/rps.tmp") && [[ -n $tls ]]; then

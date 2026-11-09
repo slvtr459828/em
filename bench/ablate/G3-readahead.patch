@@ -1,0 +1,10 @@
+--- a/bench/em_tls_echo.c
++++ b/bench/em_tls_echo.c
+@@ -55,6 +55,7 @@
+     SSL_CTX *cctx;
+     tls_test_ctx(&sctx, &cctx);
+     SSL_CTX_free(cctx);
++    SSL_CTX_set_read_ahead(sctx, 1);
+     int r = em_run(workers, worker, NULL);
+     if (r) fprintf(stderr, "em_run: %d\n", r);
+     return r != 0;

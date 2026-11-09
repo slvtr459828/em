@@ -1,0 +1,11 @@
+--- a/src/tls.c
++++ b/src/tls.c
+@@ -117,7 +117,7 @@
+             if (r < 0) return r;
+             continue;
+         }
+-        ERR_clear_error();
++        if (ERR_peek_error()) ERR_clear_error();
+         int n;
+         switch (op) {
+         case ACCEPT:  n = SSL_accept(t->ssl); break;
