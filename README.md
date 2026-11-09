@@ -52,7 +52,7 @@ Lý do đầy đủ nằm trong [DESIGN.md](DESIGN.md).
 | M3 | Nhiều worker, `SO_REUSEPORT`, UDP | Xong |
 | M3.5 | Backend epoll (chọn tường minh auto/uring/epoll) | Xong |
 | M4 | Crate Rust `em` (`std::io::Read`/`Write`, không `async`) | Xong |
-| M5 | Đo sâu: `perf` ở 1024 conn × 4 KiB (em-uring, em-epoll, tokio), lặp bench đo nhiễu x86/arm, latency p99, bench churn connection | |
+| M5 | Đo sâu: `perf` ở 1024 conn × 4 KiB (em-uring, em-epoll, tokio), lặp bench đo nhiễu x86/arm, latency p99, bench churn connection, chạy lâu 10–30 phút với RSS phải phẳng | |
 
 Sau v0: TLS, HTTP, binding Java/JS/Python.
 

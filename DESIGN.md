@@ -97,6 +97,15 @@ recv/send không leak, không use-after-free (chạy dưới ASan).
 - Work-stealing, preemption — mâu thuẫn D2 / gây UB dưới code ngôn ngữ chủ.
 - Binding Java/JS/Python, TLS, HTTP.
 
+## Bộ conformance cho binding (để sau, ghi lại để không quên)
+
+Mọi binding phải giữ cùng một bộ ngữ nghĩa với C. Hiện đặc tả là các test C `tests/t*`;
+mỗi test của crate Rust ghi rõ nó ứng với test C nào (`// conformance: ...`).
+**Làm khi bắt đầu binding thứ hai**, không trước: lúc đó mới biết hai binding khác nhau ở
+đâu (panic/exception, Drop/close). Hình dạng dự kiến: mỗi binding một chương trình
+`conformance <kịch-bản>` in kết quả ra stdout; một driver chung đóng vai bên kia mạng và so
+với kết quả mong đợi. Kịch bản viết một lần, mỗi binding chỉ viết phần chạy kịch bản.
+
 ## Hướng cho JS (để sau, ghi lại để không quên)
 
 "Nhẹ hơn bê cả trình duyệt vào backend": thay vì addon N-API chạy trong Node, em làm
