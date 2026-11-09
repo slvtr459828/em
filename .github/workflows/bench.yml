@@ -23,12 +23,12 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    # 10 servers x 6 cells x rounds x (duration + ~1 s) = ~55 min at the defaults
+    # (10 servers x 7 cells + 3 TLS servers x 3 cells) x rounds x (duration + ~1 s) = ~65 min at the defaults
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liburing-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liburing-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

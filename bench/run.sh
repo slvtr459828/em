@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Echo benchmark: em and its Rust crate (io_uring and epoll backends) vs tokio, monoio, compio, glommio. See plans/bench.md.
+# Echo benchmark: em and its Rust crate (io_uring and epoll backends) vs tokio, monoio, compio, glommio.
+# See plans/bench.md. Then three TLS cells (plans/v0.2.md): em-tls-uring, em-tls-epoll, tokio-rustls.
 # env: DURATION (s per run, 10), ROUNDS (5), OUT (output dir, bench/out)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -10,6 +11,7 @@ OUT=${OUT:-bench/out}
 ARCH=$(uname -m)
 BIN=build/$ARCH/bench
 SERVERS=(em-uring emrs-uring monoio-uring compio-uring glommio-uring tokio-epoll monoio-epoll compio-epoll em-epoll emrs-epoll)
+TLS_SERVERS=(em-tls-uring em-tls-epoll tokio-rustls)
 CONNS=(16 256 1024)
 SIZES=(128 4096)
 SRV_CPUS=0 # one server CPU (a single number: see cpu_ticks), 1 worker; client gets 3 CPUs: plans/bench.md
@@ -35,21 +37,25 @@ ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
 ulimit -l unlimited 2>/dev/null || echo "warn: cannot raise RLIMIT_MEMLOCK; glommio may fail" >&2
 
 build() {
-    make bench-em >&2
+    make bench-em bench-em-tls >&2
     mkdir -p "$BIN"
     cp "build/$ARCH/rel/em_echo" "$BIN/em-uring"
     cp "build/$ARCH/rel/em_echo" "$BIN/em-epoll"
+    cp "build/$ARCH/rel/em_tls_echo" "$BIN/em-tls-uring"
+    cp "build/$ARCH/rel/em_tls_echo" "$BIN/em-tls-epoll"
     (
         cd bench/rust
-        local pkgs=(-p tokio_echo -p monoio_echo -p glommio_echo -p client)
+        local pkgs=(-p tokio_echo -p monoio_echo -p glommio_echo)
         # glommio's bundled liburing misses struct open_how with some headers (Fedora 44);
         # on others (Ubuntu 24.04) forcing it in is a redefinition. Only add it when needed.
-        # em_rs_echo on its own: the CFLAGS retry below would also reach em's build.rs (asm file)
-        cargo build --release --locked -p em_rs_echo >&2
+        # em_rs_echo, client, tokio_rustls_echo on their own: the CFLAGS retry below would also reach
+        # the build.rs of em (asm file) and ring (asm files)
+        cargo build --release --locked -p em_rs_echo -p client -p tokio_rustls_echo >&2
         cargo build --release --locked "${pkgs[@]}" >&2 ||
             CFLAGS="${CFLAGS:-} -include linux/openat2.h" cargo build --release --locked "${pkgs[@]}" >&2
         cp target/release/em_rs_echo ../../$BIN/emrs
         cp target/release/tokio_echo ../../$BIN/tokio-epoll
+        cp target/release/tokio_rustls_echo ../../$BIN/tokio-rustls
         cp target/release/monoio_echo ../../$BIN/monoio
         cp target/release/glommio_echo ../../$BIN/glommio-uring
         cp target/release/client ../../$BIN/client
@@ -63,7 +69,8 @@ build() {
 
 start() { # server port: launches pinned in the background, waits until it accepts
     local cmd=("$BIN/$1" "$2" "$WORKERS")
-    case $1 in em-*) cmd=(env "EM_BACKEND=${1#em-}" "${cmd[@]}") ;; esac # same binary, backend forced
+    case $1 in em-tls-*) cmd=(env "EM_BACKEND=${1#em-tls-}" "${cmd[@]}") ;; # same binary, backend forced
+               em-*) cmd=(env "EM_BACKEND=${1#em-}" "${cmd[@]}") ;; esac
     case $1 in emrs-*) cmd=(env "EM_BACKEND=${1#emrs-}" "$BIN/emrs" "$2" "$WORKERS") ;; esac
     case $1 in monoio-*) cmd=("$BIN/monoio" "$2" "${1#monoio-}" "$WORKERS") ;; esac
     taskset -c $SRV_CPUS "${cmd[@]}" >/dev/null &
@@ -96,14 +103,18 @@ mkdir -p "$OUT"
 CELLS=()
 for c in "${CONNS[@]}"; do for s in "${SIZES[@]}"; do CELLS+=("echo $c $s"); done; done
 CELLS+=("churn 64 128")
+# TLS cells: server us/rt of em-tls-* minus em-* in the same cell (same conns x size) is the cost
+# of TLS (table.py). The mode names echotls/churntls keep them apart from the plain cells.
+CELLS+=("echotls 256 128" "echotls 256 4096" "churntls 64 128")
 echo "round,mode,server,conns,size,rps,client_cpu,server_cpu,us_per_rt,p50_us,p99_us,p999_us" >"$OUT/results.csv"
 port=20000
 TIMEFORMAT='%U %S %R'
 for ((r = 1; r <= ROUNDS; r++)); do
     for cell in "${CELLS[@]}"; do
         read -r mode c s <<<"$cell"
-        arg=(); [[ $mode == echo ]] || arg=(churn)
-        for srv in "${SERVERS[@]}"; do
+        case $mode in echo) arg=() ;; churn) arg=(churn) ;; echotls) arg=(tls) ;; churntls) arg=(churn tls) ;; esac
+        srvs=("${SERVERS[@]}"); [[ $mode == *tls ]] && srvs=("${TLS_SERVERS[@]}")
+        for srv in "${srvs[@]}"; do
             port=$((port + 1))
             start "$srv" "$port"
             # bash `time` reports the client's own user+sys; client stderr is kept for errors
@@ -123,5 +134,5 @@ for ((r = 1; r <= ROUNDS; r++)); do
 done
 rm -f "$OUT/rps.tmp"
 
-python3 -I bench/table.py "$OUT/results.csv" "${SERVERS[@]}" | tee "$OUT/table.md"
+python3 -I bench/table.py "$OUT/results.csv" "${SERVERS[@]}" --tls "${TLS_SERVERS[@]}" | tee "$OUT/table.md"
 [[ -z ${GITHUB_STEP_SUMMARY:-} ]] || { echo "### echo bench ($ARCH, ${DURATION}s x $ROUNDS rounds)"; cat "$OUT/table.md"; } >>"$GITHUB_STEP_SUMMARY"

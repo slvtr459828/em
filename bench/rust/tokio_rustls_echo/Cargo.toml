@@ -1,0 +1,10 @@
+[package]
+name = "tokio_rustls_echo"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = "0.13"

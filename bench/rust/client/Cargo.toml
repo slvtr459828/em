@@ -5,3 +5,5 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.54", features = ["rt", "net", "io-util", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

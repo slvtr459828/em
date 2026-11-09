@@ -54,12 +54,13 @@ Lý do đầy đủ nằm trong [DESIGN.md](DESIGN.md).
 | M4 | Crate Rust `em` (`std::io::Read`/`Write`, không `async`) | Xong |
 | M5 | Đo sâu: syscall/round-trip và `perf`, khoảng nhiễu qua 5 vòng, latency p99, churn connection, soak 600 s với RSS phẳng | Xong |
 | v0.1 | offload + DNS | Xong |
+| v0.2 | TLS: `em_tls` (OpenSSL qua BIO pair, ngoài `libem`); Rust dùng rustls trên `em::TcpStream` | Đang chạy CI |
 
-Sau v0: TLS, HTTP, binding Java/JS/Python.
+Sau v0.2: HTTP, binding Java/JS/Python.
 
 ## Build và test
 
-Cần: Linux ≥ 6.1, gcc, make, liburing-devel. Test ASan cần thêm libasan và libubsan.
+Cần: Linux ≥ 6.1, gcc, make, liburing-devel. Test ASan cần thêm libasan và libubsan. TLS (`libem_tls`, test t40–t46) cần thêm OpenSSL ≥ 3.0 (`libssl-dev`/`openssl-devel`, tìm bằng `pkg-config openssl`); thiếu thì `libem` và test của nó vẫn build, còn `make test` in dòng `SKIPPED: TLS tests ...` (không bỏ qua âm thầm).
 
 ```bash
 make test         # -O2
@@ -187,6 +188,45 @@ khi cần, tối đa 64, sống từ `em_run` tới hết `em_run`):
   trước khi trả về. Host dạng số được parse tại chỗ, không qua pool. Rust: `em::resolve`.
 
 Trên epoll, `em_read` trên file thường cũng đi qua pool.
+
+## TLS
+
+**C/C++:** `include/em_tls.h` + `libem_tls.a`, dùng OpenSSL qua BIO pair; mọi lần chờ đi qua
+`em_recv`/`em_send`. Người dùng tự cấu hình `SSL_CTX` (cert, ALPN, verify...) bằng API OpenSSL;
+em không có lớp cấu hình riêng. `libem.a` không phụ thuộc OpenSSL.
+
+```c
+em_tls *t;
+if (em_tls_accept(&t, ctx, fd) == 0) {            // hoặc em_tls_connect(&t, ctx, fd, "host")
+    char buf[4096];
+    ssize_t n;
+    while ((n = em_tls_recv(t, buf, sizeof buf)) > 0)   // 0 = close_notify; cắt ngang = -ECONNRESET
+        if (em_tls_send_all(t, buf, n) < 0) break;
+    em_tls_shutdown(t);
+    em_tls_free(t);
+}
+em_close(fd);
+```
+
+Đọc bị hủy lúc chờ byte thì gọi lại được (deadline đọc dùng kiểu này); hủy lúc đang gửi làm hỏng
+luồng (mọi lệnh sau trả `-EPIPE`). Một kết nối cho một fiber đọc và một fiber ghi cùng lúc
+(song công), fiber thứ hai cùng chiều nhận `-EBUSY`. Chi tiết ở `em_tls.h`.
+
+**Rust:** không có `em::tls`. `rustls::StreamOwned` chạy nguyên trạng trên `em::TcpStream`
+(`Read + Write`, fiber park bên trong), test ở `rust/em/tests/tls.rs`:
+
+```rust
+let tcp = em::TcpStream::connect(addr)?;
+let mut tls = rustls::StreamOwned::new(rustls::ClientConnection::new(config, name)?, tcp);
+tls.write_all(b"hello")?;           // dev-dependency rustls, crate em không đổi
+```
+
+**Chi phí.** Bộ nhớ: **~81 KiB mỗi kết nối TLS idle** (RSS của `bench/em_tls_echo` với 1000
+kết nối idle: 8.4 MiB lúc rảnh, 89 MiB sau đó; đo bằng `bench/rss_tls.sh`; gồm `SSL` của OpenSSL,
+2 × 17 KiB BIO, buffer đọc/ghi của OpenSSL và stack fiber). Chưa tối ưu. CPU: bench có thêm
+em-tls-uring/em-tls-epoll/tokio-rustls ở echo 256 × 128, 256 × 4096 và churn 64 × 128, và bảng
+(h) trong `bench/table.py` tính chi phí TLS = µs/round-trip của em-tls trừ của em thường cùng
+ô (chạy bằng workflow `bench`, chưa có số chính thức; số kTLS dựa vào ô 4096, xem `plans/v0.2.md`).
 
 ## Tài liệu
 

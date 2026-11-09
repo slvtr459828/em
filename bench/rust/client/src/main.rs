@@ -1,15 +1,86 @@
 // Closed-loop ping-pong load generator, same for every server.
-// usage: client addr conns size seconds threads [churn]
+// usage: client addr conns size seconds threads [churn] [tls]
 // Each connection sends `size` bytes, reads exactly `size` back, compares, repeats.
 // churn: each of `conns` loops instead does connect, one round-trip, close with RST
 // (zero linger: no TIME_WAIT, so ephemeral ports do not run out); counts connections.
+// tls: every connection does a TLS handshake first (rustls via tokio-rustls, certificate not
+// verified: the servers use throwaway self-signed ones); churn then counts handshake + round-trip.
 // Prints "total_round_trips round_trips_per_sec p50_us p99_us p999_us"; exits 1 if any echo is
 // short or differs. Latency of every round-trip goes into a per-thread log-linear histogram
 // (128 sub-buckets per power of two, < 1% error; fixed array, nothing allocated while measuring).
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
+use tokio_rustls::TlsConnector;
+
+#[derive(Debug)]
+struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+
+impl ServerCertVerifier for AcceptAny {
+    fn verify_server_cert(&self, _: &CertificateDer<'_>, _: &[CertificateDer<'_>], _: &ServerName<'_>, _: &[u8], _: UnixTime) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+    fn verify_tls12_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn verify_tls13_signature(&self, m: &[u8], c: &CertificateDer<'_>, d: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+    }
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn tls_connector() -> TlsConnector {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let cfg = ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(cfg))
+}
+
+enum Conn {
+    Plain(TcpStream),
+    Tls(Box<TlsStream<TcpStream>>),
+}
+
+impl Conn {
+    async fn open(addr: &str, tls: Option<&TlsConnector>, linger0: bool) -> std::io::Result<Conn> {
+        let tcp = TcpStream::connect(addr).await?;
+        tcp.set_nodelay(true)?;
+        if linger0 {
+            tcp.set_zero_linger()?; // drop = RST
+        }
+        Ok(match tls {
+            None => Conn::Plain(tcp),
+            Some(c) => Conn::Tls(Box::new(c.connect(ServerName::try_from("localhost").unwrap(), tcp).await?)),
+        })
+    }
+
+    async fn round_trip(&mut self, out: &[u8], inb: &mut [u8]) -> std::io::Result<()> {
+        match self {
+            Conn::Plain(s) => {
+                s.write_all(out).await?;
+                s.read_exact(inb).await?;
+            }
+            Conn::Tls(s) => {
+                s.write_all(out).await?;
+                s.flush().await?;
+                s.read_exact(inb).await?;
+            }
+        }
+        Ok(())
+    }
+}
 
 const SUB: usize = 128; // values below SUB ns are exact; above, 7 bits of mantissa
 const NB: usize = (64 - 6) * SUB;
@@ -31,22 +102,18 @@ fn lower(i: usize) -> u64 {
 
 thread_local!(static HIST: RefCell<Vec<u64>> = RefCell::new(vec![0; NB]));
 
-async fn conn(addr: String, size: usize, deadline: Instant, churn: bool) -> std::io::Result<u64> {
-    let mut s = TcpStream::connect(&addr).await?;
-    s.set_nodelay(true)?;
+async fn conn(addr: String, size: usize, deadline: Instant, churn: bool, tls: Option<TlsConnector>) -> std::io::Result<u64> {
+    let mut s = Conn::open(&addr, tls.as_ref(), churn).await?;
     let out: Vec<u8> = (0..size).map(|i| (i * 31 + 7) as u8).collect();
     let mut inb = vec![0u8; size];
     let mut n = 0u64;
     let mut t = Instant::now();
     while t < deadline {
         if churn && n > 0 {
-            s.set_zero_linger()?;
             drop(s);
-            s = TcpStream::connect(&addr).await?;
-            s.set_nodelay(true)?;
+            s = Conn::open(&addr, tls.as_ref(), true).await?;
         }
-        s.write_all(&out).await?;
-        s.read_exact(&mut inb).await?;
+        s.round_trip(&out, &mut inb).await?;
         let t2 = Instant::now();
         if inb != out {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "echo mismatch"));
@@ -60,25 +127,28 @@ async fn conn(addr: String, size: usize, deadline: Instant, churn: bool) -> std:
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
-    if a.len() != 6 && !(a.len() == 7 && a[6] == "churn") {
-        eprintln!("usage: client addr conns size seconds threads [churn]");
+    let flags = &a[a.len().min(6)..];
+    if a.len() < 6 || flags.iter().any(|f| f != "churn" && f != "tls") {
+        eprintln!("usage: client addr conns size seconds threads [churn] [tls]");
         std::process::exit(2);
     }
+    let tls = flags.iter().any(|f| f == "tls");
     let conns: usize = a[2].parse().unwrap();
     let size: usize = a[3].parse().unwrap();
     let secs: f64 = a[4].parse().unwrap();
     let threads: usize = a[5].parse().unwrap();
-    let churn = a.len() == 7;
+    let churn = flags.iter().any(|f| f == "churn");
     let start = Instant::now();
     let deadline = start + Duration::from_secs_f64(secs);
     let hs: Vec<_> = (0..threads)
         .map(|t| {
             let addr = a[1].clone();
+            let conn_tls = tls.then(tls_connector);
             let mine = conns / threads + (t < conns % threads) as usize;
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 rt.block_on(async {
-                    let js: Vec<_> = (0..mine).map(|_| tokio::spawn(conn(addr.clone(), size, deadline, churn))).collect();
+                    let js: Vec<_> = (0..mine).map(|_| tokio::spawn(conn(addr.clone(), size, deadline, churn, conn_tls.clone()))).collect();
                     let mut total = 0;
                     for j in js {
                         total += j.await.unwrap()?;
