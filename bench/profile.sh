@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Where does a server spend its round-trips (plans/m5.md, step 1)? For each server and cell:
 #   syscalls.csv  syscalls per round-trip, by syscall (perf stat on syscalls:sys_enter_*)
-#   <srv>-<conns>x<size>.txt  flat CPU profile of the server CPU (perf record -e cpu-clock)
+#   <srv>-<conns>x<size>.txt  flat CPU profile of the server CPU (perf record -e cpu-clock),
+#   <srv>-<conns>x<size>.dso.txt the same by dso only (kernel / libcrypto / libssl / the binary)
+#   A TLS cell ("tls:256:128") writes <srv>-tls-<conns>x<size>.* (the plain cells use other conns).
 # Needs perf with tracepoint access (root, or perf_event_paranoid=-1 and readable tracefs).
 # env: DURATION (5), OUT (bench/out/profile), PROF_SERVERS, PROF_CELLS ("conns:size ..."),
+#      (a cell is "conns:size", or "tls:conns:size" for a TLS echo cell: use with the TLS servers),
 #      PERF (perf command, e.g. "sudo perf" where tracefs is root-only)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -19,13 +22,15 @@ mkdir -p "$OUT"
 echo "server,conns,size,syscall,per_rt" >"$OUT/syscalls.csv"
 port=21000
 for cell in "${PROF_CELLS[@]}"; do
+    arg=(); tag=
+    [[ $cell == tls:* ]] && { arg=(tls); tag=tls-; cell=${cell#tls:}; }
     c=${cell%:*} s=${cell#*:}
     for srv in "${PROF_SERVERS[@]}"; do
         # pass 1: syscall counts (tracepoints cost a little; counts, not time, are what we read)
         port=$((port + 1)); start "$srv" "$port"
         "${PERF[@]}" stat -x, -e 'syscalls:sys_enter_*' -p "$pid" -o "$OUT/stat.tmp" &
         sp=$!; sleep 0.5
-        taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" >"$OUT/rps.tmp"
+        taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" "${arg[@]}" >"$OUT/rps.tmp"
         kill -INT $sp; wait $sp || true
         stop
         read -r total _ <"$OUT/rps.tmp"
@@ -37,12 +42,14 @@ for cell in "${PROF_CELLS[@]}"; do
         # record the server CPU while the client runs (the client itself is not run under perf/sudo)
         "${PERF[@]}" record -q -e cpu-clock -C "$SRV_CPUS" -o "$OUT/perf.data" -- sleep "$DURATION" &
         sp=$!
-        taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" >/dev/null
+        taskset -c $CLI_CPUS "$BIN/client" "127.0.0.1:$port" "$c" "$s" "$DURATION" "$CLI_THREADS" "${arg[@]}" >/dev/null
         wait $sp
         stop
         "${PERF[@]}" report -q -i "$OUT/perf.data" --no-children --sort comm,dso,sym --percent-limit 0.5 \
-            >"$OUT/$srv-${c}x$s.txt" 2>/dev/null
-        head -n 25 "$OUT/$srv-${c}x$s.txt" >&2
+            >"$OUT/$srv-$tag${c}x$s.txt" 2>/dev/null
+        "${PERF[@]}" report -q -i "$OUT/perf.data" --no-children --sort dso >"$OUT/$srv-$tag${c}x$s.dso.txt" 2>/dev/null
+        head -n 25 "$OUT/$srv-$tag${c}x$s.txt" >&2
+        cat "$OUT/$srv-$tag${c}x$s.dso.txt" >&2
     done
 done
 rm -f "$OUT/stat.tmp" "$OUT/rps.tmp" "$OUT/perf.data" "$OUT/perf.data.old" # our directory: removable whoever owns them

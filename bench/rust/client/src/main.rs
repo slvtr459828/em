@@ -1,19 +1,24 @@
 // Closed-loop ping-pong load generator, same for every server.
-// usage: client addr conns size seconds threads [churn] [tls]
+// usage: client addr conns size seconds threads [churn] [tls|tlsres]
 // Each connection sends `size` bytes, reads exactly `size` back, compares, repeats.
 // churn: each of `conns` loops instead does connect, one round-trip, close with RST
 // (zero linger: no TIME_WAIT, so ephemeral ports do not run out); counts connections.
-// tls: every connection does a TLS handshake first (rustls via tokio-rustls, certificate not
-// verified: the servers use throwaway self-signed ones); churn then counts handshake + round-trip.
+// tls: every connection does a full TLS handshake first (rustls via tokio-rustls, client session
+// resumption disabled, certificate not verified: the servers use throwaway self-signed ones);
+// churn then counts handshake + round-trip. tlsres: same, but the client keeps a session store and
+// resumes when it can. With either, a second output line says what was negotiated and how many
+// handshakes were full / resumed ("tls <version> <suite> <kx group> <cert key> full=N resumed=M").
 // Prints "total_round_trips round_trips_per_sec p50_us p99_us p999_us"; exits 1 if any echo is
 // short or differs. Latency of every round-trip goes into a per-thread log-linear histogram
 // (128 sub-buckets per power of two, < 1% error; fixed array, nothing allocated while measuring).
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls::client::Resumption;
+use rustls::{ClientConfig, HandshakeKind, DigitallySignedStruct, SignatureScheme};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
@@ -37,7 +42,11 @@ impl ServerCertVerifier for AcceptAny {
     }
 }
 
-fn tls_connector() -> TlsConnector {
+static FULL: AtomicU64 = AtomicU64::new(0);
+static RESUMED: AtomicU64 = AtomicU64::new(0);
+static NEGOTIATED: OnceLock<String> = OnceLock::new();
+
+fn tls_connector(resume: bool) -> TlsConnector {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let cfg = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
@@ -45,6 +54,10 @@ fn tls_connector() -> TlsConnector {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
         .with_no_client_auth();
+    let mut cfg = cfg;
+    if !resume {
+        cfg.resumption = Resumption::disabled();
+    }
     TlsConnector::from(Arc::new(cfg))
 }
 
@@ -62,7 +75,24 @@ impl Conn {
         }
         Ok(match tls {
             None => Conn::Plain(tcp),
-            Some(c) => Conn::Tls(Box::new(c.connect(ServerName::try_from("localhost").unwrap(), tcp).await?)),
+            Some(c) => {
+                let s = c.connect(ServerName::try_from("localhost").unwrap(), tcp).await?;
+                let cc = s.get_ref().1;
+                match cc.handshake_kind() {
+                    Some(HandshakeKind::Resumed) => RESUMED.fetch_add(1, Relaxed),
+                    _ => FULL.fetch_add(1, Relaxed),
+                };
+                NEGOTIATED.get_or_init(|| {
+                    // P-256 OID 1.2.840.10045.3.1.7 inside the server's certificate
+                    const P256: [u8; 10] = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
+                    let key = cc.peer_certificates().and_then(|c| c.first()).map_or("?", |c| {
+                        if c.windows(P256.len()).any(|w| w == P256) { "ecdsa-p256" } else { "other" }
+                    });
+                    format!("{:?} {:?} {:?} {key}", cc.protocol_version().unwrap(), cc.negotiated_cipher_suite().unwrap().suite(),
+                            cc.negotiated_key_exchange_group().map(|g| g.name()))
+                });
+                Conn::Tls(Box::new(s))
+            }
         })
     }
 
@@ -128,11 +158,12 @@ async fn conn(addr: String, size: usize, deadline: Instant, churn: bool, tls: Op
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let flags = &a[a.len().min(6)..];
-    if a.len() < 6 || flags.iter().any(|f| f != "churn" && f != "tls") {
-        eprintln!("usage: client addr conns size seconds threads [churn] [tls]");
+    if a.len() < 6 || flags.iter().any(|f| f != "churn" && f != "tls" && f != "tlsres") {
+        eprintln!("usage: client addr conns size seconds threads [churn] [tls|tlsres]");
         std::process::exit(2);
     }
-    let tls = flags.iter().any(|f| f == "tls");
+    let resume = flags.iter().any(|f| f == "tlsres");
+    let tls = resume || flags.iter().any(|f| f == "tls");
     let conns: usize = a[2].parse().unwrap();
     let size: usize = a[3].parse().unwrap();
     let secs: f64 = a[4].parse().unwrap();
@@ -143,7 +174,7 @@ fn main() {
     let hs: Vec<_> = (0..threads)
         .map(|t| {
             let addr = a[1].clone();
-            let conn_tls = tls.then(tls_connector);
+            let conn_tls = tls.then(|| tls_connector(resume));
             let mine = conns / threads + (t < conns % threads) as usize;
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -184,4 +215,7 @@ fn main() {
         i.map_or(0.0, |i| lower(i) as f64 / 1e3)
     };
     println!("{total} {rps:.0} {:.1} {:.1} {:.1}", q(0.5), q(0.99), q(0.999));
+    if let Some(n) = NEGOTIATED.get() {
+        println!("tls {n} full={} resumed={}", FULL.load(Relaxed), RESUMED.load(Relaxed));
+    }
 }

@@ -105,15 +105,18 @@ for c in "${CONNS[@]}"; do for s in "${SIZES[@]}"; do CELLS+=("echo $c $s"); don
 CELLS+=("churn 64 128")
 # TLS cells: server us/rt of em-tls-* minus em-* in the same cell (same conns x size) is the cost
 # of TLS (table.py). The mode names echotls/churntls keep them apart from the plain cells.
-CELLS+=("echotls 256 128" "echotls 256 4096" "churntls 64 128")
-echo "round,mode,server,conns,size,rps,client_cpu,server_cpu,us_per_rt,p50_us,p99_us,p999_us" >"$OUT/results.csv"
+# churntls: client resumption off (every connection a full handshake); churntlsres: client keeps a
+# session store and resumes (resumed = fraction of resumed handshakes, must be ~1 for both servers).
+CELLS+=("echotls 256 128" "echotls 256 4096" "churntls 64 128" "churntlsres 64 128")
+echo "round,mode,server,conns,size,rps,client_cpu,server_cpu,us_per_rt,p50_us,p99_us,p999_us,resumed" >"$OUT/results.csv"
+: >"$OUT/tls_info.txt" # what each TLS server negotiated, as the client saw it
 port=20000
 TIMEFORMAT='%U %S %R'
 for ((r = 1; r <= ROUNDS; r++)); do
     for cell in "${CELLS[@]}"; do
         read -r mode c s <<<"$cell"
-        case $mode in echo) arg=() ;; churn) arg=(churn) ;; echotls) arg=(tls) ;; churntls) arg=(churn tls) ;; esac
-        srvs=("${SERVERS[@]}"); [[ $mode == *tls ]] && srvs=("${TLS_SERVERS[@]}")
+        case $mode in echo) arg=() ;; churn) arg=(churn) ;; echotls) arg=(tls) ;; churntls) arg=(churn tls) ;; churntlsres) arg=(churn tlsres) ;; esac
+        srvs=("${SERVERS[@]}"); [[ $mode == *tls* ]] && srvs=("${TLS_SERVERS[@]}")
         for srv in "${srvs[@]}"; do
             port=$((port + 1))
             start "$srv" "$port"
@@ -128,7 +131,13 @@ for ((r = 1; r <= ROUNDS; r++)); do
             # client prints "total_round_trips rps p50 p99 p999"; server CPU is over the same client wall time
             cols=$(awk -v u="$u" -v s="$sy" -v w="$wall" -v t0="$t0" -v t1="$t1" -v hz="$TICKS" -v n="$total" -v nc="$CLI_THREADS" \
                 'BEGIN { sc = (t1 - t0) / hz; printf "%.2f,%.2f,%.2f", (u + s) / (w * nc), sc / w, sc * 1e6 / n }')
-            echo "$r,$mode,$srv,$c,$s,$rps,$cols,$p50,$p99,$p999" | tee -a "$OUT/results.csv" >&2
+            # TLS cells: the client's second line is "tls <version> <suite> <group> <cert> full=N resumed=M"
+            res=-
+            if tls=$(sed -n 's/^tls //p' "$OUT/rps.tmp") && [[ -n $tls ]]; then
+                echo "$srv $mode: $tls" >>"$OUT/tls_info.txt"
+                res=$(sed 's/.*full=\([0-9]*\) resumed=\([0-9]*\)/\1 \2/' <<<"$tls" | awk '{ printf "%.3f", $2 / ($1 + $2) }')
+            fi
+            echo "$r,$mode,$srv,$c,$s,$rps,$cols,$p50,$p99,$p999,$res" | tee -a "$OUT/results.csv" >&2
         done
     done
 done

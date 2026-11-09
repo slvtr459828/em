@@ -25,6 +25,7 @@ fn main() -> std::io::Result<()> {
         loop {
             let (s, _) = l.accept().await?;
             let acceptor = acceptor.clone();
+            s.set_nodelay(true)?; // else Nagle holds the echo behind the session tickets for a delayed ACK (~40 ms)
             tokio::spawn(async move {
                 let Ok(mut s) = acceptor.accept(s).await else { return };
                 let mut buf = [0u8; 16384];

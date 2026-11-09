@@ -4,7 +4,10 @@
 # (round r of a server over round r of tokio, run minutes apart).
 # With --tls: the same tables for the TLS cells (ratios vs tokio-rustls) and (h) the cost of TLS:
 # server us per round-trip (or connection) of em-tls-X minus em-X in the same cell.
-import csv, statistics, sys
+# TLS churn comes in two modes: churntls (client resumption off: every connection a full handshake) and
+# churntlsres (client keeps a session store; "resumed" is the measured fraction of resumed handshakes
+# and must be ~100% for every server or the cell is not a resumption cell).
+import csv, re, statistics, sys
 from collections import defaultdict
 
 args = sys.argv[2:]
@@ -15,16 +18,19 @@ for r in csv.DictReader(open(sys.argv[1])):
     k = (r["mode"], int(r["conns"]), int(r["size"]), r["server"])
     for f in ("rps", "client_cpu", "server_cpu", "us_per_rt", "p50_us", "p99_us"):
         col[f][k][r["round"]] = float(r[f])
+    if r.get("resumed", "-") != "-":
+        col["resumed"][k][r["round"]] = float(r["resumed"])
 cells = sorted({k[:3] for k in col["rps"]})
 echo = [c for c in cells if c[0] == "echo"]
 churn = [c for c in cells if c[0] == "churn"]
 echotls = [c for c in cells if c[0] == "echotls"]
-churntls = [c for c in cells if c[0] == "churntls"]
+churntls = [c for c in cells if c[0] in ("churntls", "churntlsres")]
+mode_name = {"churntls": "full handshake, client resumption off", "churntlsres": "resumption on, session store in the client"}
 med = lambda f, cl, srv: statistics.median(col[f][(*cl, srv)].values())
 
 
 def ratio(f, cl, srv, fmt):
-    base = "tokio-rustls" if cl[0].endswith("tls") else "tokio-epoll"
+    base = "tokio-rustls" if "tls" in cl[0] else "tokio-epoll"
     m, v, b = med(f, cl, srv), col[f][(*cl, srv)], col[f][(*cl, base)]
     rs = [v[r] / b[r] for r in v if r in b]
     rng = f" [{min(rs):.2f}–{max(rs):.2f}]" if len(rs) > 1 and srv != base else ""
@@ -74,7 +80,8 @@ if tls_servers and (echotls or churntls):
     table("(f) TLS echo: server CPU us per round-trip, lower is better", "conns x size", [(lab(c), lambda v, c=c: ratio("us_per_rt", c, v, us)) for c in echotls], tls_servers)
     table("(g) TLS: p99 latency us (p99/p50), lower is better", "conns x size", [(lab(c), lambda v, c=c: tail(c, v)) for c in echotls], tls_servers)
     for c in churntls:
-        table(f"(g2) TLS churn: {c[1]} concurrent, each connect + handshake + one {c[2]} B round-trip + RST", "", [
+        table(f"(g2) TLS churn, {mode_name[c[0]]} [{c[0]}]: {c[1]} concurrent, each connect + handshake + one {c[2]} B round-trip + RST", "", [
+            ("resumed handshakes", lambda v: f"{100 * statistics.median(col['resumed'][(*c, v)].values()):.1f}%"),
             ("connections/s", lambda v: ratio("rps", c, v, rps)),
             ("server CPU us per connection", lambda v: ratio("us_per_rt", c, v, us)),
             ("p99 us incl. connect+handshake (p99/p50)", lambda v: tail(c, v)),
@@ -83,16 +90,23 @@ if tls_servers and (echotls or churntls):
     print("| cell | backend | em-tls us | em us (rest of the round-trip) | TLS cost us [lo–hi] | cost / rest |")
     print("|---|---|---|---|---|---|")
     for tl in echotls + churntls:
-        plain = ("churn" if tl[0] == "churntls" else "echo", tl[1], tl[2])
+        plain = ("churn" if tl[0].startswith("churn") else "echo", tl[1], tl[2])
         for b in ("uring", "epoll"):
             if plain in cells:
-                print(f"| {tl[0][:-3]} {lab(tl)} | {b} | {cost_row(tl, plain, b)} |")
+                print(f"| {tl[0].replace('tls', ' tls ').strip()} {lab(tl)} | {b} | {cost_row(tl, plain, b)} |")
     print()
     print("kTLS is worth a look only if the cost is larger than the rest of the round-trip in the 4096 cell AND em has users that send files.\n")
+info = sys.argv[1].rsplit("/", 1)[0] + "/tls_info.txt" if "/" in sys.argv[1] else "tls_info.txt"
+try:  # what the client saw negotiated: version suite group cert-key, per server (full=/resumed= counts are summed away)
+    seen = sorted({re.sub(r" full=\d+ resumed=\d+", "", l.strip()) for l in open(info) if l.strip()})
+    if seen:
+        print("Negotiated (as seen by the client):\n" + "".join(f"- {l}\n" for l in seen))
+except FileNotFoundError:
+    pass
 print("Server pinned to 1 CPU, client to 3. (Nx [lo–hi]) = median ratio vs tokio-epoll [min–max of per-round ratios]; uring servers first, then epoll.")
 print("Two servers differ in a cell only if their [lo–hi] ranges do not overlap; otherwise read it as a tie.")
 name = lambda cl: f"{cl[0]} c={cl[1]} s={cl[2]}"
-srvs_of = lambda c: tls_servers if c[0].endswith("tls") else servers
+srvs_of = lambda c: tls_servers if "tls" in c[0] else servers
 cli = [f"{v} {name(c)}" for c in cells for v in srvs_of(c) if med("client_cpu", c, v) >= 0.9]
 srv = [f"{v} {name(c)}" for c in cells for v in srvs_of(c) if med("server_cpu", c, v) < 0.9]
 if cli:

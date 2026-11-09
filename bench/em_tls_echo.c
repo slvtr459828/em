@@ -1,6 +1,7 @@
 /* TLS echo server for bench/run.sh: argv[1] = port, argv[2] = workers (default 1). Same shape as
  * em_echo.c with em_tls on every connection. The certificate is generated at startup
  * (tests/tls_util.h); the bench client accepts any certificate. */
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include "../tests/tls_util.h"
 
@@ -10,6 +11,9 @@ static SSL_CTX *sctx;
 static int echo(void *arg)
 {
     int fd = (int)(intptr_t)arg;
+    /* After the handshake the server writes the session tickets and then the echo: without NODELAY
+     * Nagle holds the echo behind the unacked tickets until the client's delayed ACK (~40 ms) */
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &(int){ 1 }, sizeof(int));
     em_tls *t;
     if (em_tls_accept(&t, sctx, fd) == 0) {
         char buf[16384];
