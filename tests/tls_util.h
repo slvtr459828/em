@@ -2,6 +2,7 @@
 #define EM_TEST_TLS_UTIL_H
 /* Self-signed EC P-256 certificate for "localhost", generated in memory with the OpenSSL API
  * (no files, no openssl CLI). Server and client contexts share it; the client trusts only it. */
+#include <openssl/ec.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
@@ -12,8 +13,15 @@
 
 static inline void tls_test_ctx(SSL_CTX **srv, SSL_CTX **cli)
 {
+#ifdef OPENSSL_IS_AWSLC
+    /* AWS-LC has no EVP_EC_gen */
+    EC_KEY *ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
+    EVP_PKEY *key = EVP_PKEY_new();
+    assert(ec && key && EC_KEY_generate_key(ec) && EVP_PKEY_assign_EC_KEY(key, ec));
+#else
     EVP_PKEY *key = EVP_EC_gen("P-256");
     assert(key);
+#endif
     X509 *x = X509_new();
     assert(x);
     X509_set_version(x, 2);

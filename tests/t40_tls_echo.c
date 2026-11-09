@@ -85,8 +85,14 @@ int main(void)
             /* largest output per SSL_write: TLS 1.2, CBC + SHA384 (biggest per-record expansion),
              * 512 B records (32 per call). It must still fit the out buffer whole. */
             SSL_CTX_set_max_proto_version(cctx, TLS1_2_VERSION);
-            assert(SSL_CTX_set_cipher_list(cctx, "ECDHE-ECDSA-AES256-SHA384:@SECLEVEL=0") == 1);
-            assert(SSL_CTX_set_cipher_list(sctx, "ECDHE-ECDSA-AES256-SHA384:@SECLEVEL=0") == 1);
+#ifdef OPENSSL_IS_AWSLC
+            /* AWS-LC has no CBC-SHA256/384 suites; CBC + SHA1 is its largest per-record expansion */
+#define CBC_SUITE "ECDHE-ECDSA-AES256-SHA"
+#else
+#define CBC_SUITE "ECDHE-ECDSA-AES256-SHA384:@SECLEVEL=0"
+#endif
+            assert(SSL_CTX_set_cipher_list(cctx, CBC_SUITE) == 1);
+            assert(SSL_CTX_set_cipher_list(sctx, CBC_SUITE) == 1);
             SSL_CTX_set_max_send_fragment(sctx, 512);
             SSL_CTX_set_max_send_fragment(cctx, 512);
         }

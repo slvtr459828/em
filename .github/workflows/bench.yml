@@ -27,6 +27,10 @@ on:
         description: "run bench/tls_libs.sh: TLS library microbench"
         type: boolean
         default: false
+      awslc:
+        description: "build em_tls against AWS-LC 5.12.0 (TLS_PREFIX) for the selected script (bench, tlsab, profile)"
+        type: boolean
+        default: false
 
 jobs:
   bench:
@@ -46,10 +50,10 @@ jobs:
         with:
           workspaces: bench/rust
       - name: tlslib deps
-        if: inputs.tlslib
+        if: inputs.tlslib || inputs.awslc
         run: command -v cmake >/dev/null && command -v go >/dev/null || sudo apt-get install -y --no-install-recommends cmake golang-go
       - uses: actions/cache@v4
-        if: inputs.tlslib
+        if: inputs.tlslib || inputs.awslc
         with:
           path: build/*/tlslibs
           key: tlslibs-${{ runner.arch }}-${{ hashFiles('bench/tls_libs.sh') }}
@@ -59,6 +63,11 @@ jobs:
         run: |
           sudo sysctl -w vm.max_map_count=1048576
           sudo prlimit --pid $$ --nofile=1048576:1048576 --memlock=unlimited:unlimited
+          if [[ "${{ inputs.awslc }}" == true ]]; then
+            # run.sh, tls_ab.sh and profile.sh build em_tls_echo against this prefix (see bench/run.sh)
+            BUILD_ONLY=1 LIBS=aws-lc-5.12.0 bench/tls_libs.sh
+            export TLS_PREFIX=$PWD/build/$(uname -m)/tlslibs/aws-lc-5.12.0
+          fi
           if [[ "${{ inputs.profile }}" == true ]]; then
             # perf for the runner's kernel; tracepoints and kernel symbols need these sysctls
             sudo apt-get install -y --no-install-recommends linux-tools-common "linux-tools-$(uname -r)" ||

@@ -4,6 +4,17 @@
  * em_recv / em_send. Link libem_tls.a, libem.a, -lssl -lcrypto. libem itself does not
  * depend on OpenSSL. Same fiber context rules as em.h: call from a fiber.
  *
+ * Library. Default: OpenSSL >= 3.0 found by pkg-config. `make TLS_PREFIX=dir` builds against the
+ * library installed in dir (include/, lib/ or lib64/) instead: a self-built OpenSSL, or AWS-LC
+ * (tested: v5.12.0; bench/tls_libs.sh builds it: BUILD_ONLY=1 LIBS=aws-lc-5.12.0). The SSL_CTX you
+ * pass in must come from the same library em_tls was built against. AWS-LC differences you can
+ * see: no stateful TLS 1.3 tickets (SSL_OP_NO_TICKET gives no resumption); a TLS 1.3 server sends
+ * its tickets with its next write, so a server that only reads never issues one; renegotiation is
+ * off (as em_tls wants anyway). Symbols: AWS-LC reuses OpenSSL's names, so a process that links
+ * em_tls with AWS-LC AND the system OpenSSL through another library (libcurl, libpq...) will have
+ * one side call into the other. Build AWS-LC with BORINGSSL_PREFIX to avoid it (documented here,
+ * not built or tested by the repo's CI).
+ *
  * Ownership.
  *  - fd: a connected TCP socket from em (em_accept / em_connect). em_tls never closes it.
  *    Close the fd (em_close) after em_tls_free, on the worker that owns it; use of an
