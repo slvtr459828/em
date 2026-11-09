@@ -18,8 +18,26 @@
  * argument); EM_MSG_SENT is the SENDER's own completion of the msg_ring SQE. */
 #define EM_MSG_CANCEL 1u
 #define EM_MSG_SENT   3u
+#define EM_MSG_JOBS   5u /* user_data of the armed READ on the worker's job-done eventfd */
 
-enum { EM_READY, EM_RUNNING, EM_PARKED, EM_IOWAIT, EM_SCOPEWAIT, EM_DONE };
+#define EM_POOL_MAX 64 /* pool threads, process-wide */
+
+/* EM_JOBWAIT: waiting in em_offload; not interruptible (the job uses the fiber's stack). */
+enum { EM_READY, EM_RUNNING, EM_PARKED, EM_IOWAIT, EM_SCOPEWAIT, EM_DONE, EM_JOBWAIT };
+
+/* A job for the pool. Every field but `res` and `next` is touched by the owning worker only;
+ * the pool thread reads fn/arg, writes res, then pushes the job on the owner's done list. */
+enum { EM_JOB_WAIT, EM_JOB_DONE, EM_JOB_ABANDONED };
+typedef struct em_job {
+    struct em_job *next;     /* pool queue OR done list, never both */
+    struct em_slot *home;    /* owner's done list + eventfd */
+    intptr_t (*fn)(void *);
+    void     *arg;
+    intptr_t  res;
+    em_fiber *f;             /* waiter; stale once state == EM_JOB_ABANDONED */
+    void    (*release)(struct em_job *); /* heap jobs: frees the job (and what hangs off it); NULL = on a fiber stack */
+    uint8_t   state;
+} em_job;
 
 /* One in-flight kernel op; lives on the stack of the fiber that waits for it. */
 typedef struct em_op {
@@ -57,19 +75,24 @@ struct em_fdw {
     uint8_t   registered; /* EPOLL_CTL_ADD done (once; the kernel drops it when the fd closes) */
     uint8_t   nb;         /* O_NONBLOCK set by em_read */
     uint8_t   rd_idle;    /* stream drained by a short recv; cleared by the next read event */
-    uint8_t   kind;       /* 0 unknown, EM_FD_STREAM, EM_FD_OTHER (SO_TYPE once; OTHER after EOF/error) */
+    uint8_t   kind;       /* 0 unknown, EM_FD_STREAM, EM_FD_OTHER, EM_FD_FILE (classified once; OTHER after EOF/error) */
 };
-enum { EM_FD_STREAM = 1, EM_FD_OTHER = 2 };
+enum { EM_FD_STREAM = 1, EM_FD_OTHER = 2, EM_FD_FILE = 3 };
 struct em_timer { int64_t deadline; em_fiber *f; };
 enum { EM_WAIT_RD, EM_WAIT_WR };
 
 struct em_rt;
+/* State of the READ armed on the done eventfd (io_uring). IDLE = its CQE was reaped, re-arm. */
+enum { EM_JRD_IDLE, EM_JRD_ARMED, EM_JRD_CANCELLING, EM_JRD_STOPPED };
 
 typedef struct em_worker {
     struct em_rt *rt;   /* NULL = not inside em_run */
     int       id;
     em_scope *root;     /* this worker's root scope, valid while the loop runs */
     size_t    msg_inflight; /* msg_ring SQEs whose own CQE has not been reaped */
+    size_t    jobs;     /* jobs handed to the pool and not yet taken off the done list */
+    uint64_t  jobs_buf; /* io_uring: target of the armed READ on the done eventfd */
+    uint8_t   jobs_rd;  /* io_uring: EM_JRD_* */
     void     *sched_sp;
     em_fiber *current;
     em_fiber *rq_head, *rq_tail;
@@ -93,8 +116,19 @@ typedef struct em_worker {
 
 /* Process-wide state, allocated once in em_run. The only atomics in em live
  * here and are touched on the mmap/munmap path, first-error publication and
- * startup/shutdown, never on the per-op path. Everything else crosses threads
+ * startup/shutdown, never on the per-op path (plus the per-worker done lists of
+ * the offload pool, one CAS per finished job). Everything else crosses threads
  * as a msg_ring CQE (io_uring) or an eventfd write (epoll). */
+struct em_pool {
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+    pthread_attr_t  attr;   /* threads run on the caller's original CPU set, not on a worker's core */
+    em_job *head, *tail;    /* FIFO of jobs not yet taken */
+    int     queued, spare;  /* spare = threads not running a job */
+    int     nthreads, stop;
+    pthread_t th[EM_POOL_MAX];
+};
+
 struct em_rt {
     int    n;
     int  (*main_fn)(void *);
@@ -103,6 +137,7 @@ struct em_rt {
     _Atomic size_t nmapped;     /* mappings owned by all workers (live + free-lists) */
     size_t cap;                 /* max mappings, process-wide */
     int    epoll;               /* backend, decided once in em_run */
+    struct em_pool pool;
     sem_t  up;                  /* workers -> worker 0: "ready" then "finished" (phases never overlap) */
     sem_t  go;                  /* worker 0 -> workers: start (or abort) */
     sem_t  release;             /* worker 0 -> workers: all finished, rings may close */
@@ -111,6 +146,8 @@ struct em_rt {
         struct em_rt *rt;
         int       id;
         int       cpu;
+        _Atomic(em_job *) done; /* finished jobs, pushed by pool threads (LIFO), taken whole by the owner */
+        int       done_fd;      /* eventfd written after each push; -1 = not created */
         int       wake_fd;      /* io_uring: ring fd (msg_ring target); epoll: eventfd. Written before "ready", read after "go" */
         pthread_t th;
     } slot[];
@@ -130,11 +167,20 @@ int  em_scope_is_cancelled(const em_fiber *f);
 void em_scope_interrupt_all(em_worker *w, em_scope *s);   /* wake/cancel every fiber under s */
 void em_scope_cancel_all(em_worker *w, em_scope *s);      /* s->cancelled = 1 + interrupt */
 /* io.c: public ops, each branching once on w->epoll */
+/* pool.c */
+int  em_pool_init(struct em_pool *p, size_t masksz, const void *mask);
+void em_pool_join(struct em_pool *p);    /* after every worker is done: stops and joins the threads */
+void em_pool_destroy(struct em_pool *p);
+void em_jobs_reap(em_worker *w);         /* owner: take the done list; wake waiters, free abandoned jobs */
 /* io_uring.c */
 struct io_uring_sqe *ur_sqe_get(em_worker *w);   /* leaves room for a link timeout */
 void ur_interrupt(em_worker *w, em_fiber *f);    /* f is EM_IOWAIT: submit ASYNC_CANCEL */
 void ur_submit(em_worker *w);
 void ur_reap(em_worker *w);                      /* submit, wait for CQEs, wake fibers */
+void ur_jobs_start(em_worker *w);                /* arm the READ on the done eventfd */
+void ur_jobs_stop(em_worker *w);                 /* cancel it and wait for its CQE (no CQE may outlive the worker) */
+int  ur_job_wait(int64_t deadline_ns);           /* em_resolve: park until woken by ur_job_wake, the deadline (-ETIME) or cancel */
+void ur_job_wake(em_worker *w, em_fiber *f);
 int     ur_sleep_until(int64_t deadline_ns);
 int     ur_accept(int lfd);
 int     ur_connect(const struct sockaddr *a, socklen_t n);
@@ -149,6 +195,8 @@ ssize_t ur_sendto(int fd, const void *buf, size_t len, const struct sockaddr *ds
 int  ep_init(em_worker *w);                      /* 0 or -errno; w->evfd is the cancel eventfd */
 void ep_exit(em_worker *w);
 void ep_interrupt(em_worker *w, em_fiber *f);    /* f is EM_IOWAIT: unlink, -ECANCELED, ready */
+int  ep_job_wait(void);                          /* em_resolve: 0 = woken by ep_job_wake, else -ETIMEDOUT / -ECANCELED */
+void ep_job_wake(em_worker *w, em_fiber *f);
 void ep_reap(em_worker *w);                      /* epoll_wait (until the earliest timer), wake fibers */
 int     ep_sleep_until(int64_t deadline_ns);
 int     ep_accept(int lfd);
@@ -167,5 +215,9 @@ extern _Atomic size_t em_dbg_mmap_count;
 extern _Atomic size_t em_dbg_munmap_count;
 extern size_t em_dbg_map_cap; /* nonzero: overrides the process-wide mapping cap of the next em_run */
 size_t em_dbg_inflight(void);
+/* The em_resolve path (heap job, interruptible wait, abandoned on cancel/deadline) with fn(arg)
+ * in place of getaddrinfo. Returns fn's result, or -ECANCELED / -ETIMEDOUT / -EPERM / -ENOMEM.
+ * arg must outlive the call: an abandoned job still runs fn. */
+int em_dbg_heap_job(intptr_t (*fn)(void *), void *arg);
 
 #endif

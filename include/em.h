@@ -27,7 +27,7 @@ struct em_scope {
  * else (before or after em_run on the calling thread, a thread em did not start,
  * e.g. through a socket kept in a thread-local past em_run) the calls fail
  * instead of touching worker state that no longer exists: I/O, em_sleep_until,
- * em_spawn, em_park and em_scope_close return -EPERM; em_close just close()s fd
+ * em_spawn, em_park, em_offload, em_resolve and em_scope_close return -EPERM; em_close just close()s fd
  * (0 or -errno); em_yield does nothing; em_scope_open leaves an inert scope. */
 
 /* Runs main_fn as the first fiber of EVERY worker (one app copy per core).
@@ -97,8 +97,8 @@ int       em_connect(const struct sockaddr *a, socklen_t n);
 ssize_t   em_recv(int fd, void *buf, size_t len);        /* 0 = EOF */
 /* Any fd (signalfd, eventfd, pipe). On epoll the first call on an fd sets
  * O_NONBLOCK on it (the flag lives on the open file description, so dups see
- * it), and a regular file is read synchronously: it blocks the worker for the
- * page-cache read. */
+ * it). A regular file is read on the offload pool (as em_offload, so not
+ * interruptible once started); on io_uring it is an ordinary read. */
 ssize_t   em_read(int fd, void *buf, size_t len);
 ssize_t   em_send(int fd, const void *buf, size_t len);  /* may send less */
 int       em_send_all(int fd, const void *buf, size_t len);
@@ -111,6 +111,30 @@ int       em_udp_bind(const struct sockaddr *a, socklen_t n);
  * on return. A datagram longer than len is truncated. */
 ssize_t   em_recvfrom(int fd, void *buf, size_t len, struct sockaddr *src, socklen_t *srclen);
 ssize_t   em_sendto(int fd, const void *buf, size_t len, const struct sockaddr *dst, socklen_t n);
+/* Runs fn(arg) on a pool thread; the calling fiber parks until fn returns and the
+ * worker keeps running other fibers meanwhile. Returns fn's result, or -EPERM
+ * outside a fiber, or -EAGAIN if no pool thread could be created (fn did not run).
+ * Not interruptible: fn may use the caller's stack (buffers, arg), so em_offload
+ * always waits for fn to finish, even if the scope is cancelled or its deadline
+ * passes meanwhile; the cancellation is reported by the next cancel point.
+ * fn runs outside em: em calls made from it return -EPERM. The pool is shared by
+ * the whole process, starts at em_run and ends with it; threads are created on
+ * demand, at most 64, and extra jobs queue. A job that never returns stalls its
+ * thread, and em_run, forever. */
+intptr_t  em_offload(intptr_t (*fn)(void *), void *arg);
+/* getaddrinfo(host) on the offload pool. Writes up to max (>= 1) addresses (port
+ * set to `port`; family AF_INET, AF_INET6 or AF_UNSPEC) into out, in resolver
+ * order, and returns the count (>= 1). A numeric host is parsed in place, without
+ * the pool. Errors: -ENOENT name does not exist (EAI_NONAME, EAI_NODATA), -EAGAIN
+ * temporary resolver failure, -ENOMEM, -errno for EAI_SYSTEM, -EIO any other
+ * resolver error, -EINVAL bad argument or host longer than 255 bytes, -EPERM
+ * outside a fiber, -ECANCELED / -ETIMEDOUT. Unlike em_offload it returns at once
+ * on cancel or deadline: the lookup keeps running on the pool and its result is
+ * dropped; em_run waits for such a lookup before it returns (as long as the
+ * resolver takes). */
+int       em_resolve(const char *host, uint16_t port, int family,
+                     struct sockaddr_storage *out, int max);
+
 /* Cancels other fibers' ops on fd (they get -ECANCELED), then closes. Not
  * cancellable itself: always closes fd. fds em created may be closed any way.
  * An fd created outside em and used with em must be closed with this, on the

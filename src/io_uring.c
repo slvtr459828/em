@@ -48,6 +48,34 @@ void ur_interrupt(em_worker *w, em_fiber *f)
     io_uring_sqe_set_data64(sqe, 0);
 }
 
+/* The worker keeps one READ armed on its done eventfd (pool threads write to it). Its CQE
+ * (EM_MSG_JOBS) is the only wake-up the pool needs: ur_reap takes the done list, then re-arms.
+ * No wake-up is lost: the counter is read before the list is taken, so a push after that
+ * leaves the counter nonzero and the next READ completes at once. */
+static void jobs_arm(em_worker *w)
+{
+    struct io_uring_sqe *sqe = ur_sqe_get(w);
+    io_uring_prep_read(sqe, w->rt->slot[w->id].done_fd, &w->jobs_buf, sizeof w->jobs_buf, 0);
+    io_uring_sqe_set_data64(sqe, EM_MSG_JOBS);
+    w->jobs_rd = EM_JRD_ARMED;
+}
+
+void ur_jobs_start(em_worker *w)
+{
+    jobs_arm(w);
+}
+
+/* Shutdown: the READ targets w->jobs_buf and the eventfd, so its CQE must be reaped before
+ * the worker's memory and the ring go away. */
+void ur_jobs_stop(em_worker *w)
+{
+    struct io_uring_sqe *sqe = ur_sqe_get(w);
+    io_uring_prep_cancel64(sqe, EM_MSG_JOBS, 0);
+    io_uring_sqe_set_data64(sqe, 0);
+    w->jobs_rd = EM_JRD_CANCELLING;
+    while (w->jobs_rd != EM_JRD_STOPPED) ur_reap(w);
+}
+
 void ur_reap(em_worker *w)
 {
     for (;;) {
@@ -57,12 +85,14 @@ void ur_reap(em_worker *w)
     }
     struct io_uring_cqe *cqe;
     unsigned head, n = 0;
-    int cancel_root = 0;
+    int cancel_root = 0, jobs_cqe = 0;
     io_uring_for_each_cqe(&w->ring, head, cqe) {
         n++;
         if (cqe->user_data & 1) { /* not an op pointer */
             if (cqe->user_data == EM_MSG_CANCEL) {
                 cancel_root = 1; /* acted on below, once every CQE of the batch is reaped */
+            } else if (cqe->user_data == EM_MSG_JOBS) {
+                jobs_cqe = 1;    /* done list is taken below, after the whole batch */
             } else {
                 assert(cqe->user_data == EM_MSG_SENT);
                 w->msg_inflight--;
@@ -79,6 +109,10 @@ void ur_reap(em_worker *w)
         em_make_ready(w, op->f);
     }
     io_uring_cq_advance(&w->ring, n);
+    if (jobs_cqe) {
+        em_jobs_reap(w); /* a CQE with a value or -ECANCELED alike: the list is the truth */
+        if (w->jobs_rd == EM_JRD_CANCELLING) w->jobs_rd = EM_JRD_STOPPED; else jobs_arm(w);
+    }
     if (cancel_root && w->root) em_scope_cancel_all(w, w->root);
 }
 
@@ -152,6 +186,23 @@ int ur_sleep_until(int64_t deadline_ns)
     int r = op_end(sqe, OP_NOLINK); /* ts is read at submit, but stays live anyway */
     if (r != -ETIME) return r;
     return target == deadline_ns ? 0 : -ETIMEDOUT;
+}
+
+/* em_resolve's wait: a timeout op at the scope deadline (none = never fires) that the done
+ * list cancels (ur_job_wake) like any other op, so the fiber leaves its frame only after
+ * this op's CQE (I1). Returns -ETIME when the deadline passed, -ECANCELED when woken. */
+int ur_job_wait(int64_t deadline_ns)
+{
+    struct io_uring_sqe *sqe = ur_sqe_get(&em_W);
+    int64_t t = deadline_ns ? deadline_ns : INT64_MAX;
+    struct __kernel_timespec ts = { t / 1000000000, t % 1000000000 };
+    io_uring_prep_timeout(sqe, &ts, 0, IORING_TIMEOUT_ABS);
+    return op_end(sqe, OP_NOLINK);
+}
+
+void ur_job_wake(em_worker *w, em_fiber *f)
+{
+    ur_interrupt(w, f);
 }
 
 int ur_accept(int lfd)

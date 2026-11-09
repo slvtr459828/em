@@ -6,7 +6,9 @@ TESTS := tests/t1_pingpong tests/t2_churn tests/t3_many tests/t4_guard tests/t5_
   tests/t12_close_recv tests/t13_sleep tests/t14_blocked tests/t15_deadlock_unwind \
   tests/t16_reuseport_echo tests/t17_identity tests/t18_failfast_cross tests/t19_cancel_all \
   tests/t20_sigterm tests/t21_udp tests/t22_map_cap tests/t23_cancel_exit_race \
-  tests/t24_fairness tests/t25_udp_waiters tests/t26_close_wakes tests/t27_backend_env tests/t28_timer_heap tests/t29_fd_reuse tests/t30_outside tests/t31_short_read
+  tests/t24_fairness tests/t25_udp_waiters tests/t26_close_wakes tests/t27_backend_env tests/t28_timer_heap tests/t29_fd_reuse tests/t30_outside tests/t31_short_read \
+  tests/t32_offload_nostall tests/t33_offload_thread tests/t34_offload_nocancel tests/t35_offload_cap \
+  tests/t36_resolve tests/t37_resolve_abandon tests/t38_file_read
 
 ifeq ($(ARCH),x86_64)
 ASM := src/ctx_x86_64.S
@@ -30,7 +32,7 @@ $(1)/%.o: src/%.c src/internal.h include/em.h
 $(1)/ctx.o: $(ASM)
 	@mkdir -p $(1)
 	$(CC) $(2) -c $$< -o $$@
-$(1)/libem.a: $(1)/fiber.o $(1)/scope.o $(1)/io.o $(1)/io_uring.o $(1)/io_epoll.o $(1)/ctx.o
+$(1)/libem.a: $(1)/fiber.o $(1)/scope.o $(1)/io.o $(1)/io_uring.o $(1)/io_epoll.o $(1)/pool.o $(1)/ctx.o
 	rm -f $$@ && ar rcs $$@ $$^
 $(1)/%: tests/%.c $(1)/libem.a src/internal.h
 	$(CC) $(2) -Isrc $$< $(1)/libem.a -luring -lm -lpthread -o $$@

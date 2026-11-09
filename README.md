@@ -53,6 +53,7 @@ Lý do đầy đủ nằm trong [DESIGN.md](DESIGN.md).
 | M3.5 | Backend epoll (chọn tường minh auto/uring/epoll) | Xong |
 | M4 | Crate Rust `em` (`std::io::Read`/`Write`, không `async`) | Xong |
 | M5 | Đo sâu: syscall/round-trip và `perf`, khoảng nhiễu qua 5 vòng, latency p99, churn connection, soak 600 s với RSS phẳng | Xong |
+| v0.1 | offload + DNS | Xong |
 
 Sau v0: TLS, HTTP, binding Java/JS/Python.
 
@@ -161,13 +162,30 @@ Khác biệt của epoll cần biết:
 - Mỗi lệnh I/O thử syscall nonblocking trước, chỉ đợi khi `EAGAIN`. Socket do em tạo
   (`listen`, `accept`, `connect`, `udp_bind`) là nonblocking; `recv/send` luôn kèm `MSG_DONTWAIT`.
 - `em_read` bật `O_NONBLOCK` trên fd ở lần đầu (cờ nằm trên file description nên các bản dup
-  cũng thấy). Đọc file thường chặn worker trong lúc đọc page cache; offload là việc của v0.1 (D6).
+  cũng thấy). Đọc file thường đi qua pool offload (xem dưới), nên không chặn worker; trên
+  io_uring vẫn là `IORING_OP_READ`.
 - Timer có độ phân giải 1 ms (không bao giờ nổ sớm).
 - fd do em tạo thì đóng cách nào cũng được. fd tạo ngoài em (signalfd, pipe...) mà đã dùng
   với em thì phải đóng bằng `em_close` trên worker đang dùng nó; `close()` thẳng để lại trạng
   thái đăng ký cũ mà fd ngoài em tiếp theo cùng số sẽ thừa hưởng (lần đợi đầu không bao giờ thức).
 - Một fiber luôn có dữ liệu sẵn sẽ nhường sau mỗi 128 lệnh xong ngay, để fiber khác và timer
   không bị đói.
+
+## Code chặn và DNS
+
+em không hook syscall (D6): gọi `getaddrinfo`, đọc file, hay một thư viện chặn ngay trên fiber
+là đứng cả worker. Hai hàm thay thế, cùng chạy trên một pool thread chung cho cả process (tạo
+khi cần, tối đa 64, sống từ `em_run` tới hết `em_run`):
+
+- `em_offload(fn, arg)` chạy `fn` trên pool, fiber park tới khi xong, worker chạy fiber khác.
+  **Không ngắt được**: `fn` có thể dùng buffer trên stack fiber nên luôn được đợi tới cùng, kể
+  cả khi scope bị hủy hay quá deadline (lệnh chặn kế tiếp mới báo). Trong `fn`, mọi hàm em trả
+  `-EPERM`. Rust: `em::offload(|| ...)`, mượn biến cục bộ được, panic được ném lại trên fiber.
+- `em_resolve(host, port, family, out, max)` là `getaddrinfo` qua pool, **tôn trọng deadline và
+  hủy**: trả về ngay, lần tra cứu chạy nốt trên pool và bị bỏ kết quả; `em_run` đợi nó xong
+  trước khi trả về. Host dạng số được parse tại chỗ, không qua pool. Rust: `em::resolve`.
+
+Trên epoll, `em_read` trên file thường cũng đi qua pool.
 
 ## Tài liệu
 

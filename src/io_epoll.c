@@ -8,6 +8,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #include "internal.h"
@@ -30,7 +31,8 @@
 
 #define EP_BUDGET 128        /* immediately-completed ops before a forced poll + yield */
 #define EP_EVENTS 64         /* epoll_wait batch; the rest stays in the kernel ready list */
-#define EV_WAKE   UINT32_MAX /* data.u32 of the cancel eventfd (an fd number can't be this) */
+#define EV_WAKE   UINT32_MAX     /* data.u32 of the cancel eventfd (an fd number can't be this) */
+#define EV_JOBS   (UINT32_MAX - 1) /* ... of the job-done eventfd (pool threads write it) */
 
 /* ---- timer heap: binary min-heap on deadline; f->heap_idx makes removal O(log n) ---- */
 
@@ -221,6 +223,13 @@ static void ep_poll(em_worker *w, int block)
             cancel_root = 1; /* acted on below, after every event of the batch */
             continue;
         }
+        if (fd == EV_JOBS) {
+            uint64_t v;
+            ssize_t r = read(w->rt->slot[w->id].done_fd, &v, sizeof v); /* counter first, then the list: see ur_reap */
+            (void)r;
+            em_jobs_reap(w);
+            continue;
+        }
         if (fd >= w->nfd) continue; /* stale event of an fd em_close already forgot */
         struct em_fdw *s = &w->fdt[fd];
         if (m & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
@@ -312,6 +321,25 @@ int ep_sleep_until(int64_t deadline_ns)
     return target == deadline_ns ? 0 : -ETIMEDOUT;
 }
 
+/* em_resolve's wait: parked like a sleeper (deadline in the heap, no fd) until
+ * ep_job_wake, the deadline or cancel. 0 = woken by the done list. */
+int ep_job_wait(void)
+{
+    em_worker *w = &em_W;
+    em_fiber *f = w->current;
+    int64_t dl = f->cur_scope->deadline;
+    int e;
+    if (dl && (e = heap_push(w, f, dl))) return e;
+    f->wfd = -1;
+    park(w, f);
+    return f->wake_res;
+}
+
+void ep_job_wake(em_worker *w, em_fiber *f)
+{
+    wake(w, f, 0);
+}
+
 int ep_accept(int lfd)
 {
     ssize_t r;
@@ -360,20 +388,28 @@ int ep_connect(const struct sockaddr *a, socklen_t n)
     return fd;
 }
 
-/* A stream recv that returns less than asked has drained the socket: the next
- * recv would only see EAGAIN (in echo-like loops, one wasted syscall per
- * round-trip). Remember it and wait first; any data arriving later raises a new
- * edge, which clears rd_idle. Not for datagram sockets (a short recv says
- * nothing about the queue) nor once EOF/error was seen (ep_poll sets EM_FD_OTHER). */
-static int stream_fd(em_worker *w, int fd)
+/* Classify fd once (cached in kind): regular file, stream socket, or other. A stream recv
+ * that returns less than asked has drained the socket: the next recv would only see EAGAIN
+ * (in echo-like loops, one wasted syscall per round-trip). Remember it and wait first; any
+ * data arriving later raises a new edge, which clears rd_idle. Not for datagram sockets (a
+ * short recv says nothing about the queue) nor once EOF/error was seen (ep_poll sets
+ * EM_FD_OTHER). A regular file is never ready-or-not: em_read sends it to the pool. */
+static int fd_kind(em_worker *w, int fd)
 {
     struct em_fdw *s = &w->fdt[fd];
     if (!s->kind) {
+        struct stat st;
         int t = 0;
         socklen_t l = sizeof t;
-        s->kind = getsockopt(fd, SOL_SOCKET, SO_TYPE, &t, &l) == 0 && t == SOCK_STREAM ? EM_FD_STREAM : EM_FD_OTHER;
+        if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) s->kind = EM_FD_FILE;
+        else s->kind = getsockopt(fd, SOL_SOCKET, SO_TYPE, &t, &l) == 0 && t == SOCK_STREAM ? EM_FD_STREAM : EM_FD_OTHER;
     }
-    return s->kind == EM_FD_STREAM;
+    return s->kind;
+}
+
+static int stream_fd(em_worker *w, int fd)
+{
+    return fd_kind(w, fd) == EM_FD_STREAM;
 }
 
 /* The mark must be set right after the syscall, before EP_IO's fair() may poll or
@@ -399,13 +435,30 @@ ssize_t ep_recv(int fd, void *buf, size_t len)
     return r;
 }
 
-/* Reads signalfd/eventfd/pipe: the fd must be nonblocking or the first read
- * would stop the whole worker, so set O_NONBLOCK once per fd (shared by dups). */
+/* Reads signalfd/eventfd/pipe: the fd must be nonblocking or the first read would stop the
+ * whole worker, so set O_NONBLOCK once per fd (shared by dups). A regular file cannot be
+ * waited on (always "ready", the read itself blocks on the disk): it is read on the pool,
+ * like em_offload, so it is not interruptible once started (the kernel writes into buf). */
+struct file_read { int fd; void *buf; size_t len; };
+
+static intptr_t file_read_fn(void *p)
+{
+    struct file_read *a = p;
+    ssize_t r;
+    do r = read(a->fd, a->buf, a->len); while (r < 0 && errno == EINTR);
+    return r < 0 ? -errno : r;
+}
+
 ssize_t ep_read(int fd, void *buf, size_t len)
 {
     em_worker *w = &em_W;
     int e = fdt_ensure(w, fd);
     if (e) return e;
+    if (fd_kind(w, fd) == EM_FD_FILE) {
+        if ((e = begin())) return e;
+        struct file_read a = { fd, buf, len };
+        return em_offload(file_read_fn, &a);
+    }
     if (!w->fdt[fd].nb) {
         int fl = fcntl(fd, F_GETFL);
         if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) return -errno;
@@ -465,7 +518,9 @@ int ep_init(em_worker *w)
     if (w->epfd < 0) return -errno;
     w->evfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     struct epoll_event ev = { .events = EPOLLIN | EPOLLET, .data.u32 = EV_WAKE };
-    if (w->evfd < 0 || epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->evfd, &ev) < 0) {
+    struct epoll_event jev = { .events = EPOLLIN | EPOLLET, .data.u32 = EV_JOBS };
+    if (w->evfd < 0 || epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->evfd, &ev) < 0 ||
+        epoll_ctl(w->epfd, EPOLL_CTL_ADD, w->rt->slot[w->id].done_fd, &jev) < 0) {
         int e = -errno;
         if (w->evfd >= 0) close(w->evfd);
         close(w->epfd);

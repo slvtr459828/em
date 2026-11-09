@@ -1,6 +1,7 @@
 use crate::ffi;
 use crate::{cvt, errno};
 use libc::{c_int, c_void, sockaddr, sockaddr_in, sockaddr_in6, sockaddr_storage, socklen_t};
+use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::marker::PhantomData;
 use std::mem::{size_of, zeroed};
@@ -201,3 +202,23 @@ macro_rules! fd_traits {
     )*};
 }
 fd_traits!(TcpListener, TcpStream, UdpSocket);
+
+/// Looks `host` up on the offload pool (`getaddrinfo`, `em_resolve`) and returns its addresses
+/// (IPv4 and IPv6, resolver order, at most 16) with `port` set. A numeric host is parsed without
+/// the pool. The fiber parks; the worker keeps running. Cancelled or past its deadline, it returns
+/// at once (`ECANCELED` / [`ErrorKind::TimedOut`]) and the lookup finishes in the background.
+/// A name that does not exist is `ENOENT` ([`ErrorKind::NotFound`]), a resolver that is down
+/// `EAGAIN` ([`ErrorKind::WouldBlock`]); `EPERM` outside a fiber.
+///
+/// [`ErrorKind::TimedOut`]: std::io::ErrorKind::TimedOut
+/// [`ErrorKind::NotFound`]: std::io::ErrorKind::NotFound
+/// [`ErrorKind::WouldBlock`]: std::io::ErrorKind::WouldBlock
+pub fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    let host = CString::new(host).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    // SAFETY: all-zero is a valid sockaddr_storage.
+    let mut out: [sockaddr_storage; 16] = unsafe { zeroed() };
+    // SAFETY: `host` is NUL-terminated and `out` has room for the 16 addresses we allow.
+    let n = unsafe { ffi::em_resolve(host.as_ptr(), port, libc::AF_UNSPEC, out.as_mut_ptr(), out.len() as c_int) };
+    let n = cvt(n as isize)?;
+    out[..n].iter().map(|st| sock_addr(st, size_of::<sockaddr_storage>() as socklen_t)).collect()
+}

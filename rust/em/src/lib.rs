@@ -41,8 +41,9 @@
 //! # Rules that the types cannot enforce
 //!
 //! * **Blocking std calls stall the whole worker** (`std::fs`, `std::net`, `thread::sleep`,
-//!   `Mutex` held across a wait, DNS): em does not hook syscalls (D6). Use [`sleep`] and the
-//!   sockets of this crate.
+//!   `Mutex` held across a wait, DNS): em does not hook syscalls (D6). Use [`sleep`], the
+//!   sockets of this crate, [`resolve`] for names, and wrap any other blocking call in
+//!   [`offload`].
 //! * **`thread_local!` is shared by all fibers of a worker**: it is per thread, not per fiber.
 //! * **A fiber stack is 256 KiB and fixed** (D7). Deep recursion or big stack arrays end in
 //!   `SIGSEGV` at the guard page, not in a Rust panic. Put big buffers in the heap.
@@ -72,7 +73,7 @@ use libc::{c_int, c_void};
 mod ffi;
 mod net;
 
-pub use net::{read_fd, TcpListener, TcpStream, UdpSocket};
+pub use net::{read_fd, resolve, TcpListener, TcpStream, UdpSocket};
 
 type Payload = Box<dyn Any + Send + 'static>;
 
@@ -292,6 +293,47 @@ where
 pub fn sleep(dur: Duration) -> io::Result<()> {
     let r = unsafe { ffi::em_sleep_until(deadline_after(dur)) };
     if r < 0 { Err(errno(r)) } else { Ok(()) }
+}
+
+struct Job<F, R> {
+    f: Option<F>,
+    out: Option<std::thread::Result<R>>,
+}
+
+extern "C" fn offload_main<F: FnOnce() -> R, R>(arg: *mut c_void) -> isize {
+    // SAFETY: arg is the `Job` on the frame of `offload_job`, which em_offload does not leave
+    // before this returns; only this pool thread touches it meanwhile.
+    let job = unsafe { &mut *(arg as *mut Job<F, R>) };
+    let f = job.f.take().unwrap();
+    // A panic must not unwind into C: keep the payload for the fiber.
+    job.out = Some(catch_unwind(AssertUnwindSafe(f)));
+    0
+}
+
+fn offload_job<F: FnOnce() -> R, R>(f: F) -> R {
+    let mut job = Job { f: Some(f), out: None };
+    // SAFETY: see offload_main. em_offload waits for it even when the scope is cancelled, so `f`
+    // may borrow from this frame (no 'static), like std::thread::scope.
+    unsafe { ffi::em_offload(offload_main::<F, R>, &mut job as *mut _ as *mut c_void) };
+    match job.out {
+        Some(Ok(v)) => v,
+        Some(Err(p)) => resume_unwind(p),
+        // em_offload refused (outside a fiber: EPERM; no pool thread could start: EAGAIN) and
+        // never ran f: run it here, where blocking is all it can cost.
+        None => (job.f.take().unwrap())(),
+    }
+}
+
+/// Runs `f` on a pool thread (shared by the process, at most 64 threads) while the fiber parks
+/// and the worker runs other fibers: the way to call code that blocks (a DB driver, `std::fs`,
+/// hashing, a C library). Returns `f`'s result; a panic in `f` is resumed on the fiber.
+///
+/// **Not cancellable:** `f` may borrow from the caller's stack, so `offload` always waits for it,
+/// even if the scope is cancelled or its deadline passes meanwhile; the next cancel point reports
+/// it. `f` runs outside em: em calls made from it fail with `EPERM`, and a `thread_local!` it
+/// touches is the pool thread's. Outside a fiber `f` just runs on the calling thread.
+pub fn offload<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    offload_job(f)
 }
 
 /// Lets the other fibers of this worker run. No-op outside a fiber.

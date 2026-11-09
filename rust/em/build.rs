@@ -11,7 +11,7 @@ fn main() {
         a => panic!("em supports x86_64 and aarch64, not {a}"),
     };
     let mut b = cc::Build::new();
-    for f in ["fiber.c", "scope.c", "io.c", "io_uring.c", "io_epoll.c", asm] {
+    for f in ["fiber.c", "scope.c", "io.c", "io_uring.c", "io_epoll.c", "pool.c", asm] {
         b.file(src.join(f));
     }
     // layout.c is a compile-time check only (_Static_assert); it emits no code.

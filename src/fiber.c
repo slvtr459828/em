@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include "internal.h"
@@ -303,6 +304,14 @@ static int worker_init(em_worker *w, struct em_rt *rt, int id)
     CPU_SET(rt->slot[id].cpu, &one);
     if (sched_setaffinity(0, sizeof one, &one) != 0) return -errno;
 
+    /* Pool threads wake this worker through done_fd (closed in worker_exit, after the pool is joined). */
+    rt->slot[id].done_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (rt->slot[id].done_fd < 0) {
+        int e = -errno;
+        rt->slot[id].done_fd = -1;
+        return e;
+    }
+
     if (w->epoll) {
         int e = ep_init(w);
         if (e) return e;
@@ -331,6 +340,7 @@ static void worker_exit(em_worker *w, int init_ok)
     if (init_ok) {
         if (w->epoll) ep_exit(w); else io_uring_queue_exit(&w->ring);
     }
+    if (w->rt->slot[w->id].done_fd >= 0) close(w->rt->slot[w->id].done_fd);
     w->rt = NULL;
 }
 
@@ -349,6 +359,7 @@ static void worker_main(em_worker *w)
     w->root = &root;
     int deadlocked = 0;
     int rc = spawn_fiber(&root, rt->main_fn, rt->arg);
+    if (!w->epoll) ur_jobs_start(w);
     while (rc == 0) {
         em_fiber *f;
         while ((f = rq_pop(w))) {
@@ -377,6 +388,10 @@ static void worker_main(em_worker *w)
     }
     publish_result(w, deadlocked ? -EDEADLK : rc ? rc : root.first_err ? root.first_err :
                       root.cancelled ? -ECANCELED : 0);
+    /* Abandoned em_resolve jobs still run on the pool and will land on our done list; wait
+     * for them (em.h), then no CQE of ours may remain that targets this worker's memory. */
+    while (w->jobs) { if (w->epoll) ep_reap(w); else ur_reap(w); }
+    if (!w->epoll) ur_jobs_stop(w);
     /* Our msg_ring SQEs must complete before the ring can go away, and no ring
      * may go away before every sender is past this point (below). */
     while (w->msg_inflight) ur_reap(w); /* io_uring only: epoll sends none */
@@ -487,7 +502,15 @@ int em_run(int nworkers, int (*main_fn)(void *), void *arg)
     rt->cap = em_dbg_map_cap ? em_dbg_map_cap
                              : m > MAP_RESERVE ? (m - MAP_RESERVE) / 2 : 0; /* 2 VMAs per fiber */
     for (int i = 0; i < n; i++) {
-        rt->slot[i] = (struct em_slot){ .rt = rt, .id = i, .cpu = nth_cpu(&orig, i) };
+        rt->slot[i] = (struct em_slot){ .rt = rt, .id = i, .cpu = nth_cpu(&orig, i), .done_fd = -1 };
+    }
+    int pe = em_pool_init(&rt->pool, sizeof orig, &orig);
+    if (pe) {
+        sem_destroy(&rt->up);
+        sem_destroy(&rt->go);
+        sem_destroy(&rt->release);
+        free(rt);
+        return pe;
     }
 
     /* Threads first, so they inherit the caller's mask and signal mask. */
@@ -506,6 +529,7 @@ int em_run(int nworkers, int (*main_fn)(void *), void *arg)
     if (!rt->abort) {
         worker_main(w);
         sem_wait_n(&rt->up, started); /* everyone finished, nobody will send any more */
+        em_pool_join(&rt->pool);      /* every job is back (workers waited), so no pool thread touches a done_fd later */
         sem_post_n(&rt->release, started);
     }
     worker_exit(w, e0 == 0);
@@ -513,6 +537,7 @@ int em_run(int nworkers, int (*main_fn)(void *), void *arg)
 
     if (sched_setaffinity(0, sizeof orig, &orig) != 0) note_error(rt, -errno);
     int r = atomic_load(&rt->first_err);
+    em_pool_destroy(&rt->pool);
     sem_destroy(&rt->up);
     sem_destroy(&rt->go);
     sem_destroy(&rt->release);
