@@ -5,7 +5,7 @@
 # 256x4096 on both backends. Per row: round-trips/s, server CPU us/rt (as run.sh), and with a PMU
 # `perf stat -e instructions:u,cycles:u -p <server>` per round-trip. src/ itself is never touched.
 # Output: $OUT/results.csv, $OUT/ablate.md (also appended to $GITHUB_STEP_SUMMARY).
-# env: DURATION (5), ROUNDS (5), OUT (bench/out/tls-ablate), PERF (perf command)
+# env: DURATION (5), ROUNDS (5), OUT (bench/out/tls-ablate), PERF (perf command), VARIANTS (patch names, plus base)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DURATION=${DURATION:-5}
@@ -14,7 +14,7 @@ OUT=${OUT:-bench/out/tls-ablate}
 PERF=(${PERF:-perf})
 source bench/run.sh
 
-VARIANTS=(base G1-errclear G2-pending G3-readahead G4-noprobe ALL)
+VARIANTS=(${VARIANTS:-base G1-errclear G14 G124 ALL})
 CELLS=("256 128" "256 4096")
 BACKENDS=(uring epoll)
 
