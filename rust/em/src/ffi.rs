@@ -74,6 +74,6 @@ extern "C" {
     pub fn em_sendto(fd: c_int, buf: *const c_void, len: size_t, dst: *const sockaddr, n: socklen_t) -> ssize_t;
     pub fn em_close(fd: c_int) -> c_int;
 
-    pub fn em_offload(f: extern "C" fn(*mut c_void) -> isize, arg: *mut c_void) -> isize;
+    pub fn em_offload(f: extern "C" fn(*mut c_void) -> isize, arg: *mut c_void, res: *mut isize) -> c_int;
     pub fn em_resolve(host: *const libc::c_char, port: u16, family: c_int, out: *mut sockaddr_storage, max: c_int) -> c_int;
 }

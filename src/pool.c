@@ -158,7 +158,7 @@ void em_jobs_reap(em_worker *w)
     }
 }
 
-intptr_t em_offload(intptr_t (*fn)(void *), void *arg)
+int em_offload(intptr_t (*fn)(void *), void *arg, intptr_t *res)
 {
     em_worker *w = &em_W;
     em_fiber *f = w->current;
@@ -170,7 +170,8 @@ intptr_t em_offload(intptr_t (*fn)(void *), void *arg)
     f->state = EM_JOBWAIT;
     em_switch_to_sched(w, f);
     assert(j.state == EM_JOB_DONE); /* j is on this frame: never leave before the pool is done with it */
-    return j.res;
+    if (res) *res = j.res;
+    return 0;
 }
 
 /* Interruptible wait for a heap job. 0 = DONE (caller reads j->res and releases it); else

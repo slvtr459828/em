@@ -314,13 +314,17 @@ fn offload_job<F: FnOnce() -> R, R>(f: F) -> R {
     let mut job = Job { f: Some(f), out: None };
     // SAFETY: see offload_main. em_offload waits for it even when the scope is cancelled, so `f`
     // may borrow from this frame (no 'static), like std::thread::scope.
-    unsafe { ffi::em_offload(offload_main::<F, R>, &mut job as *mut _ as *mut c_void) };
-    match job.out {
-        Some(Ok(v)) => v,
-        Some(Err(p)) => resume_unwind(p),
+    let ran = unsafe {
+        ffi::em_offload(offload_main::<F, R>, &mut job as *mut _ as *mut c_void, std::ptr::null_mut())
+    } == 0;
+    if !ran {
         // em_offload refused (outside a fiber: EPERM; no pool thread could start: EAGAIN) and
         // never ran f: run it here, where blocking is all it can cost.
-        None => (job.f.take().unwrap())(),
+        return (job.f.take().unwrap())();
+    }
+    match job.out.take().unwrap() {
+        Ok(v) => v,
+        Err(p) => resume_unwind(p),
     }
 }
 

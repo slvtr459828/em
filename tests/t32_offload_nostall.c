@@ -18,7 +18,7 @@ static intptr_t slow(void *arg)
 static int off(void *arg)
 {
     (void)arg;
-    assert(em_offload(slow, NULL) == 99);
+    { intptr_t r_; assert(em_offload(slow, NULL, &r_) == 0 && r_ == 99); }
     done = 1;
     return 0;
 }

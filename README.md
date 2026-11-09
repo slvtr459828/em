@@ -169,7 +169,8 @@ Khác biệt của epoll cần biết:
   với em thì phải đóng bằng `em_close` trên worker đang dùng nó; `close()` thẳng để lại trạng
   thái đăng ký cũ mà fd ngoài em tiếp theo cùng số sẽ thừa hưởng (lần đợi đầu không bao giờ thức).
 - Một fiber luôn có dữ liệu sẵn sẽ nhường sau mỗi 128 lệnh xong ngay, để fiber khác và timer
-  không bị đói.
+  không bị đói. Cả hai backend: vòng lặp `em_yield()` thuần cũng poll không chặn mỗi 128 lần
+  gọi, nên hủy từ worker khác, kết quả pool và timer vẫn tới.
 
 ## Code chặn và DNS
 
@@ -177,7 +178,7 @@ em không hook syscall (D6): gọi `getaddrinfo`, đọc file, hay một thư vi
 là đứng cả worker. Hai hàm thay thế, cùng chạy trên một pool thread chung cho cả process (tạo
 khi cần, tối đa 64, sống từ `em_run` tới hết `em_run`):
 
-- `em_offload(fn, arg)` chạy `fn` trên pool, fiber park tới khi xong, worker chạy fiber khác.
+- `em_offload(fn, arg, &res)` chạy `fn` trên pool (trả 0 và ghi kết quả của `fn` vào `*res`; `-EPERM`/`-EAGAIN` nghĩa là `fn` không chạy), fiber park tới khi xong, worker chạy fiber khác.
   **Không ngắt được**: `fn` có thể dùng buffer trên stack fiber nên luôn được đợi tới cùng, kể
   cả khi scope bị hủy hay quá deadline (lệnh chặn kế tiếp mới báo). Trong `fn`, mọi hàm em trả
   `-EPERM`. Rust: `em::offload(|| ...)`, mượn biến cục bộ được, panic được ném lại trên fiber.

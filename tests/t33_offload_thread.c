@@ -14,7 +14,7 @@ static intptr_t fn(void *p)
     struct args *a = p;
     assert(syscall(SYS_gettid) != a->worker_tid);
     assert(em_sleep_until(em_now() + 1000000) == -EPERM);
-    assert(em_offload(fn, NULL) == -EPERM);
+    assert(em_offload(fn, NULL, NULL) == -EPERM);
     cpu_set_t set;
     assert(sched_getaffinity(0, sizeof set, &set) == 0);
     assert(CPU_COUNT(&set) == a->ncpu); /* the caller's original set, not the worker's single core */
@@ -26,9 +26,9 @@ static int main_fn(void *arg)
 {
     int ncpu = (int)(intptr_t)arg;
     struct args a = { .worker_tid = (pid_t)syscall(SYS_gettid), .ncpu = ncpu };
-    assert(em_offload(fn, &a) == 41);
+    { intptr_t r_; assert(em_offload(fn, &a, &r_) == 0 && r_ == 41); }
     for (int i = 0; i < 8; i++) assert(a.buf[i] == i * i);
-    assert(em_offload(fn, &a) == 41); /* reuses the pool thread */
+    { intptr_t r_; assert(em_offload(fn, &a, &r_) == 0 && r_ == 41); } /* reuses the pool thread */
     printf("offload thread (%s): runs off the worker, em calls from fn are -EPERM\n", em_backend());
     return 0;
 }
@@ -37,7 +37,7 @@ int main(void)
 {
     cpu_set_t set;
     assert(sched_getaffinity(0, sizeof set, &set) == 0);
-    assert(em_offload(fn, NULL) == -EPERM); /* outside em_run */
+    assert(em_offload(fn, NULL, NULL) == -EPERM); /* outside em_run */
     assert(em_run(1, main_fn, (void *)(intptr_t)CPU_COUNT(&set)) == 0);
     return 0;
 }

@@ -8,7 +8,7 @@ TESTS := tests/t1_pingpong tests/t2_churn tests/t3_many tests/t4_guard tests/t5_
   tests/t20_sigterm tests/t21_udp tests/t22_map_cap tests/t23_cancel_exit_race \
   tests/t24_fairness tests/t25_udp_waiters tests/t26_close_wakes tests/t27_backend_env tests/t28_timer_heap tests/t29_fd_reuse tests/t30_outside tests/t31_short_read \
   tests/t32_offload_nostall tests/t33_offload_thread tests/t34_offload_nocancel tests/t35_offload_cap \
-  tests/t36_resolve tests/t37_resolve_abandon tests/t38_file_read
+  tests/t36_resolve tests/t37_resolve_abandon tests/t38_file_read tests/t39_yield_poll
 
 ifeq ($(ARCH),x86_64)
 ASM := src/ctx_x86_64.S

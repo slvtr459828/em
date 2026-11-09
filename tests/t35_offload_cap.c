@@ -33,7 +33,7 @@ static intptr_t job(void *arg)
 static int caller(void *arg)
 {
     intptr_t i = (intptr_t)arg;
-    assert(em_offload(job, (void *)i) == i * 3 + 1);
+    { intptr_t r_; assert(em_offload(job, (void *)i, &r_) == 0 && r_ == i * 3 + 1); }
     atomic_fetch_add(&ndone, 1);
     return 0;
 }

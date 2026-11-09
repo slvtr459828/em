@@ -73,12 +73,17 @@ void ur_jobs_stop(em_worker *w)
     io_uring_prep_cancel64(sqe, EM_MSG_JOBS, 0);
     io_uring_sqe_set_data64(sqe, 0);
     w->jobs_rd = EM_JRD_CANCELLING;
-    while (w->jobs_rd != EM_JRD_STOPPED) ur_reap(w);
+    while (w->jobs_rd != EM_JRD_STOPPED) ur_reap(w, 1);
 }
 
-void ur_reap(em_worker *w)
+void ur_reap(em_worker *w, int block)
 {
-    for (;;) {
+    if (!block) {
+        /* DEFER_TASKRUN: completions (msg_ring, eventfd READ, timeouts) only appear when we enter
+         * the kernel with GETEVENTS; plain io_uring_submit would skip the enter when SQ is empty. */
+        int r = io_uring_submit_and_get_events(&w->ring);
+        if (r < 0 && r != -EBUSY && r != -EAGAIN && r != -EINTR) fatal("io_uring_submit_and_get_events", r);
+    } else for (;;) {
         int r = io_uring_submit_and_wait(&w->ring, 1);
         if (r >= 0 || r == -EBUSY) break; /* EBUSY: CQ overflow pending, reap below */
         if (r != -EINTR && r != -EAGAIN) fatal("io_uring_submit_and_wait", r);
@@ -113,6 +118,7 @@ void ur_reap(em_worker *w)
         em_jobs_reap(w); /* a CQE with a value or -ECANCELED alike: the list is the truth */
         if (w->jobs_rd == EM_JRD_CANCELLING) w->jobs_rd = EM_JRD_STOPPED; else jobs_arm(w);
     }
+    w->budget = EM_POLL_BUDGET;
     if (cancel_root && w->root) em_scope_cancel_all(w, w->root);
 }
 

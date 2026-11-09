@@ -23,7 +23,7 @@ static int off(void *arg)
 {
     (void)arg;
     int64_t t0 = em_now();
-    assert(em_offload(slow, NULL) == 42);
+    { intptr_t r_; assert(em_offload(slow, NULL, &r_) == 0 && r_ == 42); }
     assert(em_now() - t0 >= 95 * 1000000LL);
     assert(em_sleep_until(em_now() + 1000000000LL) == -ECANCELED);
     return 0;
@@ -36,7 +36,7 @@ static int main_fn(void *arg)
     em_scope s;
     em_scope_open(&s, em_now() + 20 * 1000000LL);
     int64_t t0 = em_now();
-    assert(em_offload(slow, NULL) == 42);
+    { intptr_t r_; assert(em_offload(slow, NULL, &r_) == 0 && r_ == 42); }
     assert(em_now() - t0 >= 95 * 1000000LL);
     assert(em_sleep_until(em_now() + 1000000000LL) == -ETIMEDOUT);
     assert(em_scope_close(&s) == 0);

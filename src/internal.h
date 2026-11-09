@@ -85,6 +85,11 @@ struct em_rt;
 /* State of the READ armed on the done eventfd (io_uring). IDLE = its CQE was reaped, re-arm. */
 enum { EM_JRD_IDLE, EM_JRD_ARMED, EM_JRD_CANCELLING, EM_JRD_STOPPED };
 
+/* Fairness: a fiber that never parks (immediately-completed ops on epoll, or em_yield loops on
+ * both backends) must still let the worker poll: cross-worker cancel, pool completions and
+ * timers only arrive through the poll. */
+#define EM_POLL_BUDGET 128
+
 typedef struct em_worker {
     struct em_rt *rt;   /* NULL = not inside em_run */
     int       id;
@@ -106,7 +111,7 @@ typedef struct em_worker {
     size_t    nfd;
     struct em_timer *heap;          /* epoll: binary min-heap on deadline */
     size_t    nheap, capheap;
-    int       budget;               /* epoll: immediately-completed ops left before a forced yield */
+    int       budget;               /* ops/yields left before a non-blocking poll (see em_yield); reset by every poll */
 #ifdef __SANITIZE_ADDRESS__
     void     *sched_fake;
     const void *sched_bottom;
@@ -176,7 +181,7 @@ void em_jobs_reap(em_worker *w);         /* owner: take the done list; wake wait
 struct io_uring_sqe *ur_sqe_get(em_worker *w);   /* leaves room for a link timeout */
 void ur_interrupt(em_worker *w, em_fiber *f);    /* f is EM_IOWAIT: submit ASYNC_CANCEL */
 void ur_submit(em_worker *w);
-void ur_reap(em_worker *w);                      /* submit, wait for CQEs, wake fibers */
+void ur_reap(em_worker *w, int block);           /* submit, (block: wait for a CQE,) wake fibers */
 void ur_jobs_start(em_worker *w);                /* arm the READ on the done eventfd */
 void ur_jobs_stop(em_worker *w);                 /* cancel it and wait for its CQE (no CQE may outlive the worker) */
 int  ur_job_wait(int64_t deadline_ns);           /* em_resolve: park until woken by ur_job_wake, the deadline (-ETIME) or cancel */
@@ -197,7 +202,7 @@ void ep_exit(em_worker *w);
 void ep_interrupt(em_worker *w, em_fiber *f);    /* f is EM_IOWAIT: unlink, -ECANCELED, ready */
 int  ep_job_wait(void);                          /* em_resolve: 0 = woken by ep_job_wake, else -ETIMEDOUT / -ECANCELED */
 void ep_job_wake(em_worker *w, em_fiber *f);
-void ep_reap(em_worker *w);                      /* epoll_wait (until the earliest timer), wake fibers */
+void ep_reap(em_worker *w, int block);           /* epoll_wait (block: until the earliest timer), wake fibers */
 int     ep_sleep_until(int64_t deadline_ns);
 int     ep_accept(int lfd);
 int     ep_connect(const struct sockaddr *a, socklen_t n);
@@ -207,6 +212,7 @@ ssize_t ep_send(int fd, const void *buf, size_t len);
 int     ep_shutdown(int fd, int how);
 int     ep_close(int fd);
 void    ep_fd_forget(em_worker *w, int fd); /* wake waiters -ECANCELED, clean slot */
+void    ep_fd_new(em_worker *w, int fd, int kind); /* fd em just created: clean slot + kind (EM_FD_*) */
 ssize_t ep_recvfrom(int fd, void *buf, size_t len, struct sockaddr *src, socklen_t *srclen);
 ssize_t ep_sendto(int fd, const void *buf, size_t len, const struct sockaddr *dst, socklen_t n);
 

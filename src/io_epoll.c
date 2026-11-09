@@ -29,7 +29,6 @@
  * that number is never added to epoll and its first wait parks forever. Contract
  * (em.h): such fds must be closed with em_close. */
 
-#define EP_BUDGET 128        /* immediately-completed ops before a forced poll + yield */
 #define EP_EVENTS 64         /* epoll_wait batch; the rest stays in the kernel ready list */
 #define EV_WAKE   UINT32_MAX     /* data.u32 of the cancel eventfd (an fd number can't be this) */
 #define EV_JOBS   (UINT32_MAX - 1) /* ... of the job-done eventfd (pool threads write it) */
@@ -250,24 +249,23 @@ static void ep_poll(em_worker *w, int block)
             wake(w, f, -ETIMEDOUT);
         }
     }
-    w->budget = EP_BUDGET;
+    w->budget = EM_POLL_BUDGET;
     if (cancel_root && w->root) em_scope_cancel_all(w, w->root);
 }
 
-void ep_reap(em_worker *w)
+void ep_reap(em_worker *w, int block)
 {
-    ep_poll(w, 1);
+    ep_poll(w, block);
 }
 
 /* An op that completed without waiting never went through the scheduler. A fiber
  * that always finds data would starve the others and never let a timer fire, so
- * after EP_BUDGET such ops the worker polls (wakes due timers and ready fds) and
- * yields. io_uring needs none of this: every op goes through the scheduler. */
+ * after EM_POLL_BUDGET such ops the worker yields, and em_yield polls (the budget is spent).
+ * io_uring needs this only for em_yield loops: every op goes through the scheduler. */
 static void fair(void)
 {
     em_worker *w = &em_W;
     if (--w->budget > 0) return;
-    ep_poll(w, 0);
     em_yield();
 }
 
@@ -344,7 +342,7 @@ int ep_accept(int lfd)
 {
     ssize_t r;
     EP_IO(r, lfd, EM_WAIT_RD, accept4(lfd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK));
-    if (r >= 0) ep_fd_forget(&em_W, (int)r);
+    if (r >= 0) ep_fd_new(&em_W, (int)r, EM_FD_STREAM);
     return (int)r;
 }
 
@@ -361,12 +359,19 @@ void ep_fd_forget(em_worker *w, int fd)
     *s = (struct em_fdw){0};
 }
 
+/* A fd em just created: clean slot, kind known (no lazy fstat + getsockopt later). */
+void ep_fd_new(em_worker *w, int fd, int kind)
+{
+    ep_fd_forget(w, fd);
+    if (!fdt_ensure(w, fd)) w->fdt[fd].kind = (uint8_t)kind; /* ENOMEM: stays unknown, classified lazily */
+}
+
 int ep_connect(const struct sockaddr *a, socklen_t n)
 {
     em_worker *w = &em_W;
     int fd = socket(a->sa_family, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) return -errno;
-    ep_fd_forget(w, fd);
+    ep_fd_new(w, fd, EM_FD_STREAM);
     int e = begin();
     if (!e && connect(fd, a, n) < 0) {
         if (errno == EINPROGRESS || errno == EINTR) {
@@ -388,7 +393,7 @@ int ep_connect(const struct sockaddr *a, socklen_t n)
     return fd;
 }
 
-/* Classify fd once (cached in kind): regular file, stream socket, or other. A stream recv
+/* Classify fd once (cached in kind; fds em creates get it at creation, see ep_fd_new): regular file, stream socket, or other. A stream recv
  * that returns less than asked has drained the socket: the next recv would only see EAGAIN
  * (in echo-like loops, one wasted syscall per round-trip). Remember it and wait first; any
  * data arriving later raises a new edge, which clears rd_idle. Not for datagram sockets (a
@@ -457,7 +462,9 @@ ssize_t ep_read(int fd, void *buf, size_t len)
     if (fd_kind(w, fd) == EM_FD_FILE) {
         if ((e = begin())) return e;
         struct file_read a = { fd, buf, len };
-        return em_offload(file_read_fn, &a);
+        intptr_t r;
+        e = em_offload(file_read_fn, &a, &r);
+        return e ? e : r;
     }
     if (!w->fdt[fd].nb) {
         int fl = fcntl(fd, F_GETFL);
@@ -526,7 +533,7 @@ int ep_init(em_worker *w)
         close(w->epfd);
         return e;
     }
-    w->budget = EP_BUDGET;
+    w->budget = EM_POLL_BUDGET;
     return 0;
 }
 

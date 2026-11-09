@@ -112,8 +112,10 @@ int       em_udp_bind(const struct sockaddr *a, socklen_t n);
 ssize_t   em_recvfrom(int fd, void *buf, size_t len, struct sockaddr *src, socklen_t *srclen);
 ssize_t   em_sendto(int fd, const void *buf, size_t len, const struct sockaddr *dst, socklen_t n);
 /* Runs fn(arg) on a pool thread; the calling fiber parks until fn returns and the
- * worker keeps running other fibers meanwhile. Returns fn's result, or -EPERM
- * outside a fiber, or -EAGAIN if no pool thread could be created (fn did not run).
+ * worker keeps running other fibers meanwhile. Returns 0 when fn ran (its result is
+ * stored in *res; res may be NULL), -EPERM outside a fiber, or -EAGAIN if no pool
+ * thread could be created (fn did not run): the result of fn is never mixed with
+ * these codes.
  * Not interruptible: fn may use the caller's stack (buffers, arg), so em_offload
  * always waits for fn to finish, even if the scope is cancelled or its deadline
  * passes meanwhile; the cancellation is reported by the next cancel point.
@@ -121,7 +123,7 @@ ssize_t   em_sendto(int fd, const void *buf, size_t len, const struct sockaddr *
  * the whole process, starts at em_run and ends with it; threads are created on
  * demand, at most 64, and extra jobs queue. A job that never returns stalls its
  * thread, and em_run, forever. */
-intptr_t  em_offload(intptr_t (*fn)(void *), void *arg);
+int       em_offload(intptr_t (*fn)(void *), void *arg, intptr_t *res);
 /* getaddrinfo(host) on the offload pool. Writes up to max (>= 1) addresses (port
  * set to `port`; family AF_INET, AF_INET6 or AF_UNSPEC) into out, in resolver
  * order, and returns the count (>= 1). A numeric host is parsed in place, without

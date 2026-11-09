@@ -204,6 +204,12 @@ void em_yield(void)
     em_worker *w = &W;
     em_fiber *f = w->current;
     if (!f) return;
+    /* The scheduler polls only when the run queue empties, so a fiber that keeps yielding would
+     * starve cancel, pool completions and timers: poll without blocking every EM_POLL_BUDGET
+     * yields (one syscall per 128 yields, none on the others). */
+    if (--w->budget <= 0) {
+        if (w->epoll) ep_reap(w, 0); else ur_reap(w, 0);
+    }
     f->state = EM_READY;
     rq_push(w, f);
     em_switch_to_sched(w, f);
@@ -384,17 +390,17 @@ static void worker_main(em_worker *w)
             em_scope_cancel_all(w, &root);
             continue;
         }
-        if (w->epoll) ep_reap(w); else ur_reap(w);
+        if (w->epoll) ep_reap(w, 1); else ur_reap(w, 1);
     }
     publish_result(w, deadlocked ? -EDEADLK : rc ? rc : root.first_err ? root.first_err :
                       root.cancelled ? -ECANCELED : 0);
     /* Abandoned em_resolve jobs still run on the pool and will land on our done list; wait
      * for them (em.h), then no CQE of ours may remain that targets this worker's memory. */
-    while (w->jobs) { if (w->epoll) ep_reap(w); else ur_reap(w); }
+    while (w->jobs) { if (w->epoll) ep_reap(w, 1); else ur_reap(w, 1); }
     if (!w->epoll) ur_jobs_stop(w);
     /* Our msg_ring SQEs must complete before the ring can go away, and no ring
      * may go away before every sender is past this point (below). */
-    while (w->msg_inflight) ur_reap(w); /* io_uring only: epoll sends none */
+    while (w->msg_inflight) ur_reap(w, 1); /* io_uring only: epoll sends none */
     w->root = NULL;
 }
 

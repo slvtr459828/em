@@ -37,7 +37,7 @@ int em_tcp_listen(const struct sockaddr *a, socklen_t n, int backlog)
     NEED_FIBER(-EPERM);
     int fd = socket(a->sa_family, SOCK_STREAM | sock_flags(), 0);
     if (fd < 0) return -errno;
-    if (em_W.epoll) ep_fd_forget(&em_W, fd); /* reused number: no stale slot */
+    if (em_W.epoll) ep_fd_new(&em_W, fd, EM_FD_STREAM); /* reused number: no stale slot */
     int one = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) < 0 ||
         setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) < 0 || /* every worker listens; kernel spreads */
@@ -109,7 +109,7 @@ int em_udp_bind(const struct sockaddr *a, socklen_t n)
     NEED_FIBER(-EPERM);
     int fd = socket(a->sa_family, SOCK_DGRAM | sock_flags(), 0);
     if (fd < 0) return -errno;
-    if (em_W.epoll) ep_fd_forget(&em_W, fd); /* reused number: no stale slot */
+    if (em_W.epoll) ep_fd_new(&em_W, fd, EM_FD_OTHER); /* reused number: no stale slot */
     int one = 1;
     in_port_t port = 0;
     if (a->sa_family == AF_INET) port = ((const struct sockaddr_in *)a)->sin_port;
