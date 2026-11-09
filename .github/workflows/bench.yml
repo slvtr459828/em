@@ -15,6 +15,10 @@ on:
         description: run bench/profile.sh (syscalls per round-trip + perf profile) instead of the bench
         type: boolean
         default: false
+      tlslib:
+        description: "run bench/tls_libs.sh: TLS library microbench"
+        type: boolean
+        default: false
 
 jobs:
   bench:
@@ -33,6 +37,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench/rust
+      - name: tlslib deps
+        if: inputs.tlslib
+        run: command -v cmake >/dev/null && command -v go >/dev/null || sudo apt-get install -y --no-install-recommends cmake golang-go
+      - uses: actions/cache@v4
+        if: inputs.tlslib
+        with:
+          path: build/*/tlslibs
+          key: tlslibs-${{ runner.arch }}-${{ hashFiles('bench/tls_libs.sh') }}
       - name: bench
         # max_map_count: em maps stacks per fiber. nofile/memlock (glommio) are raised on this
         # shell, which bench/run.sh inherits; prlimit under sudo may exceed the hard limit.
@@ -50,6 +62,8 @@ jobs:
             # TLS echo: em_tls on both backends vs tokio-rustls (own OUT: same cell names as above never clash)
             PERF="sudo perf" DURATION=${{ inputs.duration }} OUT=bench/out/profile-tls \
               PROF_SERVERS="em-tls-uring em-tls-epoll tokio-rustls" PROF_CELLS="tls:256:128 tls:256:4096" bench/profile.sh
+          elif [[ "${{ inputs.tlslib }}" == true ]]; then
+            bench/tls_libs.sh
           elif [[ "${{ inputs.soak }}" != 0 ]]; then
             SOAK=${{ inputs.soak }} bench/soak.sh
           else
