@@ -166,6 +166,7 @@ extern __thread em_worker em_W;
 void em_switch_to_sched(em_worker *w, em_fiber *f);
 void em_make_ready(em_worker *w, em_fiber *f);
 void em_fiber_finished(em_worker *w, em_fiber *f, int r); /* called on f's own stack */
+void em_stack_trim(void);   /* running fiber: release the dead stack pages below the caller's frame */
 /* scope.c */
 void em_scope_unlink(em_fiber *f);          /* remove f from home; wakes closer at 0 children */
 int  em_scope_is_cancelled(const em_fiber *f);

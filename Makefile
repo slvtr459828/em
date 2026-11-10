@@ -67,9 +67,9 @@ $(1)/libem.a: $(1)/fiber.o $(1)/scope.o $(1)/io.o $(1)/io_uring.o $(1)/io_epoll.
 $(1)/%: tests/%.c $(1)/libem.a src/internal.h
 	$(CC) $(2) -Isrc $$< $(1)/libem.a -luring -lm -lpthread -o $$@
 ifdef TLS_TESTS
-$(1)/tls.o: src/tls.c include/em_tls.h include/em.h
+$(1)/tls.o: src/tls.c src/internal.h include/em_tls.h include/em.h
 	@mkdir -p $(1)
-	$(CC) $(2) $(TLS_CF) -c $$< -o $$@
+	$(CC) $(2) $(TLS_CF) -Isrc -c $$< -o $$@
 $(1)/libem_tls.a: $(1)/tls.o
 	rm -f $$@ && ar rcs $$@ $$^
 $(addprefix $(1)/,$(notdir $(TLS_TESTS))): $(1)/%: tests/%.c tests/tls_util.h $(1)/libem_tls.a $(1)/libem.a

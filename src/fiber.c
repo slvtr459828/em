@@ -258,6 +258,21 @@ static void fiber_unmap(em_worker *w, em_fiber *f)
     em_dbg_munmap_count++;
 }
 
+/* Gives back the physical pages of the running fiber's stack below its current frame (minus one
+ * page of margin): a deep call (a TLS handshake) leaves them touched but dead, and an idle fiber
+ * would hold them for its whole life. The pages come back zero-filled on the next touch. Skipped
+ * when the frame is not on the fiber's stack (ASan's fake frames). */
+void em_stack_trim(void)
+{
+    em_fiber *f = em_W.current;
+    if (!f) return;
+    uintptr_t lo = (uintptr_t)map_base(f) + EM_GUARD_SIZE;
+    uintptr_t sp = (uintptr_t)__builtin_frame_address(0);
+    if (sp < lo || sp >= (uintptr_t)f) return;
+    uintptr_t hi = (sp - 4096) & ~(uintptr_t)4095;
+    if (hi > lo) madvise((void *)lo, hi - lo, MADV_DONTNEED);
+}
+
 int em_worker_id(void) { return W.id; }
 int em_worker_count(void) { return W.rt ? W.rt->n : 0; }
 

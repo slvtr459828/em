@@ -54,7 +54,7 @@ Lý do đầy đủ nằm trong [DESIGN.md](DESIGN.md).
 | M4 | Crate Rust `em` (`std::io::Read`/`Write`, không `async`) | Xong |
 | M5 | Đo sâu: syscall/round-trip và `perf`, khoảng nhiễu qua 5 vòng, latency p99, churn connection, soak 600 s với RSS phẳng | Xong |
 | v0.1 | offload + DNS | Xong |
-| v0.2 | TLS: `em_tls` (OpenSSL qua BIO pair, ngoài `libem`); Rust dùng rustls trên `em::TcpStream` | Xong (CI [42615977691](https://github.com/slvtr459828/em/actions/runs/42615977691)) |
+| v0.2 | TLS: `em_tls` (OpenSSL/AWS-LC qua BIO tự viết, ngoài `libem`); Rust dùng rustls trên `em::TcpStream` | Xong (CI [42615977691](https://github.com/slvtr459828/em/actions/runs/42615977691)) |
 
 Sau v0.2: HTTP, binding Java/JS/Python.
 
@@ -191,7 +191,7 @@ Trên epoll, `em_read` trên file thường cũng đi qua pool.
 
 ## TLS
 
-**C/C++:** `include/em_tls.h` + `libem_tls.a`, dùng OpenSSL qua BIO pair; mọi lần chờ đi qua
+**C/C++:** `include/em_tls.h` + `libem_tls.a`, dùng OpenSSL (hoặc AWS-LC) qua một BIO tự viết trên buffer của em; mọi lần chờ đi qua
 `em_recv`/`em_send`. Người dùng tự cấu hình `SSL_CTX` (cert, ALPN, verify...) bằng API OpenSSL;
 em không có lớp cấu hình riêng. `libem.a` không phụ thuộc OpenSSL.
 
@@ -221,9 +221,12 @@ let mut tls = rustls::StreamOwned::new(rustls::ClientConnection::new(config, nam
 tls.write_all(b"hello")?;           // dev-dependency rustls, crate em không đổi
 ```
 
-**Chi phí.** Bộ nhớ: **~81 KiB mỗi kết nối TLS idle** (RSS của `bench/em_tls_echo` với 1000
-kết nối idle: 8.4 MiB lúc rảnh, 89 MiB sau đó; đo bằng `bench/rss_tls.sh`; gồm `SSL` của OpenSSL,
-BIO 19.5 KiB ghi + 18 KiB đọc, buffer đọc/ghi của OpenSSL và stack fiber). Chưa tối ưu. CPU: bench có thêm
+**Chi phí.** Bộ nhớ (RSS của `bench/em_tls_echo` với 1000 kết nối idle sau một echo 16 KiB, đo bằng
+`bench/rss_tls.sh`): **~30 KiB mỗi kết nối TLS idle trên AWS-LC, ~86 KiB trên OpenSSL** (OpenSSL giữ
+thêm cặp buffer record 2 x 16 KiB của nó; `SSL_MODE_RELEASE_BUFFERS` đưa về ~53 KiB nhưng tốn 4-12% CPU
+ở echo 128 B nên em_tls không bật). Kết nối idle không giữ buffer lớn: buffer đọc/ghi của em được cấp khi cần
+và trả khi hết byte, lần `em_recv` đang đỗ đọc vào 512 B nằm trong `em_tls`, và stack fiber được trả
+lại sau handshake. CPU: bench có thêm
 em-tls-uring/em-tls-epoll/tokio-rustls ở echo 256 × 128, 256 × 4096 và churn 64 × 128, và bảng
 (h) trong `bench/table.py` tính chi phí TLS = µs/round-trip của em-tls trừ của em thường cùng
 ô (chạy bằng workflow `bench`, chưa có số chính thức; số kTLS dựa vào ô 4096, xem `plans/v0.2.md`).
