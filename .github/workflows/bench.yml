@@ -23,6 +23,10 @@ on:
         description: "run bench/tls_libs.sh: TLS library microbench"
         type: boolean
         default: false
+      tlsonly:
+        description: "bench: only the TLS cells and the TLS memory table (ONLY=tls); use rounds >= 9 for the lost-cells verdicts"
+        type: boolean
+        default: false
       awslc:
         description: "build em_tls against AWS-LC 5.12.0 (TLS_PREFIX) for the selected script (bench, tlsab, profile)"
         type: boolean
@@ -35,8 +39,10 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    # (10 servers x 7 cells + 3 TLS servers x 4 cells) x rounds x (duration + ~1 s) = ~65 min at the defaults
-    timeout-minutes: 90
+    # (10 servers x 7 cells + 9 TLS servers x 4 cells) x rounds x (duration + ~1 s) = ~97 min at the defaults;
+    # tlsonly: 9 x 4 x 9 rounds x ~11 s = ~59 min + build + bench/rss_tls.sh (~5 min). Raise the timeout if a
+    # tlsonly run exceeds 75 min; do not cut the rounds.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - name: deps
@@ -81,10 +87,10 @@ jobs:
             } || echo "note: libssl3t64-dbgsym not installed; libcrypto symbols rely on debuginfod"
             # tracefs stays root-only, so perf runs under sudo; the servers and client do not
             PERF="sudo perf" DURATION=${{ inputs.duration }} bench/profile.sh
-            # TLS echo: em_tls on both backends vs tokio-rustls (own OUT: same cell names as above never clash)
+            # TLS echo: em_tls on both backends vs every TLS server of run.sh (own OUT: same cell names as above never clash)
             # churn cells, call graphs (who calls ERR_clear_error, malloc, ...) and PMU counters (skipped on VMs)
             PERF="sudo env DEBUGINFOD_URLS=$DEBUGINFOD_URLS perf" DURATION=${{ inputs.duration }} OUT=bench/out/profile-tls \
-              PROF_SERVERS="em-tls-uring em-tls-epoll tokio-rustls" \
+              PROF_SERVERS="$(bash -c 'source bench/run.sh && echo "${TLS_SERVERS[*]}"' bench/profile.sh)" \
               PROF_CELLS="tls:256:128 tls:256:4096 churntls:64:128 churntlsres:64:128" \
               PROF_CALLGRAPH=1 PROF_COUNTERS=1 bench/profile.sh
           elif [[ "${{ inputs.tlsab }}" == true ]]; then
@@ -94,6 +100,7 @@ jobs:
           elif [[ "${{ inputs.soak }}" != 0 ]]; then
             SOAK=${{ inputs.soak }} bench/soak.sh
           else
+            [[ "${{ inputs.tlsonly }}" != true ]] || export ONLY=tls
             DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/run.sh
           fi
       - uses: actions/upload-artifact@v4

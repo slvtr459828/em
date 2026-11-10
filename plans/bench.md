@@ -32,6 +32,14 @@ và cho các trade-off còn treo (kích thước ring, ~11 ns/switch).
   `monoio-uring`, `monoio-epoll`, `compio-uring`, `compio-epoll`, `glommio-uring`. Khi M3.5 xong
   thì thêm `em-epoll`. Cùng backend so với nhau mới công bằng: em-uring so với monoio/compio/
   glommio-uring; bản epoll của chúng so với tokio.
+- **Server TLS** (`TLS_SERVERS` trong `bench/run.sh`; plans/tls-win.md): `em-tls-uring`, `em-tls-epoll`,
+  `tokio-rustls` (multi_thread, 1 worker), `tokio-rustls-ct` (current_thread), `monoio-rustls-uring`,
+  `monoio-rustls-epoll`, `compio-rustls-uring`, `compio-rustls-epoll`, `glommio-rustls-uring`. Mọi server
+  rustls dùng chung `bench/rust/tls_cfg` (aws-lc-rs, ticket stateless, 2 ticket, buffer echo 16 KiB). Bảng
+  "ô thua" (`table.py`, mục (j)) **không** dùng quy tắc `[lo–hi]` chồng nhau: tỉ lệ em/đối thủ theo từng
+  vòng; THUA = trung vị xấu hơn 5% và mọi vòng cùng phía xấu, THẮNG đối xứng, còn lại NGANG; cần ROUNDS >= 9.
+  Bảng bộ nhớ (`bench/rss_tls.sh`, mục (i)) có quy tắc riêng (độ dốc 500 → 1000 kết nối, 3 lần lặp).
+  `ONLY=tls` chỉ chạy các ô TLS.
 - **Xen kẽ**: mỗi vòng chạy lần lượt mọi server cho mọi ô ma trận. Chạy `R` vòng.
   Nhiễu VM chia đều cho mọi server thay vì dồn vào một bên.
 - Kết quả là **trung vị** qua các vòng, cùng tỉ lệ so với tokio. Số tuyệt đối trên VM dùng

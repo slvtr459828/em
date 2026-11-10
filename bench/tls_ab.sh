@@ -11,6 +11,7 @@ DURATION=${DURATION:-10}
 ROUNDS=${ROUNDS:-5}
 OUT=${OUT:-bench/out/tls-ab}
 source bench/run.sh
+TLS_SERVERS=(em-tls-uring em-tls-epoll tokio-rustls) # not the runtime comparison servers of run.sh: this is the ticket-mode A/B
 
 build
 mkdir -p "$OUT"

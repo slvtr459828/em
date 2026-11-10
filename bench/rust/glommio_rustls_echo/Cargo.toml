@@ -1,0 +1,10 @@
+[package]
+name = "glommio_rustls_echo"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+glommio = "0.9"
+futures-lite = "2"
+futures-rustls = { version = "=0.26.0", default-features = false, features = ["aws_lc_rs", "tls12"] }
+tls_cfg = { path = "../tls_cfg" }

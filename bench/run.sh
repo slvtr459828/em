@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 # Echo benchmark: em and its Rust crate (io_uring and epoll backends) vs tokio, monoio, compio, glommio.
-# See plans/bench.md. Then three TLS cells (plans/v0.2.md): em-tls-uring, em-tls-epoll, tokio-rustls.
+# See plans/bench.md. Then the TLS cells (plans/v0.2.md, plans/tls-win.md): em-tls-* vs every Rust runtime
+# on rustls/aws-lc-rs, then the memory per idle TLS connection (bench/rss_tls.sh).
 # env: DURATION (s per run, 10), ROUNDS (5), OUT (output dir, bench/out)
+#      ONLY=tls: run only the TLS cells (the verdict table needs ROUNDS >= 9)
 #      TLS_PREFIX (an OpenSSL prefix with include/ and lib[64]/: em-tls-* servers are built against it
 #      and run with it on LD_LIBRARY_PATH; bench/tls_libs.sh builds such prefixes)
 #      TLS_TICKETS (0|stateless|stateful), NODELAY (0): passed through to the TLS servers
 set -euo pipefail
 cd "$(dirname "$0")/.."
+ROOT=$PWD
 
 DURATION=${DURATION:-10}
 ROUNDS=${ROUNDS:-5}
 OUT=${OUT:-bench/out}
+ONLY=${ONLY:-}
+[[ -z $ONLY || $ONLY == tls ]] || { echo "ONLY=$ONLY: want tls or unset" >&2; exit 2; }
 ARCH=$(uname -m)
 BIN=build/$ARCH/bench
 SERVERS=(em-uring emrs-uring monoio-uring compio-uring glommio-uring tokio-epoll monoio-epoll compio-epoll em-epoll emrs-epoll)
-TLS_SERVERS=(em-tls-uring em-tls-epoll tokio-rustls)
+TLS_SERVERS=(em-tls-uring em-tls-epoll tokio-rustls tokio-rustls-ct monoio-rustls-uring monoio-rustls-epoll compio-rustls-uring compio-rustls-epoll glommio-rustls-uring)
 CONNS=(16 256 1024)
 SIZES=(128 4096)
 SRV_CPUS=0 # one server CPU (a single number: see cpu_ticks), 1 worker; client gets 3 CPUs: plans/bench.md
@@ -65,17 +70,27 @@ build() {
     cp "$tls_echo" "$BIN/em-tls-epoll"
     (
         cd bench/rust
-        local pkgs=(-p tokio_echo -p monoio_echo -p glommio_echo)
+        local pkgs=(-p tokio_echo -p monoio_echo -p glommio_echo -p glommio_rustls_echo)
         # glommio's bundled liburing misses struct open_how with some headers (Fedora 44);
         # on others (Ubuntu 24.04) forcing it in is a redefinition. Only add it when needed.
-        # em_rs_echo, client, tokio_rustls_echo on their own: the CFLAGS retry below would also reach
-        # the build.rs of em (asm file) and ring (asm files)
-        cargo build --release --locked -p em_rs_echo -p client -p tokio_rustls_echo >&2
-        cargo build --release --locked "${pkgs[@]}" >&2 ||
-            CFLAGS="${CFLAGS:-} -include linux/openat2.h" cargo build --release --locked "${pkgs[@]}" >&2
+        # em_rs_echo, client and the other TLS servers on their own: the retry below changes CC, which
+        # reruns the build.rs of every crate in its graph. Not CFLAGS: it would also reach aws-lc-sys
+        # (asm files do not take `-include`), em (asm file) and ring. The wrapper adds the include
+        # to glommio's liburing sources only.
+        cargo build --release --locked -p em_rs_echo -p client -p tokio_rustls_echo -p monoio_rustls_echo >&2
+        cargo build --release --locked "${pkgs[@]}" >&2 || {
+            local cc=$ROOT/build/$ARCH/glommio-cc
+            mkdir -p "$(dirname "$cc")"
+            printf '#!/bin/sh\ncase "$*" in *glommio-*/liburing/*) exec %s -include linux/openat2.h "$@" ;; esac\nexec %s "$@"\n' \
+                "${CC:-cc}" "${CC:-cc}" >"$cc"
+            chmod +x "$cc"
+            CC=$cc cargo build --release --locked "${pkgs[@]}" >&2
+        }
         cp target/release/em_rs_echo ../../$BIN/emrs
         cp target/release/tokio_echo ../../$BIN/tokio-epoll
-        cp target/release/tokio_rustls_echo ../../$BIN/tokio-rustls
+        cp target/release/tokio_rustls_echo ../../$BIN/tokio-rustls # tokio-rustls-ct: the same binary, TOKIO_RT=current_thread
+        cp target/release/monoio_rustls_echo ../../$BIN/monoio-rustls
+        cp target/release/glommio_rustls_echo ../../$BIN/glommio-rustls-uring
         cp target/release/monoio_echo ../../$BIN/monoio
         cp target/release/glommio_echo ../../$BIN/glommio-uring
         cp target/release/client ../../$BIN/client
@@ -83,17 +98,22 @@ build() {
         for d in uring epoll; do
             cargo build --release --locked -p compio_echo --features $d >&2
             cp target/release/compio_echo ../../$BIN/compio-$d
+            cargo build --release --locked -p compio_rustls_echo --features $d >&2
+            cp target/release/compio_rustls_echo ../../$BIN/compio-rustls-$d
         done
     )
 }
 
 start() { # server port: launches pinned in the background, waits until it accepts
     local cmd=("$BIN/$1" "$2" "$WORKERS")
-    case $1 in em-tls-*) cmd=(env "EM_BACKEND=${1#em-tls-}" "${cmd[@]}") # same binary, backend forced
+    case $1 in em-tls-uring|em-tls-epoll) cmd=(env "EM_BACKEND=${1#em-tls-}" "${cmd[@]}") # same binary, backend forced
                [[ -z ${TLS_PREFIX:-} ]] || cmd=(env "LD_LIBRARY_PATH=$(tls_prefix_lib)" "${cmd[@]}") ;;
-               em-*) cmd=(env "EM_BACKEND=${1#em-}" "${cmd[@]}") ;; esac
-    case $1 in emrs-*) cmd=(env "EM_BACKEND=${1#emrs-}" "$BIN/emrs" "$2" "$WORKERS") ;; esac
-    case $1 in monoio-*) cmd=("$BIN/monoio" "$2" "${1#monoio-}" "$WORKERS") ;; esac
+               em-uring|em-epoll) cmd=(env "EM_BACKEND=${1#em-}" "${cmd[@]}") ;; esac
+    case $1 in emrs-uring|emrs-epoll) cmd=(env "EM_BACKEND=${1#emrs-}" "$BIN/emrs" "$2" "$WORKERS") ;; esac
+    # exact names: monoio-* would also match monoio-rustls-*
+    case $1 in monoio-uring|monoio-epoll) cmd=("$BIN/monoio" "$2" "${1#monoio-}" "$WORKERS") ;;
+               monoio-rustls-uring|monoio-rustls-epoll) cmd=("$BIN/monoio-rustls" "$2" "${1#monoio-rustls-}" "$WORKERS") ;;
+               tokio-rustls-ct) cmd=(env TOKIO_RT=current_thread "$BIN/tokio-rustls" "$2" "$WORKERS") ;; esac
     taskset -c $SRV_CPUS "${cmd[@]}" >/dev/null &
     pid=$!
     for _ in {1..100}; do
@@ -149,8 +169,10 @@ build
 mkdir -p "$OUT"
 # echo cells, then one churn cell (connect, one 128 B round-trip, RST; 64 concurrent: plans/m5.md)
 CELLS=()
-for c in "${CONNS[@]}"; do for s in "${SIZES[@]}"; do CELLS+=("echo $c $s"); done; done
-CELLS+=("churn 64 128")
+if [[ $ONLY != tls ]]; then
+    for c in "${CONNS[@]}"; do for s in "${SIZES[@]}"; do CELLS+=("echo $c $s"); done; done
+    CELLS+=("churn 64 128")
+fi
 # TLS cells: server us/rt of em-tls-* minus em-* in the same cell (same conns x size) is the cost
 # of TLS (table.py). The mode names echotls/churntls keep them apart from the plain cells.
 # churntls: client resumption off (every connection a full handshake); churntlsres: client keeps a
@@ -164,6 +186,9 @@ for ((r = 1; r <= ROUNDS; r++)); do
         read -r mode c s <<<"$cell"
         case $mode in echo) arg=() ;; churn) arg=(churn) ;; echotls) arg=(tls) ;; churntls) arg=(churn tls) ;; churntlsres) arg=(churn tlsres) ;; esac
         srvs=("${SERVERS[@]}"); [[ $mode == *tls* ]] && srvs=("${TLS_SERVERS[@]}")
+        # the order rotates with the round (round r starts at server r), so no server always runs right
+        # after the same other server
+        k=$(((r - 1) % ${#srvs[@]})); srvs=("${srvs[@]:k}" "${srvs[@]:0:k}")
         for srv in "${srvs[@]}"; do
             port=$((port + 1))
             start "$srv" "$port"
@@ -175,5 +200,12 @@ for ((r = 1; r <= ROUNDS; r++)); do
 done
 rm -f "$OUT/rps.tmp"
 
-python3 -I bench/table.py "$OUT/results.csv" "${SERVERS[@]}" --tls "${TLS_SERVERS[@]}" | tee "$OUT/table.md"
-[[ -z ${GITHUB_STEP_SUMMARY:-} ]] || { echo "### echo bench ($ARCH, ${DURATION}s x $ROUNDS rounds)"; cat "$OUT/table.md"; } >>"$GITHUB_STEP_SUMMARY"
+# memory per idle TLS connection (own table), after the cells so a failure here keeps the cell results
+bench/rss_tls.sh | tee "$OUT/rss.md" >&2
+
+# table.py exits 1 when a check fails (missing rows, mixed negotiation, resumption < 0.95): the summary is
+# still written, then the run fails
+rc=0
+python3 -I bench/table.py "$OUT/results.csv" "${SERVERS[@]}" --tls "${TLS_SERVERS[@]}" | tee "$OUT/table.md" || rc=$?
+[[ -z ${GITHUB_STEP_SUMMARY:-} ]] || { echo "### echo bench ($ARCH, ${DURATION}s x $ROUNDS rounds)"; cat "$OUT/table.md" "$OUT/rss.md"; } >>"$GITHUB_STEP_SUMMARY"
+exit "$rc"

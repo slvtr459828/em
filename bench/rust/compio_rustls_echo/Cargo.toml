@@ -1,0 +1,13 @@
+[package]
+name = "compio_rustls_echo"
+version = "0.0.0"
+edition = "2021"
+
+# Driver is chosen at build time: --features uring | epoll (run.sh builds both).
+[features]
+uring = ["compio/io-uring"]
+epoll = ["compio/polling"]
+
+[dependencies]
+compio = { version = "0.19", default-features = false, features = ["runtime", "net", "io", "macros", "rustls"] }
+tls_cfg = { path = "../tls_cfg" }
