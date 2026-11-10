@@ -1,7 +1,7 @@
 #ifndef EM_TLS_H
 #define EM_TLS_H
-/* TLS over an em fd: OpenSSL driven through a BIO pair, every wait goes through
- * em_recv / em_send. Link libem_tls.a, libem.a, -lssl -lcrypto. libem itself does not
+/* TLS over an em fd: OpenSSL driven through a custom BIO over buffers em owns, every wait goes
+ * through em_recv / em_send. Link libem_tls.a, libem.a, -lssl -lcrypto. libem itself does not
  * depend on OpenSSL. Same fiber context rules as em.h: call from a fiber.
  *
  * Library. Default: OpenSSL >= 3.0 found by pkg-config. `make TLS_PREFIX=dir` builds against the
@@ -14,6 +14,12 @@
  * em_tls with AWS-LC AND the system OpenSSL through another library (libcurl, libpq...) will have
  * one side call into the other. Build AWS-LC with BORINGSSL_PREFIX to avoid it (documented here,
  * not built or tested by the repo's CI).
+ *
+ * Memory. An idle em_tls holds its SSL state and a 512 B receive buffer, nothing big: the read and
+ * write buffers (up to 18 / 19.5 KiB) exist only while records are in flight. Measured per idle
+ * connection (bench/rss_tls.sh): ~30 KiB with AWS-LC, ~86 KiB with OpenSSL (its own record buffers,
+ * kept between calls; SSL_MODE_RELEASE_BUFFERS would cut ~32 KiB for 4-12% CPU on small records,
+ * so em_tls does not set it: your SSL_CTX may).
  *
  * Ownership.
  *  - fd: a connected TCP socket from em (em_accept / em_connect). em_tls never closes it.
