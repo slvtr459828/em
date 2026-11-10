@@ -1,0 +1,11 @@
+[package]
+name = "tls_cfg"
+version = "0.0.0"
+edition = "2021"
+
+# The rustls server configuration shared by every TLS echo server (plans/tls-win.md 1.2).
+# aws-lc-rs everywhere (same AWS-LC as em's AWS-LC build), no `ring`: rcgen's default features would pull it in.
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
+aws-lc-sys = "=0.47.0"
