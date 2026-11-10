@@ -344,3 +344,49 @@ Tỉ lệ so với tokio-rustls của các run trước không nối tiếp đư
 THẮNG: echo uring vs compio và glommio (0.77–0.89) trên cả hai arch; echo epoll vs compio-epoll
 (0.74–0.84); churn có resume uring vs monoio, compio trên x86 (0.94–0.95). Còn lại NGANG.
 
+
+**Bước 2a** (35950ae, merge 6cd76cb; bench 42782999801). Thay BIO pair bằng custom BIO trên buffer do em
+giữ: buffer tx và rx chỉ lấy khi cần, trả về khi rỗng, có pool 8 buffer cho mỗi worker; recv khi idle đọc
+vào 512 B inline; sau handshake gọi `madvise` trả phần stack không dùng. Nhánh copy riêng cho AWS-LC
+đã bỏ. Bộ nhớ idle trên AWS-LC từ 82.6 xuống **29.3 KiB** (CI, x86 và arm như nhau); OpenSSL từ 127
+xuống 85.8 (đo local), riêng phần buffer record của OpenSSL người dùng tự gỡ bằng
+`SSL_MODE_RELEASE_BUFFERS`. CPU không tụt: echo 128 uring vs monoio từ 1.08–1.09 về 1.00 (NGANG).
+
+**Bước 2b** (6d1d00a; nhánh thử `exp/uring-churn`, các run 42772059859, 42772064211, 42780494860).
+Ring dùng `COOP_TASKRUN|TASKRUN_FLAG` thay cho `DEFER_TASKRUN`. Bảng dưới là CPU server, trung vị
+9 vòng, arm, em-tls-uring chia cho đối thủ:
+
+| Biến thể | churn vs glommio | echo 128 vs monoio | echo 128 vs glommio |
+|---|---|---|---|
+| gốc | 1.24 | 1.09 | 0.89 |
+| COOP_TASKRUN | 1.17 | 1.01 | 0.72 |
+| recv/send đồng bộ trước | 1.12 | 1.54 | 1.09 |
+| COOP_TASKRUN + send đồng bộ trước | 1.15 | 1.52 | 1.07 |
+
+Các hướng bị loại và lý do:
+- recv/send đồng bộ trước: ở 256 kết nối, phần lớn lần gọi chỉ nhận EAGAIN rồi vẫn phải submit vào
+  ring, nên echo tệ đi 1.3–1.5x. Nó còn làm đỏ `t24_fairness`, vì khi dữ liệu có sẵn thì fiber không
+  nhường lượt.
+- accept4 đồng bộ: socket lắng nghe ở chế độ blocking nên lệnh này chặn luôn cả thread.
+- Bỏ `cancel_fd` trong `ur_close`: `t7_echo` treo, vì op đang chờ trên fd vừa đóng không bao giờ
+  hoàn tất.
+
+**Sau bước 2** (main 6d1d00a, bench 42791456704, xanh mọi job):
+
+| Ô | x86 | arm |
+|---|---|---|
+| Bộ nhớ idle vs tokio / glommio | 1.14 / 1.13 THUA (29.3 vs 25.6 / 25.9 KiB) | như x86 |
+| Bộ nhớ idle vs monoio / compio | 0.51 / 0.58 THẮNG | như x86 |
+| echo 128 uring vs monoio / compio / glommio | 0.98 / 0.68 / 0.69 | 1.04 / 0.74 / 0.86 |
+| echo epoll vs tokio, tokio-ct | 1.12–1.26, NGANG (min < 1) | 1.10–1.15 THUA |
+| churn uring vs glommio | 0.97 NGANG | 1.16 / 1.12 THUA |
+| churn epoll vs tokio-ct | 1.04 NGANG | 1.06 THUA |
+| p99/p50 churn epoll | 1.24–1.34 THUA | 1.16–1.23 THUA |
+
+Còn thua, chưa điều tra:
+- glue trên epoll: echo vs tokio thua 10–15%;
+- p99/p50 của churn trên epoll;
+- churn uring trên arm: dù đã đổi cờ ring, vẫn thua glommio 1.12–1.16x.
+
+Self-check resume của glommio tụt xuống 0.92–0.94 ở một hai vòng trong ba run liền. Đây là hành vi của
+glommio, không phải của em.
