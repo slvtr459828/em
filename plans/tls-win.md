@@ -321,4 +321,26 @@ Phỏng vấn người dùng sau red team (2026-11-10). Không câu trả lời 
 
 ## Kết quả
 
-Chưa chạy.
+**Bước 0** (CI 42754655469, xanh mọi job gồm `awslc` x86/arm): t46 trên OpenSSL 3.0.13 và AWS-LC: alert →
+`-EPROTO` sau 400 ms (deadline 2 s); KeyUpdate: server nhận đủ 64 KiB rồi ghi được (tiền đề "không thư viện
+nào phát từ `SSL_read`" đúng thật trên cả 3.0.13 và AWS-LC); reset: reader `-EPROTO`, writer `-ECONNRESET`.
+
+**Bước 1** (bench 42756701491: `awslc`, `tlsonly`, 9 vòng; mọi kiểm tự động qua; resume ≥ 99.6%).
+Tỉ lệ so với tokio-rustls của các run trước không nối tiếp được: tokio-rustls đã đổi từ `ring` sang aws-lc-rs.
+
+Ô THUA (em / đối thủ cùng backend, CPU server; trung vị [min–max]):
+
+| Ô | x86 | arm | Quy trách nhiệm sơ bộ |
+|---|---|---|---|
+| Bộ nhớ idle: em 82.6 KiB/kết nối | 3.2x tokio/glommio, 1.4–1.6x monoio/compio | như x86 | em: buffer BIO pair, buffer SSL giữ khi idle, stack fiber đã chạm (`buf[16384]` của echo, `IN_BYTES` của AWS-LC) |
+| echo 128, epoll vs tokio, tokio-ct | 1.09, 1.11 | 1.13, 1.15 | em: glue BIO pair trên epoll |
+| echo 4096, epoll vs tokio, tokio-ct | 1.05, 1.07 | NGANG | em: như trên |
+| echo 128, uring vs monoio | 1.08 | 1.09 | em: chưa rõ (monoio rẻ hơn ở record nhỏ) |
+| churn, epoll vs tokio-ct | 1.06 (đầy đủ) | 1.09 / 1.06 | em: chi phí mỗi kết nối (accept, `epoll_ctl`, `setsockopt`, fiber) |
+| churn, uring vs glommio | NGANG | 1.24 / 1.19 | uring trên arm: monoio-uring 1.24x và compio-uring 1.16x tokio cũng chịu, glommio thì không. Không chỉ là kernel: glommio làm khác gì đó |
+| churn, uring vs compio | NGANG | 1.06 (đầy đủ) | như trên |
+| p99/p50 churn, epoll vs tokio-ct, monoio, compio | 1.21–1.27 | 1.18–1.29 | em: độ công bằng lập lịch trên epoll khi churn |
+
+THẮNG: echo uring vs compio và glommio (0.77–0.89) trên cả hai arch; echo epoll vs compio-epoll
+(0.74–0.84); churn có resume uring vs monoio, compio trên x86 (0.94–0.95). Còn lại NGANG.
+
