@@ -79,7 +79,7 @@ void ur_jobs_stop(em_worker *w)
 void ur_reap(em_worker *w, int block)
 {
     if (!block) {
-        /* DEFER_TASKRUN: completions (msg_ring, eventfd READ, timeouts) only appear when we enter
+        /* COOP_TASKRUN: completions (msg_ring, eventfd READ, timeouts) only appear when we enter
          * the kernel with GETEVENTS; plain io_uring_submit would skip the enter when SQ is empty. */
         int r = io_uring_submit_and_get_events(&w->ring);
         if (r < 0 && r != -EBUSY && r != -EAGAIN && r != -EINTR) fatal("io_uring_submit_and_get_events", r);

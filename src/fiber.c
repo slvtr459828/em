@@ -342,7 +342,10 @@ static int worker_init(em_worker *w, struct em_rt *rt, int id)
 
     struct io_uring_params p;
     memset(&p, 0, sizeof p);
-    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN |
+    /* COOP_TASKRUN, not DEFER_TASKRUN: measured on CI (plans/tls-win.md step 2b), TLS echo
+     * 0.89 -> 0.72 vs glommio, churn on arm 1.24 -> 1.17. Sync-first recv/send was
+     * measured too and lost (echo 1.3-1.5x worse vs monoio). */
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG |
               IORING_SETUP_SUBMIT_ALL | IORING_SETUP_CQSIZE;
     p.cq_entries = CQ_ENTRIES;
     int rc = io_uring_queue_init_params(SQ_ENTRIES, &w->ring, &p);
@@ -484,7 +487,7 @@ static int pick_backend(void)
     struct io_uring probe;
     struct io_uring_params p;
     memset(&p, 0, sizeof p);
-    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN;
+    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
     int rc = io_uring_queue_init_params(2, &probe, &p);
     if (rc == 0) {
         io_uring_queue_exit(&probe);

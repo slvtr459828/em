@@ -37,7 +37,7 @@ khi có rất nhiều connection nhàn rỗi.
 
 ## Worker
 
-- Mỗi worker: 1 thread ghim core, 1 ring (`SINGLE_ISSUER | DEFER_TASKRUN`), 1 run queue
+- Mỗi worker: 1 thread ghim core, 1 ring (`SINGLE_ISSUER | COOP_TASKRUN`), 1 run queue
   FIFO intrusive (con trỏ next nằm trong fiber), 1 free-list stack fiber để tái dùng.
 - Vòng lặp: chạy hết run queue → `io_uring_submit_and_wait(1)` → duyệt CQE, đánh thức fiber.
   Một syscall cho cả submit lẫn chờ.
