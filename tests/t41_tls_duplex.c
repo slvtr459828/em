@@ -1,9 +1,9 @@
 /* Full duplex on one TLS connection: each side has a fiber writing 16 MiB and a fiber reading 16 MiB
  * at the same time. Mid-stream the client asks for a KeyUpdate (the server's answer is produced
- * inside em_tls_recv and flushed while its writer may be flushing too) and the server updates its
+ * with its next write, which may be flushing already) and the server updates its
  * own keys. A second reader or writer on the same em_tls gets -EBUSY.
  * Third pass: 32 KiB socket buffers and a KeyUpdate request every 256 KiB, so em_send blocks all the
- * time and the writer meets the reader mid-flush (the reader flushes the KeyUpdate answer). */
+ * time. Each side answers a KeyUpdate from its writer (SSL_write), never from the reader. */
 #include <stdatomic.h>
 #include <stdio.h>
 #include "tls_util.h"

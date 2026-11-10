@@ -36,7 +36,7 @@ endif
 endif
 ifeq ($(TLS_FOUND),yes)
 TLS_TESTS := tests/t40_tls_echo tests/t41_tls_duplex tests/t42_tls_verify tests/t43_tls_truncate \
-  tests/t44_tls_cancel tests/t45_tls_workers tests/t46_tls_flushwait
+  tests/t44_tls_cancel tests/t45_tls_workers tests/t46_tls_recv_noblock
 TESTS     += $(TLS_TESTS)
 endif
 

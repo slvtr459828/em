@@ -39,14 +39,12 @@
  *  - while em_tls_recv waits for bytes: nothing was consumed, the em_tls is intact, call
  *    again (this is how a read deadline is used).
  *  - while sending: a TLS record may be half on the wire and OpenSSL's write state is
- *    mid-record, so the stream is broken. This includes the flush of a record that
- *    em_tls_recv itself had to send (KeyUpdate answer, alert). From then on every call
- *    returns -EPIPE; close the connection. The call that failed returns the cause.
+ *    mid-record, so the stream is broken. From then on every call returns -EPIPE;
+ *    close the connection. The call that failed returns the cause.
  *  - handshake: -ECANCELED / -ETIMEDOUT, the em_tls is not created.
  *
- * Known limit: both ends flushing a record from inside em_tls_recv at the same moment
- * with both TCP buffers full (simultaneous KeyUpdate under bulk traffic) can stall, as
- * neither is reading. */
+ * em_tls_recv never waits for the peer to read. An alert it has to send (protocol error)
+ * is best-effort: one non-blocking send; if the peer is not reading it may never arrive. */
 #include <openssl/ssl.h>
 #include <sys/types.h>
 

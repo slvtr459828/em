@@ -16,6 +16,7 @@
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 #include "em.h"
 #include "em_tls.h"
 
@@ -36,7 +37,6 @@ struct em_tls {
     SSL      *ssl;
     BIO      *net;     /* our end of the pair; ssl owns the other end */
     int       fd;
-    em_fiber *waiter;  /* fiber parked until the flusher is done (at most one: the other direction) */
     unsigned char reading, writing, flushing, broken;
 };
 
@@ -95,9 +95,8 @@ static void restore_errors(const struct saved *s)
 }
 
 #ifdef OPENSSL_IS_AWSLC
-/* Sends everything in the BIO through a stack buffer (AWS-LC counterpart of the BIO_nread0 loop
- * in flush()). Bytes read out of the BIO cannot go back, so every one of them is sent. A separate
- * function so its IN_BYTES array is never live together with fill()'s one. */
+/* BIO to the socket via a stack buffer (AWS-LC counterpart of flush()'s BIO_nread0 loop); bytes read
+ * out cannot go back, so all are sent. Not fill() (IN_BYTES). */
 __attribute__((noinline)) static int drain(em_tls *t)
 {
     unsigned char buf[IN_BYTES];
@@ -113,30 +112,16 @@ __attribute__((noinline)) static int drain(em_tls *t)
 }
 #endif
 
-/* Sends everything the SSL has queued, until the BIO is empty (including bytes queued by the
- * other fiber meanwhile). Only one fiber drains at a time. wait: if another fiber is draining,
- * park until it is done (needed when this fiber's own bytes must be on their way: send_all
- * returns, or the BIO is full); otherwise return, the drainer will send them. A reader never
- * waits just for its own side effect (KeyUpdate answer): the drainer may be blocked on the peer
- * and the peer on our reads. Failure here breaks the stream. */
-static int flush(em_tls *t, int wait)
+/* Sends all the SSL has queued; parks in em_send. Writer side only; `flushing` keeps the reader off
+ * the BIO meanwhile. Failure breaks the stream. */
+static int flush(em_tls *t)
 {
-    while (t->flushing) {
-        if (!wait) return 0;
-        t->waiter = em_self();
-        int r = em_park();
-        t->waiter = NULL;
-        if (r < 0) { t->broken = 1; return r; }
-        if (t->broken) return -EPIPE;
-    }
     int r = 0;
-#ifdef OPENSSL_IS_AWSLC
     t->flushing = 1;
+#ifdef OPENSSL_IS_AWSLC
     r = drain(t);
 #else
-    char *p;
-    long n;
-    t->flushing = 1;
+    char *p; long n;
     while ((n = BIO_nread0(t->net, &p)) > 0) {
         ssize_t s = em_send(t->fd, p, (size_t)n);
         if (s < 0) { r = (int)s; t->broken = 1; break; }
@@ -144,13 +129,33 @@ static int flush(em_tls *t, int wait)
     }
 #endif
     t->flushing = 0;
-    if (t->waiter) em_unpark(t->waiter);
     return r;
 }
 
+/* What SSL_read left in the BIO (an alert) goes out in one send that never parks: the peer may not
+ * be reading. Skipped while the writer flushes (it sends them) or the stream is broken (the BIO may
+ * hold a cancelled record). OpenSSL: what the kernel takes leaves the BIO, the rest waits for the
+ * writer; a send error is not recorded (the writer meets it again). AWS-LC: bytes read out cannot
+ * go back, so a short send breaks the stream. */
 #ifdef OPENSSL_IS_AWSLC
-/* Reads from the socket into the BIO (the AWS-LC counterpart of the BIO_nwrite0 block in run()).
- * Its own function so the IN_BYTES array is never live together with drain()'s one. */
+__attribute__((noinline)) static void reader_send(em_tls *t)
+{
+    unsigned char buf[OUT_BYTES];
+    int n = t->flushing || t->broken ? 0 : BIO_read(t->net, buf, sizeof buf);
+    if (n > 0 && send(t->fd, buf, (size_t)n, MSG_DONTWAIT | MSG_NOSIGNAL) != n) t->broken = 1;
+}
+#else
+static void reader_send(em_tls *t)
+{
+    char *p;
+    long n = t->flushing || t->broken ? 0 : BIO_nread0(t->net, &p);
+    ssize_t s = n > 0 ? send(t->fd, p, (size_t)n, MSG_DONTWAIT | MSG_NOSIGNAL) : 0;
+    if (s > 0) BIO_nread(t->net, &p, (int)s);
+}
+#endif
+
+#ifdef OPENSSL_IS_AWSLC
+/* Socket to BIO (AWS-LC counterpart of run()'s BIO_nwrite0 block); not drain() (IN_BYTES). */
 __attribute__((noinline)) static int fill(em_tls *t)
 {
     unsigned char in[IN_BYTES];
@@ -169,12 +174,11 @@ __attribute__((noinline)) static int fill(em_tls *t)
 static int run(em_tls *t, enum op op, void *buf, int len)
 {
     for (;;) {
-        /* A data record must never be left half-written inside OpenSSL: if the reader then has to
-         * send something (KeyUpdate answer), OpenSSL fails it with "bad write retry" or the records
-         * interleave. So SSL_write only starts when the BIO has room for its whole output
-         * (REC_WORST), and never gets WANT_WRITE (counted in em_tls_dbg_partial for t40). */
+        /* A data record must never be left half-written inside OpenSSL: an alert the reader then adds
+         * would fail ("bad write retry") or interleave. So SSL_write only starts when the BIO has
+         * room for its whole output (REC_WORST), and never gets WANT_WRITE (em_tls_dbg_partial, t40). */
         if (op == WRITE && BIO_ctrl_pending(t->net) > OUT_BYTES - REC_WORST) {
-            int r = flush(t, 1);
+            int r = flush(t);
             if (r < 0) return r;
             continue;
         }
@@ -190,16 +194,12 @@ static int run(em_tls *t, enum op op, void *buf, int len)
         int e = (n > 0 || (op == SHUTDOWN && n == 0)) ? SSL_ERROR_NONE : SSL_get_error(t->ssl, n);
         struct saved se;
         if (e == SSL_ERROR_SSL) save_errors(&se);
-        /* flush BEFORE any wait for input: TLS 1.3 can produce records while reading
-         * (KeyUpdate, alerts); forgetting means both sides wait for each other.
-         * DEBT: a READ that flushes here parks in em_send while its connection's input is not
-         * being read. Failure: both ends' readers flush at once (simultaneous KeyUpdate answer or
-         * alert under bulk traffic both ways) with both TCP send buffers full and both writers
-         * parked in em_send too: nobody reads, both connections stall until a deadline. Not yet
-         * triggered by any test (OpenSSL 3.5 sends the KeyUpdate answer from SSL_write).
-         * Remove when the reader's flush no longer blocks reading: hand it to a flusher fiber
-         * (or to the writer) and keep reading meanwhile. */
-        int fr = flush(t, op != READ || e == SSL_ERROR_WANT_WRITE);
+        /* SSL_read emits only alerts (a KeyUpdate answer waits for the next SSL_write); WANT_WRITE
+         * = an alert met a full BIO. Not in TLS 1.3 or AWS-LC (one alert, CTL_ROOM covers it); in
+         * OpenSSL TLS 1.2 ~600 renegotiation ClientHellos (a warning alert each) while we cannot
+         * send fill it. The stream is lost then. */
+        if (op == READ && e == SSL_ERROR_WANT_WRITE) { t->broken = 1; return -EIO; }
+        int fr = op == READ ? (reader_send(t), 0) : flush(t);
         switch (e) {
         case SSL_ERROR_NONE:
             if (fr < 0) return fr;
@@ -210,7 +210,7 @@ static int run(em_tls *t, enum op op, void *buf, int len)
         case SSL_ERROR_ZERO_RETURN:
             if (fr < 0) return fr;
             return op == READ ? 0 : op == WRITE ? -EPIPE : -ECONNRESET;
-        case SSL_ERROR_WANT_WRITE: /* BIO was full; flushed above, retry */
+        case SSL_ERROR_WANT_WRITE: /* not READ (above): BIO was full; flushed above, retry */
             if (op == WRITE) em_tls_dbg_partial++;
             if (fr < 0) return fr;
             continue;
