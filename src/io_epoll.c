@@ -342,7 +342,15 @@ int ep_accept(int lfd)
 {
     ssize_t r;
     EP_IO(r, lfd, EM_WAIT_RD, accept4(lfd, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK));
-    if (r >= 0) ep_fd_new(&em_W, (int)r, EM_FD_STREAM);
+    if (r >= 0) {
+        ep_fd_new(&em_W, (int)r, EM_FD_STREAM);
+        /* The first recv waits for its epoll event instead of trying at once (the registration
+         * reports data already there). Under load the data is there (98% of first recvs in the
+         * churn bench), so trying lets the accept burst's fibers finish in the round that accepted
+         * them while the others take one more: bimodal latency, a worse p99/p50. Waiting makes
+         * every connection pay the same round. rd_idle needs no registered fd: wait_fd registers. */
+        if ((size_t)r < em_W.nfd) em_W.fdt[r].rd_idle = 1;
+    }
     return (int)r;
 }
 
@@ -431,7 +439,7 @@ ssize_t ep_recv(int fd, void *buf, size_t len)
 {
     em_worker *w = &em_W;
     ssize_t r;
-    if ((size_t)fd < w->nfd && w->fdt[fd].rd_idle && w->fdt[fd].registered) {
+    if ((size_t)fd < w->nfd && w->fdt[fd].rd_idle) {
         int e = begin();
         if (!e) e = wait_fd(fd, EM_WAIT_RD);
         if (e) return e;
