@@ -7,6 +7,8 @@
 #      TLS_PREFIX (an OpenSSL prefix with include/ and lib[64]/: em-tls-* servers are built against it
 #      and run with it on LD_LIBRARY_PATH; bench/tls_libs.sh builds such prefixes)
 #      TLS_TICKETS (0|stateless|stateful), NODELAY (0): passed through to the TLS servers
+#      RIVALS: rust (default: the servers above), cpp (em, tokio as the ratio baseline, and the C/C++/Go
+#      servers of plans/bench-cpp.md: bench/cpp/*, bench/go; seastar uses GnuTLS, TLS_PREFIX does not apply to it), all (both). TLS_PREFIX reaches their build.sh too.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
@@ -18,8 +20,27 @@ ONLY=${ONLY:-}
 [[ -z $ONLY || $ONLY == tls ]] || { echo "ONLY=$ONLY: want tls or unset" >&2; exit 2; }
 ARCH=$(uname -m)
 BIN=build/$ARCH/bench
-SERVERS=(em-uring emrs-uring monoio-uring compio-uring glommio-uring tokio-epoll monoio-epoll compio-epoll em-epoll emrs-epoll)
-TLS_SERVERS=(em-tls-uring em-tls-epoll tokio-rustls tokio-rustls-ct monoio-rustls-uring monoio-rustls-epoll compio-rustls-uring compio-rustls-epoll glommio-rustls-uring)
+RIVALS=${RIVALS:-rust}
+RUST_SERVERS=(em-uring emrs-uring monoio-uring compio-uring glommio-uring tokio-epoll monoio-epoll compio-epoll em-epoll emrs-epoll)
+RUST_TLS_SERVERS=(em-tls-uring em-tls-epoll tokio-rustls tokio-rustls-ct monoio-rustls-uring monoio-rustls-epoll compio-rustls-uring compio-rustls-epoll glommio-rustls-uring)
+# The rivals outside Rust: build scripts (build.sh OUTDIR) and server names. The -uring/-epoll suffix is
+# what table.py judges by. A new runtime is its names here plus its directory in NATIVE_BUILDS.
+NATIVE_BUILDS=(bench/cpp/photon bench/cpp/asio bench/cpp/libuv bench/cpp/seastar bench/go)
+NATIVE_SERVERS=(photon-uring asio-uring seastar-uring photon-epoll asio-epoll seastar-epoll libuv-epoll go-epoll)
+NATIVE_TLS_SERVERS=(photon-tls-uring asio-tls-uring seastar-tls-uring photon-tls-epoll asio-tls-epoll seastar-tls-epoll libuv-tls-epoll go-tls-epoll)
+# go-tls-epoll: reference only (AES-128, 1 ticket: plans/bench-cpp.md): printed, never judged, no churntlsres cell
+case $RIVALS in
+    rust) SERVERS=("${RUST_SERVERS[@]}"); TLS_SERVERS=("${RUST_TLS_SERVERS[@]}"); REF_SERVERS=() ;;
+    cpp|all) REF_SERVERS=(go-tls-epoll)
+        if [[ $RIVALS == cpp ]]; then
+            SERVERS=(em-uring em-epoll tokio-epoll "${NATIVE_SERVERS[@]}")
+            TLS_SERVERS=(em-tls-uring em-tls-epoll tokio-rustls tokio-rustls-ct "${NATIVE_TLS_SERVERS[@]}")
+        else
+            SERVERS=("${RUST_SERVERS[@]}" "${NATIVE_SERVERS[@]}")
+            TLS_SERVERS=("${RUST_TLS_SERVERS[@]}" "${NATIVE_TLS_SERVERS[@]}")
+        fi ;;
+    *) echo "RIVALS=$RIVALS: want rust, cpp or all" >&2; exit 2 ;;
+esac
 CONNS=(16 256 1024)
 SIZES=(128 4096)
 SRV_CPUS=0 # one server CPU (a single number: see cpu_ticks), 1 worker; client gets 3 CPUs: plans/bench.md
@@ -70,6 +91,13 @@ build() {
     cp "$tls_echo" "$BIN/em-tls-epoll"
     (
         cd bench/rust
+        if [[ $RIVALS == cpp ]]; then # only the baselines and the client; the other runtimes are not built
+            cargo build --release --locked -p client -p tokio_echo -p tokio_rustls_echo >&2
+            cp target/release/tokio_echo ../../$BIN/tokio-epoll
+            cp target/release/tokio_rustls_echo ../../$BIN/tokio-rustls
+            cp target/release/client ../../$BIN/client
+            return 0
+        fi
         local pkgs=(-p tokio_echo -p monoio_echo -p glommio_echo -p glommio_rustls_echo)
         # glommio's bundled liburing misses struct open_how with some headers (Fedora 44);
         # on others (Ubuntu 24.04) forcing it in is a redefinition. Only add it when needed.
@@ -102,6 +130,10 @@ build() {
             cp target/release/compio_rustls_echo ../../$BIN/compio-rustls-$d
         done
     )
+    local d
+    if [[ $RIVALS != rust ]]; then
+        for d in "${NATIVE_BUILDS[@]}"; do "$d/build.sh" "$ROOT/$BIN" >&2; done
+    fi
 }
 
 start() { # server port: launches pinned in the background, waits until it accepts
@@ -190,6 +222,7 @@ for ((r = 1; r <= ROUNDS; r++)); do
         # after the same other server
         k=$(((r - 1) % ${#srvs[@]})); srvs=("${srvs[@]:k}" "${srvs[@]:0:k}")
         for srv in "${srvs[@]}"; do
+            [[ $mode == churntlsres && " ${REF_SERVERS[*]:-} " == *" $srv "* ]] && continue
             port=$((port + 1))
             start "$srv" "$port"
             run_cell "$srv" "$port" "$mode" "$c" "$s" "${arg[@]}"
@@ -206,6 +239,6 @@ bench/rss_tls.sh | tee "$OUT/rss.md" >&2
 # table.py exits 1 when a check fails (missing rows, mixed negotiation, resumption < 0.95): the summary is
 # still written, then the run fails
 rc=0
-python3 -I bench/table.py "$OUT/results.csv" "${SERVERS[@]}" --tls "${TLS_SERVERS[@]}" | tee "$OUT/table.md" || rc=$?
+python3 -I bench/table.py "$OUT/results.csv" "${SERVERS[@]}" --tls "${TLS_SERVERS[@]}" ${REF_SERVERS[@]:+--ref "${REF_SERVERS[@]}"} | tee "$OUT/table.md" || rc=$?
 [[ -z ${GITHUB_STEP_SUMMARY:-} ]] || { echo "### echo bench ($ARCH, ${DURATION}s x $ROUNDS rounds)"; cat "$OUT/table.md" "$OUT/rss.md"; } >>"$GITHUB_STEP_SUMMARY"
 exit "$rc"

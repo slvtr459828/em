@@ -11,7 +11,7 @@ N=${CONNS_N:-1000}
 REPS=${REPS:-3}
 OUT=${OUT:-bench/out}
 source bench/run.sh
-[[ -x $BIN/em-tls-uring && -x $BIN/glommio-rustls-uring ]] || build
+[[ -x $BIN/em-tls-uring && -x $BIN/${TLS_SERVERS[-1]} ]] || build
 mkdir -p "$OUT"
 
 echo "server,rep,kib_per_conn" >"$OUT/rss.csv"
@@ -46,4 +46,4 @@ PY
         stop
     done
 done
-python3 -I bench/table.py --rss "$OUT/rss.csv"
+python3 -I bench/table.py --rss "$OUT/rss.csv" ${REF_SERVERS[@]:+--ref "${REF_SERVERS[@]}"}

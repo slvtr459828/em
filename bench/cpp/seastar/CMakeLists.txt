@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16)
+project(seastar_bench CXX)
+find_package(Seastar REQUIRED)
+add_executable(seastar_echo echo.cc)
+target_link_libraries(seastar_echo PRIVATE Seastar::seastar)
+add_executable(seastar_tls_echo echo.cc)
+target_compile_definitions(seastar_tls_echo PRIVATE TLS=1)
+target_link_libraries(seastar_tls_echo PRIVATE Seastar::seastar gnutls)

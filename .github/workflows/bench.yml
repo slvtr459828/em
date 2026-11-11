@@ -27,6 +27,11 @@ on:
         description: "bench: only the TLS cells and the TLS memory table (ONLY=tls); use rounds >= 9 for the lost-cells verdicts"
         type: boolean
         default: false
+      rivals:
+        description: "bench only: rust = the Rust runtimes (default); cpp = em + tokio + C/C++/Go servers (plans/bench-cpp.md); all = both"
+        type: choice
+        options: [rust, cpp, all]
+        default: rust
       awslc:
         description: "build em_tls against AWS-LC 5.12.0 (TLS_PREFIX) for the selected script (bench, tlsab, profile)"
         type: boolean
@@ -39,10 +44,16 @@ jobs:
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
-    # (10 servers x 7 cells + 9 TLS servers x 4 cells) x rounds x (duration + ~1 s) = ~97 min at the defaults;
+    # rust: (10 servers x 7 cells + 9 TLS servers x 4 cells) x rounds x (duration + ~1 s) = ~97 min at the defaults;
     # tlsonly: 9 x 4 x 9 rounds x ~11 s = ~59 min + build + bench/rss_tls.sh (~5 min). Raise the timeout if a
     # tlsonly run exceeds 75 min; do not cut the rounds.
-    timeout-minutes: 150
+    # cpp: 11 plain servers x 7 cells + 12 TLS servers x 4 cells - 1 (go-tls-epoll has no churntlsres) = 124 runs per
+    #   round x 5 rounds x 11 s = ~114 min at the defaults; tlsonly 47 x 9 x 11 s = ~78 min + rss_tls (~8 min).
+    # all: 18 x 7 + 17 x 4 - 1 = 193 runs per round x 5 x 11 s = ~177 min; tlsonly 67 x 9 x 11 s = ~111 min + rss_tls (~10 min).
+    # The native servers add a cold build of ~30 min (photon and its pinned liburing/libaio, asio, libuv, go download,
+    # seastar ~3.5 min; a warm cpp-deps cache takes about 5), the Rust build ~10. cpp/all budget 300 min: all at the
+    # defaults ~220 min, all tlsonly 9 rounds ~160 min. all with 9 rounds and the plain cells is ~355 min: use tlsonly there.
+    timeout-minutes: ${{ inputs.rivals == 'rust' && 150 || 300 }}
     steps:
       - uses: actions/checkout@v4
       - name: deps
@@ -51,6 +62,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: bench/rust
+      - name: rivals deps
+        if: inputs.rivals != 'rust'
+        # the union of the build.sh comments (photon, asio, libuv, go, seastar)
+        run: |
+          sudo apt-get install -y --no-install-recommends build-essential cmake ninja-build pkg-config git python3 ragel \
+            curl ca-certificates tar gzip zlib1g-dev libboost-all-dev libc-ares-dev libfmt-dev libgnutls28-dev libhwloc-dev \
+            liblz4-dev libnuma-dev libpciaccess-dev libsctp-dev libyaml-cpp-dev libxml2-dev systemtap-sdt-dev \
+            libprotobuf-dev protobuf-compiler valgrind xfslibs-dev
+      - uses: actions/cache@v4
+        if: inputs.rivals != 'rust'
+        with:
+          # seastar's sources and build tree (GBs, ~3.5 min to rebuild) stay out: its install prefix is enough
+          path: |
+            build/*/cpp-deps
+            !build/*/cpp-deps/seastar-src
+            !build/*/cpp-deps/seastar-build
+            !build/*/cpp-deps/seastar-echo-build
+          key: cpp-deps-${{ runner.arch }}-${{ hashFiles('bench/cpp/*/build.sh', 'bench/go/build.sh') }}
       - name: tlslib deps
         if: inputs.tlslib || inputs.awslc
         run: command -v cmake >/dev/null && command -v go >/dev/null || sudo apt-get install -y --no-install-recommends cmake golang-go
@@ -101,6 +130,7 @@ jobs:
             SOAK=${{ inputs.soak }} bench/soak.sh
           else
             [[ "${{ inputs.tlsonly }}" != true ]] || export ONLY=tls
+            export RIVALS=${{ inputs.rivals }}
             DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/run.sh
           fi
       - uses: actions/upload-artifact@v4
