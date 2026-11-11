@@ -111,4 +111,29 @@ Cách chạy: `RIVALS=cpp bench/run.sh` (hoặc `all`; workflow bench có input 
 `TLS_PREFIX` (nếu đặt) đi theo. Seastar dùng GnuTLS nên `TLS_PREFIX` không áp dụng cho nó. Thêm một runtime = thêm tên vào
 `NATIVE_SERVERS`/`NATIVE_TLS_SERVERS` và thư mục vào `NATIVE_BUILDS` ở đầu `bench/run.sh`. `table.py` in thêm bảng (j2) (em-uring/em-epoll ở các ô plain, cùng luật
 với (j)) và liệt kê `go-tls-epoll` qua `--ref`. Ước lượng thời gian và timeout ở comment trong
-`.github/workflows/bench.yml`. Chưa có số.
+`.github/workflows/bench.yml`.
+
+### CI, 9 vòng, AWS-LC, 1 CPU server (run 42996696810 tlsonly, 42996731217 đủ ô; commit 18eb9b8)
+
+Tỉ lệ là em / đối thủ, CPU server mỗi round-trip (churn: mỗi kết nối), nhỏ hơn 1 là em tốn ít hơn. x86 / arm64.
+
+**Plain (bảng j2): em không thua ô CPU nào.**
+- uring: churn em tốn ít hơn Photon 0.39 / 0.29, Asio 0.84 / 0.65, Seastar 0.90 / 0.53. Echo hoà Photon,
+  thắng hoặc hoà Asio, thắng Seastar 0.47–0.73.
+- epoll: thắng hoặc hoà mọi đối thủ ở mọi ô echo; churn thắng tất cả (Photon 0.38 / 0.36, Go 0.65 / 0.57).
+- Ô THUA duy nhất là đuôi trễ churn trên epoll, p99/p50 1.06–1.15 so với Photon, Asio, libuv, Go (arm).
+  Cùng ô trên uring thì hoà mọi đối thủ.
+
+**TLS (bảng j): em-tls thua tokio-rustls trên epoll là do libssl, không do runtime.**
+- asio-tls-epoll dùng cùng AWS-LC: em tốn ít CPU hơn ở mọi ô, 0.85–0.94 (x86) / 0.65–0.75 (arm).
+  tokio-rustls vẫn hơn em-tls-epoll 1.06–1.15x ở echotls: khớp với số lệnh libssl 4.8k so với rustls
+  2.85k mỗi round-trip (plans/tls-win.md bước 3). Sửa runtime không đóng được khoảng này.
+- uring: thắng hoặc hoà gần hết; thua duy nhất Photon ở echotls 4 KiB trên x86 (1.11, arm 1.03 hoà).
+- Đuôi trễ churntls/churntlsres trên epoll thua Photon, Asio, libuv 1.16–1.32 p99/p50; cùng triệu chứng
+  với plain, nên nguyên nhân nằm ở runtime (nghi phạm: accept trên epoll dồn cục 7–8 kết nối), không ở TLS.
+- Bộ nhớ mỗi kết nối TLS idle: em 29.3 KiB; Photon 33.5, Seastar 29.5–33.4, libuv 47.5, Asio 91, Go 55;
+  tokio-rustls 25.5 (em vẫn thua 1.14x).
+- go-tls-epoll (tham khảo, AES-128): em bắt tay nhanh hơn 1.33x / 1.61x, CPU mỗi kết nối 0.75 / 0.62;
+  echo 128 B hoà; echo 4 KiB Go tốn ít hơn 11–15%, phần lớn do AES-128 ít vòng hơn AES-256.
+
+**Việc tiếp theo được chỉ ra:** đuôi trễ churn trên backend epoll (plain và TLS), đo accept batching.
