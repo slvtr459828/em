@@ -390,3 +390,32 @@ Còn thua, chưa điều tra:
 
 Self-check resume của glommio tụt xuống 0.92–0.94 ở một hai vòng trong ba run liền. Đây là hành vi của
 glommio, không phải của em.
+
+**Bước 3: epoll** (nhánh thử `exp/epoll-tail`; bench 42830683599 mốc, 42830699213 biến thể 1,
+42830713952 biến thể 2; cả ba xanh). Không có thay đổi nào vào main.
+
+Điều tra (đo local x86, chỉ phần p99/p50 lấy từ artifact CI):
+- Echo trên epoll thua tokio khoảng 10% CPU, nhưng không do backend. Mỗi round-trip đúng 1 recv và
+  1 send, giống tokio. Echo không TLS thì em-epoll còn nhanh hơn tokio khoảng 5%. Phần chênh nằm ở
+  libssl của AWS-LC: 4.8k lệnh user mỗi round-trip, so với 2.85k của rustls (mã hoá thì như nhau,
+  2.5k). Trên uring, phần tiết kiệm ở kernel che được khoản này nên em vẫn thắng.
+- Đuôi trễ khi churn trên epoll (p99/p50 khoảng 1.4): em rút cạn hàng chờ accept theo cụm, trung bình
+  7–8 kết nối, có lúc tới 63; trên uring thì mỗi lượt chỉ nhận 1. tokio multi_thread cũng accept theo
+  cụm và cũng có đuôi trễ khoảng 1.36, nên nó không phải mốc "bình thường" cho p99/p50 của churn.
+
+Biến thể đo trên CI. Tỉ lệ là CPU em-tls-epoll chia cho đối thủ cùng run, trung vị 9 vòng; dạng
+`a → b` nghĩa là mốc → biến thể:
+
+| Biến thể | Kết quả x86 | Kết quả arm | Quyết định |
+|---|---|---|---|
+| 1. Bỏ lần SSL_read "thử trước" khi idle | echo 128 vs tokio-ct 1.08 → 1.03; 4096: 1.16 → 1.09 | 1.12 → 1.13; 1.10 → 1.08 | Loại: lợi ích không ổn định giữa hai arch; bản đầu làm hỏng close_notify (`t43`) |
+| 2. `em_yield()` sau mỗi accept trên epoll | p99/p50 churn 1.44 → 1.23; CPU vs tokio-ct 1.03 → 1.06 | 1.38 → 1.26; 1.09 → 1.15 | Loại: tốn thêm ~5% CPU mỗi kết nối, đuôi trễ vẫn chưa về mức uring (~1.05) |
+
+**Trade-off (chốt).** Epoll là backend để em chạy được ở những nơi chặn io_uring (seccomp mặc định
+của Docker/k8s), không phải để thắng bench. Tiêu chí của nó là đúng ngữ nghĩa và không tệ.
+- Giá phải trả: echo TLS trên epoll tốn hơn tokio khoảng 10% CPU (do libssl so với rustls);
+  p99/p50 của churn trên epoll khoảng 1.4, so với khoảng 1.05 trên uring.
+- Xét lại khi có người dùng thật chạy em trên epoll mà gặp giới hạn về đuôi trễ hoặc CPU. Khi đó
+  biến thể 2 là điểm bắt đầu (đã đo, chỉ một dòng).
+
+Nợ: không có nợ.
