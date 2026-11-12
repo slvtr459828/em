@@ -86,7 +86,7 @@ build_tls_prefix() {
 }
 
 build_http() {
-    make bench-em-http HTTP_SSE42=1 >&2
+    make bench-em-http HTTP_SSE42=1 TLS_PREFIX= >&2 # M1 has no TLS: the default dir, whatever TLS_PREFIX the run exports
     local d=build/$ARCH/rel; [[ $ARCH != x86_64 ]] || d=build/$ARCH/rel-sse42 # the Makefile's own dir for HTTP_SSE42=1 (x86_64 only)
     mkdir -p "$BIN"
     cp "$d/em_http" "$BIN/em-http-uring"
