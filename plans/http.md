@@ -171,4 +171,20 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
 
 ## Kết quả
 
-(chưa có)
+### M1 trên CI (run 43186875512, commit 4c42b54, 9 vòng, x86 + arm64, `HTTP_SSE42=1` trên x86)
+
+Server ghim 1 CPU. So em-http (uring và epoll) với nginx, haproxy, h2o (cả ba chạy epoll).
+
+- **CPU mỗi request (us/rt):** không có ô THUA nào trên cả hai kiến trúc.
+  - Keep-alive và 4k: em dùng 0.63–0.95x CPU của đối thủ. NGANG với h2o ở 3 ô: x86 epoll 256 conns, arm epoll 4k/256, x86 uring churn (1.02).
+  - Churn: em-epoll THẮNG mọi đối thủ. Lo ngại từ local (malloc 16 KiB mỗi kết nối) không thành hiện thực trên CI.
+  - Pipeline 16: em 15–22x thông lượng so với nginx/haproxy, 12–15x so với h2o. Nguyên nhân là em gom response vào wbuf và flush một lần trước recv, còn đối thủ ghi từng response. Đây đúng là quyết định kiến trúc, không phải trick riêng của bench.
+- **THUA theo luật, chỉ ở trục p99/p50 và chỉ so với h2o:**
+  - x86, pipeline 16 / 16 conns: uring 1.06, epoll 1.05.
+  - arm, pipeline 16 / 16 conns: uring 1.10, epoll 1.25.
+  - arm, keep-alive 1024 conns, epoll: 1.12.
+  - Ở cả 5 ô này, p99 tuyệt đối của em thấp hơn h2o:
+    - pipeline: 131–274 us so với 1,278–3,047 us;
+    - arm 1024 epoll: 7,766 us so với 10,944 us.
+  - THUA ở đây đến từ độ trải: p50 của em quá nhỏ nên jitter cố định của scheduler làm tỉ số phình lên, không phải em chậm hơn.
+- Bytes mỗi response (`/`): haproxy 78, em 115, nginx/h2o 170. haproxy gửi ít byte nhất mà vẫn thua về CPU.
