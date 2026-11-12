@@ -137,3 +137,37 @@ Tỉ lệ là em / đối thủ, CPU server mỗi round-trip (churn: mỗi kết
   echo 128 B hoà; echo 4 KiB Go tốn ít hơn 11–15%, phần lớn do AES-128 ít vòng hơn AES-256.
 
 **Việc tiếp theo được chỉ ra:** đuôi trễ churn trên backend epoll (plain và TLS), đo accept batching.
+
+### Sửa đuôi trễ churn trên epoll (commit 03d09dd; run 43040445180, so với 42996731217 / 42996696810)
+
+Nguyên nhân: dưới tải, 98% lần recv đầu tiên đã có dữ liệu sẵn. Các fiber trong cụm vừa accept xong ngay
+trong vòng accept, còn kết nối khác chờ thêm một vòng epoll, nên latency có hai đỉnh. Cách sửa: fd vừa
+accept bật `rd_idle`, nên lần recv đầu chờ sự kiện epoll (`EPOLL_CTL_ADD` báo luôn dữ liệu đã có) và mọi
+kết nối trả cùng một vòng. `src/io_epoll.c`, +10/−2.
+
+p99/p50 em-epoll so với đối thủ cùng backend, mốc → sửa, x86 / arm64:
+
+| Ô | Đối thủ | x86 | arm64 |
+|---|---|---|---|
+| churn | Photon | 1.06 THUA → 1.00 NGANG | 1.15 NGANG → 1.05 NGANG |
+| churn | Asio | 1.09 THUA → 1.02 NGANG | 1.13 THUA → 1.06 THUA |
+| churn | libuv | 1.09 THUA → 1.05 NGANG | 1.14 THUA → 1.05 THUA |
+| churn | Go | 1.00 NGANG → 0.96 NGANG | 1.12 THUA → 1.03 NGANG |
+| churntls | Photon / Asio / libuv | 1.21 / 1.31 / 1.23 → 1.05 / 1.12 / 1.09 | 1.22 / 1.32 / 1.27 → 1.07 / 1.15 / 1.14 |
+| churntlsres | Photon / Asio / libuv | 1.16 / 1.26 / 1.21 → 0.98 / 1.05 / 1.01 (NGANG) | 1.23 / 1.28 / 1.26 → 1.05 / 1.09 / 1.10 |
+| churntls / churntlsres | tokio-rustls | 1.03 / 1.01 → 0.88 / 0.83 (THẮNG) | 1.04 / 0.99 → 0.90 / 0.86 |
+
+- CPU không xấu đi: em-epoll churn 27.45 → 26.09 us/kết nối (x86), 14.20 → 13.21 (arm); so với tokio
+  0.84 → 0.82, 0.74 → 0.75. em-tls-epoll churntls so với tokio-rustls 1.04 → 1.00 (x86), 1.00 → 0.98 (arm).
+- Số ô THUA: (j2) 5 → 1 (x86), 4 → 3 (arm); (j) 18 → 15, 14 → 11. Các ô echotls trên epoll không bị
+  thay đổi này chạm tới (kết nối mở một lần).
+- Còn lại: p99/p50 churntls trên epoll 1.05–1.15 so với Photon/Asio/libuv, churn arm 1.05–1.06 so với
+  Asio/libuv. Chưa đo nguyên nhân.
+
+Trade-off: thêm một lần park/wake mỗi kết nối khi dữ liệu đã có sẵn; bớt một lần recv EAGAIN khi server
+rảnh. CPU đo được không tăng. Xét lại nếu một ô churn trên epoll cho thấy CPU mỗi kết nối tăng.
+
+Nợ: không có nợ.
+
+Đã loại (đo local): dời acceptor về cuối vòng; chỉ bỏ điều kiện `registered`; đăng ký fd lúc accept (tệ hơn);
+thêm `em_yield()` (không cải thiện thêm).

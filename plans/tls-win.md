@@ -417,5 +417,8 @@ của Docker/k8s), không phải để thắng bench. Tiêu chí của nó là �
   p99/p50 của churn trên epoll khoảng 1.4, so với khoảng 1.05 trên uring.
 - Xét lại khi có người dùng thật chạy em trên epoll mà gặp giới hạn về đuôi trễ hoặc CPU. Khi đó
   biến thể 2 là điểm bắt đầu (đã đo, chỉ một dòng).
+- Cập nhật (commit 03d09dd, plans/bench-cpp.md): nguyên nhân đuôi trễ churn là recv đầu tiên thử ngay
+  sau accept. Cho recv đầu chờ sự kiện epoll đưa p99/p50 churn về ngang Photon/Asio/libuv trên x86,
+  không tốn thêm CPU. Đó không phải biến thể 2.
 
 Nợ: không có nợ.
