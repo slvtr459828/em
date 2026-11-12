@@ -18,6 +18,9 @@
 # a TLS server without a row in a TLS cell, more than one negotiated (version suite group cert), a
 # resumption ratio < 0.95 in the churn cell with resumption.
 # (j2): the same rule for the plain cells: em-uring / em-epoll against the other plain servers of the same backend.
+# ONLY=http (plans/http.md): the CSV has only http* modes and the servers are em-http-* and nginx-epoll,
+# haproxy-epoll, h2o-epoll. Tables (a)-(c) with ratios vs nginx-epoll and (j3): em-http-uring and em-http-epoll
+# each against EVERY other server (the rivals are epoll-only, so the backend does not pair them), same rule.
 import csv, re, statistics, sys
 from collections import defaultdict
 
@@ -85,12 +88,15 @@ echo = [c for c in cells if c[0] == "echo"]
 churn = [c for c in cells if c[0] == "churn"]
 echotls = [c for c in cells if c[0] == "echotls"]
 churntls = [c for c in cells if c[0] in ("churntls", "churntlsres")]
+httpc = [c for c in cells if c[0].startswith("http")]
+HTTP_LABEL = {"http": "GET / keep-alive", "httppipe": "GET / pipeline 16", "http4k": "GET /4k keep-alive", "httpchurn": "churn GET / (connect + 1 request + RST)"}
+hlab = lambda c: f"{HTTP_LABEL[c[0]]}, {c[1]} conns"
 mode_name = {"churntls": "full handshake, client resumption off", "churntlsres": "resumption on, session store in the client"}
 med = lambda f, cl, srv: statistics.median(col[f][(*cl, srv)].values())
 
 
 def ratio(f, cl, srv, fmt):
-    base = "tokio-rustls" if "tls" in cl[0] else "tokio-epoll"
+    base = "tokio-rustls" if "tls" in cl[0] else "nginx-epoll" if cl[0].startswith("http") else "tokio-epoll"
     m, v, b = med(f, cl, srv), col[f][(*cl, srv)], col[f][(*cl, base)]
     rs = [v[r] / b[r] for r in v if r in b]
     rng = f" [{min(rs):.2f}–{max(rs):.2f}]" if len(rs) > 1 and srv != base else ""
@@ -135,6 +141,17 @@ for c in churn:
         ("p99 us incl. connect (p99/p50) / p999", lambda v: tail(c, v)),
     ])
 
+if httpc:
+    table("(a) HTTP: requests/s (churn: connections/s), higher is better", "cell", [(hlab(c), lambda v, c=c: ratio("rps", c, v, rps)) for c in httpc])
+    table("(b) HTTP: server CPU us per request (churn: per connection), lower is better", "cell", [(hlab(c), lambda v, c=c: ratio("us_per_rt", c, v, us)) for c in httpc])
+    table("(c) HTTP: p99 latency us (p99/p50) / p999, lower is better (pipeline: latency of the batch of 16)", "cell", [(hlab(c), lambda v, c=c: tail(c, v)) for c in httpc])
+    try:  # bytes of the first response (header + body) per server and path, as the client counted them
+        seen = sorted({l.strip() for l in open(sys.argv[1].rsplit("/", 1)[0] + "/http_info.txt") if l.strip()})
+        print("Response bytes (header + body), as the client counted them:\n" + "".join(f"- {l}\n" for l in seen))
+    except FileNotFoundError:
+        pass
+
+
 def cost_row(tl, plain, backend):  # server us of em-tls-X minus em-X, per round (same round: run minutes apart)
     t, p = col["us_per_rt"][(*tl, f"em-tls-{backend}")], col["us_per_rt"][(*plain, f"em-{backend}")]
     d = [t[r] - p[r] for r in t if r in p]
@@ -172,7 +189,7 @@ try:  # what the client saw negotiated: version suite group cert-key, per server
         print("Negotiated (as seen by the client):\n" + "".join(f"- {l}\n" for l in seen))
 except FileNotFoundError:
     pass
-print("Server pinned to 1 CPU, client to 3. (Nx [lo–hi]) = median ratio vs tokio-epoll [min–max of per-round ratios]; uring servers first, then epoll.")
+print(f"Server pinned to 1 CPU, client to 3. (Nx [lo–hi]) = median ratio vs {'nginx-epoll' if httpc else 'tokio-epoll'} [min–max of per-round ratios]; uring servers first, then epoll.")
 print("Two servers differ in a cell only if their [lo–hi] ranges do not overlap; otherwise read it as a tie.")
 name = lambda cl: f"{cl[0]} c={cl[1]} s={cl[2]}"
 srvs_of = lambda c: tls_servers if "tls" in c[0] else servers
@@ -211,7 +228,7 @@ if judged_tls:
             fails.append(f"resumption < 0.95 or missing: {v} churntlsres: {dict(sorted(rs.items()))}")
 
 
-def lost_cells(heading, who, judged, ems, rivals):  # rivals: the servers that ran in these cells
+def lost_cells(heading, who, judged, ems, rivals, opp=opponents, name=name):  # rivals: the servers that ran in these cells
     print(f"\n### {heading}\n")
     nr = len(all_rounds)
     if nr < 9:
@@ -227,7 +244,7 @@ def lost_cells(heading, who, judged, ems, rivals):  # rivals: the servers that r
     fmt = lambda rs: f"{statistics.median(rs):.2f} [{min(rs):.2f}–{max(rs):.2f}]"
     for cl in judged:
         for em in ems:
-            for rv in opponents(em, rivals):
+            for rv in opp(em, rivals):
                 if not (have("us_per_rt", cl, em) and have("us_per_rt", cl, rv)):
                     continue  # reported as missing rows above
                 if max(med("client_cpu", cl, em), med("client_cpu", cl, rv)) >= 0.9:
@@ -247,6 +264,13 @@ if judged_tls:
 # plain cells: em-uring / em-epoll against the plain servers of the same backend (not emrs-*, not tokio-rustls)
 if echo + churn:
     lost_cells("(j2) lost cells, plain: em against same-backend rivals", "em", echo + churn, ("em-uring", "em-epoll"), servers)
+if httpc:
+    http_rivals = lambda em, srvs: [v for v in srvs if not v.startswith("em-http-")]  # every rival, whatever the backend
+    for v in servers:
+        for cl in httpc:
+            if missing := all_rounds - set(have("rps", cl, v)):
+                fails.append(f"missing rows: {v} {name(cl)} rounds {sorted(missing)}")
+    lost_cells("(j3) lost cells, HTTP: em-http against every rival", "em-http", httpc, ("em-http-uring", "em-http-epoll"), servers, http_rivals, hlab)
 if ref_seen := [v for v in tls_servers if v in REF]:
     print("\nReference only, not judged and not checked: " + "; ".join(f"{v} ({REF_NOTE.get(v, 'reference')})" for v in ref_seen))
 if fails:

@@ -9,6 +9,10 @@ TESTS := tests/t1_pingpong tests/t2_churn tests/t3_many tests/t4_guard tests/t5_
   tests/t24_fairness tests/t25_udp_waiters tests/t26_close_wakes tests/t27_backend_env tests/t28_timer_heap tests/t29_fd_reuse tests/t30_outside tests/t31_short_read \
   tests/t32_offload_nostall tests/t33_offload_thread tests/t34_offload_nocancel tests/t35_offload_cap \
   tests/t36_resolve tests/t37_resolve_abandon tests/t38_file_read tests/t39_yield_poll
+# em_http (libem_http.a, tests t50..): no OpenSSL needed in M1.
+HTTP_TESTS := tests/t50_http_keepalive tests/t51_http_pipeline tests/t52_http_reject \
+  tests/t53_http_workers
+TESTS += $(HTTP_TESTS)
 
 # em_tls (libem_tls.a, tests t40..t46) needs OpenSSL. Without it libem and its tests still build;
 # `make test` says the TLS tests were skipped. Simulate that: make PKG_CONFIG=false
@@ -40,19 +44,27 @@ TLS_TESTS := tests/t40_tls_echo tests/t41_tls_duplex tests/t42_tls_verify tests/
 TESTS     += $(TLS_TESTS)
 endif
 
+# picohttpparser picks SSE4.2 at compile time. Default is portable; HTTP_SSE42=1 adds -msse4.2 to
+# http.c and picohttpparser.c on x86_64 (ignored elsewhere) and builds into its own dir.
+HTTP_CF := -Ithird_party/picohttpparser
+ifeq ($(HTTP_SSE42)$(ARCH),1x86_64)
+HTTP_CF  += -msse4.2
+HTTP_TAG := -sse42
+endif
+
 ifeq ($(ARCH),x86_64)
 ASM := src/ctx_x86_64.S
 else
 ASM := src/ctx_aarch64.S
 endif
 
-B_REL  := build/$(ARCH)/rel$(TLS_TAG)
-B_ASAN := build/$(ARCH)/asan$(TLS_TAG)
+B_REL  := build/$(ARCH)/rel$(TLS_TAG)$(HTTP_TAG)
+B_ASAN := build/$(ARCH)/asan$(TLS_TAG)$(HTTP_TAG)
 CF_REL  := -std=gnu11 -O2 -g -D_FORTIFY_SOURCE=3 $(WARN) -Iinclude
 CF_ASAN := -std=gnu11 -O1 -g $(WARN) -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer
 
-.PHONY: all test test-asan test-rust bench-em bench-em-tls clean
-all: $(B_REL)/libem.a $(if $(TLS_TESTS),$(B_REL)/libem_tls.a)
+.PHONY: all test test-asan test-rust bench-em bench-em-tls bench-em-http clean
+all: $(B_REL)/libem.a $(B_REL)/libem_http.a $(if $(TLS_TESTS),$(B_REL)/libem_tls.a)
 
 # $(1)=build dir $(2)=cflags
 define rules
@@ -66,6 +78,16 @@ $(1)/libem.a: $(1)/fiber.o $(1)/scope.o $(1)/io.o $(1)/io_uring.o $(1)/io_epoll.
 	rm -f $$@ && ar rcs $$@ $$^
 $(1)/%: tests/%.c $(1)/libem.a src/internal.h
 	$(CC) $(2) -Isrc $$< $(1)/libem.a -luring -lm -lpthread -o $$@
+$(1)/picohttpparser.o: third_party/picohttpparser/picohttpparser.c third_party/picohttpparser/picohttpparser.h
+	@mkdir -p $(1)
+	$(CC) $(2) $(HTTP_CF) -c $$< -o $$@
+$(1)/http.o: src/http.c include/em_http.h include/em.h third_party/picohttpparser/picohttpparser.h
+	@mkdir -p $(1)
+	$(CC) $(2) $(HTTP_CF) -c $$< -o $$@
+$(1)/libem_http.a: $(1)/http.o $(1)/picohttpparser.o
+	rm -f $$@ && ar rcs $$@ $$^
+$(addprefix $(1)/,$(notdir $(HTTP_TESTS))): $(1)/%: tests/%.c tests/http_util.h include/em_http.h $(1)/libem_http.a $(1)/libem.a
+	$(CC) $(2) $$< $(1)/libem_http.a $(1)/libem.a -luring -lm -lpthread -o $$@
 ifdef TLS_TESTS
 $(1)/tls.o: src/tls.c src/internal.h include/em_tls.h include/em.h
 	@mkdir -p $(1)
@@ -107,6 +129,10 @@ test-rust:
 bench-em: $(B_REL)/em_echo
 $(B_REL)/em_echo: bench/em_echo.c $(B_REL)/libem.a
 	$(CC) $(CF_REL) $< $(B_REL)/libem.a -luring -lm -lpthread -o $@
+
+bench-em-http: $(B_REL)/em_http
+$(B_REL)/em_http: bench/em_http.c $(B_REL)/libem_http.a $(B_REL)/libem.a
+	$(CC) $(CF_REL) $< $(B_REL)/libem_http.a $(B_REL)/libem.a -luring -lm -lpthread -o $@
 
 ifdef TLS_TESTS
 bench-em-tls: $(B_REL)/em_tls_echo

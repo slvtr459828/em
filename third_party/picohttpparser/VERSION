@@ -1,0 +1,6 @@
+picohttpparser, vendored unmodified (picohttpparser.c, picohttpparser.h).
+upstream: https://github.com/h2o/picohttpparser
+commit:   dd573d8fa9264c646a400e96ce9f07dea6f156e4 (2026-10-27)
+license:  MIT or Perl (dual). Upstream ships no LICENSE file; LICENSE here is the MIT text taken
+          verbatim from the header comment of picohttpparser.c.
+SSE4.2 is picked at compile time (-msse4.2); em builds it only with HTTP_SSE42=1.

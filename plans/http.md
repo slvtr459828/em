@@ -140,6 +140,25 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
 3. TLS (`em_tls`), các ô TLS, rồi lần lượt thêm các đối thủ còn lại.
 4. README, `include/em_http.h` có tài liệu đầy đủ, ví dụ.
 
+## Quyết định lúc khởi động (2026-11-12)
+
+- **Dừng sau bước 1 (M1).** Làm xong GET + keep-alive, bench so với nginx, h2o và haproxy, rồi xem
+  số trước khi làm bước 2–4. Nếu đường nóng đứng sai chỗ thì sửa kiến trúc trước khi thêm body/TLS.
+- **Đối thủ.**
+  - Thêm **haproxy** (`http-request return status 200 ... string "Hello, World!"`, `nbthread 1`).
+  - **Kestrel hoãn** sang sau đợt 1 (phải cài .NET SDK trên CI bench; Go + hyper + h2o đã đại diện
+    đủ các mô hình).
+  - **Photon HTTP và Boost.Beast là tuỳ chọn:** chỉ làm nếu dựng rẻ từ bench/cpp, và không chặn
+    việc xong đợt 1.
+- **Phán định.** Luật THUA (trung vị > 1.05 và mọi vòng > 1) áp cho **mọi** đối thủ HTTP, kể cả
+  nginx và haproxy. Không còn đối thủ nào chỉ được in để tham khảo.
+- **SIMD.** picohttpparser chọn SSE4.2 lúc compile, không có dispatch lúc chạy.
+  - Makefile mặc định portable (không `-msse4.2`); `HTTP_SSE42=1` bật nó.
+  - Bench luôn bật `HTTP_SSE42=1`. README nói rõ người dùng phải tự bật.
+  - Trade-off: bản build mặc định chậm hơn ở parse. Xét lại khi baseline của các distro là
+    x86-64-v2.
+- `max_requests_per_conn` giữ nguyên như plan.
+
 ## KHÔNG làm (đợt 1)
 
 - HTTP client. Sẽ làm khi có nhu cầu proxy hoặc gọi API.

@@ -27,6 +27,10 @@ on:
         description: "bench: only the TLS cells and the TLS memory table (ONLY=tls); use rounds >= 9 for the lost-cells verdicts"
         type: boolean
         default: false
+      httponly:
+        description: "bench: only the HTTP cells (ONLY=http, plans/http.md): em-http-* vs nginx, haproxy, h2o; not with tlsonly; rivals does not apply; use rounds >= 9 for the verdicts"
+        type: boolean
+        default: false
       rivals:
         description: "bench only: rust = the Rust runtimes (default); cpp = em + tokio + C/C++/Go servers (plans/bench-cpp.md); all = both"
         type: choice
@@ -50,6 +54,8 @@ jobs:
     # cpp: 11 plain servers x 7 cells + 12 TLS servers x 4 cells - 1 (go-tls-epoll has no churntlsres) = 124 runs per
     #   round x 5 rounds x 11 s = ~114 min at the defaults; tlsonly 47 x 9 x 11 s = ~78 min + rss_tls (~8 min).
     # all: 18 x 7 + 17 x 4 - 1 = 193 runs per round x 5 x 11 s = ~177 min; tlsonly 67 x 9 x 11 s = ~111 min + rss_tls (~10 min).
+    # httponly: 5 servers x 8 cells x 9 rounds x ~11 s = ~66 min + build (Rust client ~10 min, em_http, h2o from source
+    # ~5 min cold; its build is cached) = well inside the 150 min of the default rivals. Keep rivals=rust with it.
     # The native servers add a cold build of ~30 min (photon and its pinned liburing/libaio, asio, libuv, go download,
     # seastar ~3.5 min; a warm cpp-deps cache takes about 5), the Rust build ~10. cpp/all budget 300 min: all at the
     # defaults ~220 min, all tlsonly 9 rounds ~160 min. all with 9 rounds and the plain cells is ~355 min: use tlsonly there.
@@ -80,6 +86,17 @@ jobs:
             !build/*/cpp-deps/seastar-build
             !build/*/cpp-deps/seastar-echo-build
           key: cpp-deps-${{ runner.arch }}-${{ hashFiles('bench/cpp/*/build.sh', 'bench/go/build.sh') }}
+      - name: http deps
+        if: inputs.httponly
+        # nginx and haproxy are launched by bench/http/*.sh, so the packaged services stay off; the rest builds h2o
+        run: |
+          sudo apt-get install -y --no-install-recommends nginx haproxy build-essential cmake git pkg-config zlib1g-dev
+          sudo systemctl disable --now nginx haproxy || true
+      - uses: actions/cache@v4
+        if: inputs.httponly
+        with:
+          path: build/*/http-deps
+          key: http-deps-${{ runner.arch }}-${{ hashFiles('bench/http/h2o/build.sh') }}
       - name: tlslib deps
         if: inputs.tlslib || inputs.awslc
         run: command -v cmake >/dev/null && command -v go >/dev/null || sudo apt-get install -y --no-install-recommends cmake golang-go
@@ -129,7 +146,9 @@ jobs:
           elif [[ "${{ inputs.soak }}" != 0 ]]; then
             SOAK=${{ inputs.soak }} bench/soak.sh
           else
+            [[ "${{ inputs.tlsonly }}" != true || "${{ inputs.httponly }}" != true ]] || { echo "tlsonly and httponly are exclusive" >&2; exit 2; }
             [[ "${{ inputs.tlsonly }}" != true ]] || export ONLY=tls
+            [[ "${{ inputs.httponly }}" != true ]] || export ONLY=http
             export RIVALS=${{ inputs.rivals }}
             DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/run.sh
           fi

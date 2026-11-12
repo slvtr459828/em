@@ -1,5 +1,5 @@
 // Closed-loop ping-pong load generator, same for every server.
-// usage: client addr conns size seconds threads [churn] [tls|tlsres]
+// usage: client addr conns size seconds threads [churn] [tls|tlsres] [http [path=/|/4k] [pipe=N]]
 // Each connection sends `size` bytes, reads exactly `size` back, compares, repeats.
 // churn: each of `conns` loops instead does connect, one round-trip, close with RST
 // (zero linger: no TIME_WAIT, so ephemeral ports do not run out); counts connections.
@@ -8,6 +8,11 @@
 // churn then counts handshake + round-trip. tlsres: same, but the client keeps a session store and
 // resumes when it can. With either, a second output line says what was negotiated and how many
 // handshakes were full / resumed ("tls <version> <suite> <kx group> <cert key> full=N resumed=M").
+// http (plans/http.md; plain only): `size` is the expected response body length. Each connection sends
+// `pipe` (default 1) "GET <path> HTTP/1.1" requests in one write, reads that many responses (httparse),
+// requires status 200 and Content-Length == size, and counts `pipe` round-trips per batch (the batch's
+// latency is recorded for each). churn: connect, one request, RST. A second output line says how big the
+// first response was: "http response_bytes=N" (header + body).
 // Prints "total_round_trips round_trips_per_sec p50_us p99_us p999_us"; exits 1 if any echo is
 // short or differs. Latency of every round-trip goes into a per-thread log-linear histogram
 // (128 sub-buckets per power of two, < 1% error; fixed array, nothing allocated while measuring).
@@ -44,6 +49,7 @@ impl ServerCertVerifier for AcceptAny {
 
 static FULL: AtomicU64 = AtomicU64::new(0);
 static RESUMED: AtomicU64 = AtomicU64::new(0);
+static RESP_BYTES: AtomicU64 = AtomicU64::new(0);
 static NEGOTIATED: OnceLock<String> = OnceLock::new();
 
 fn tls_connector(resume: bool) -> TlsConnector {
@@ -130,6 +136,79 @@ fn lower(i: usize) -> u64 {
     ((i % SUB + SUB) as u64) << (i / SUB + 6 - 7)
 }
 
+#[derive(Clone)]
+struct Http {
+    req: Vec<u8>, // `pipe` requests back to back
+    pipe: usize,
+    body: usize,
+}
+
+fn bad(m: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string())
+}
+
+// One batch: write all requests, read until `pipe` complete responses arrived and checked.
+async fn http_batch(s: &mut TcpStream, h: &Http, buf: &mut [u8]) -> std::io::Result<()> {
+    s.write_all(&h.req).await?;
+    let (mut len, mut got) = (0, 0);
+    while got < h.pipe {
+        let n = s.read(&mut buf[len..]).await?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        len += n;
+        let mut off = 0;
+        while got < h.pipe {
+            let mut hdrs = [httparse::EMPTY_HEADER; 32];
+            let mut r = httparse::Response::new(&mut hdrs);
+            let hl = match r.parse(&buf[off..len]).map_err(|_| bad("http: bad response"))? {
+                httparse::Status::Complete(hl) => hl,
+                httparse::Status::Partial => break,
+            };
+            if r.code != Some(200) {
+                return Err(bad("http: status is not 200"));
+            }
+            let cl = r.headers.iter().find(|x| x.name.eq_ignore_ascii_case("content-length"));
+            let cl = cl.and_then(|x| std::str::from_utf8(x.value).ok()?.trim().parse::<usize>().ok());
+            if cl != Some(h.body) {
+                return Err(bad("http: missing or wrong Content-Length"));
+            }
+            if len - off < hl + h.body {
+                break;
+            }
+            RESP_BYTES.store((hl + h.body) as u64, Relaxed);
+            off += hl + h.body;
+            got += 1;
+        }
+        buf.copy_within(off..len, 0);
+        len -= off;
+    }
+    if len != 0 {
+        return Err(bad("http: bytes after the last response"));
+    }
+    Ok(())
+}
+
+async fn http_conn(addr: String, h: Http, deadline: Instant, churn: bool) -> std::io::Result<u64> {
+    let mut s = Conn::open(&addr, None, churn).await?;
+    let mut buf = vec![0u8; h.pipe * (h.body + 1024)];
+    let mut n = 0u64;
+    let mut t = Instant::now();
+    while t < deadline {
+        if churn && n > 0 {
+            drop(s);
+            s = Conn::open(&addr, None, true).await?;
+        }
+        let Conn::Plain(tcp) = &mut s else { unreachable!() };
+        http_batch(tcp, &h, &mut buf).await?;
+        let t2 = Instant::now();
+        HIST.with(|x| x.borrow_mut()[bucket((t2 - t).as_nanos() as u64)] += h.pipe as u64);
+        t = t2;
+        n += h.pipe as u64;
+    }
+    Ok(n)
+}
+
 thread_local!(static HIST: RefCell<Vec<u64>> = RefCell::new(vec![0; NB]));
 
 async fn conn(addr: String, size: usize, deadline: Instant, churn: bool, tls: Option<TlsConnector>) -> std::io::Result<u64> {
@@ -158,8 +237,14 @@ async fn conn(addr: String, size: usize, deadline: Instant, churn: bool, tls: Op
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let flags = &a[a.len().min(6)..];
-    if a.len() < 6 || flags.iter().any(|f| f != "churn" && f != "tls" && f != "tlsres") {
-        eprintln!("usage: client addr conns size seconds threads [churn] [tls|tlsres]");
+    let http = flags.iter().any(|f| f == "http");
+    let opt = |k: &str| flags.iter().find_map(|f| f.strip_prefix(k));
+    let pipe: usize = opt("pipe=").map_or(1, |v| v.parse().unwrap_or(0));
+    let path = opt("path=").unwrap_or("/");
+    let known = |f: &String| matches!(f.as_str(), "churn" | "tls" | "tlsres" | "http") || f.starts_with("path=") || f.starts_with("pipe=");
+    let tls_flag = flags.iter().any(|f| f == "tls" || f == "tlsres");
+    if a.len() < 6 || !flags.iter().all(known) || pipe == 0 || (!http && (opt("path=").is_some() || opt("pipe=").is_some())) || (http && tls_flag) {
+        eprintln!("usage: client addr conns size seconds threads [churn] [tls|tlsres] [http [path=/|/4k] [pipe=N]]");
         std::process::exit(2);
     }
     let resume = flags.iter().any(|f| f == "tlsres");
@@ -169,17 +254,24 @@ fn main() {
     let secs: f64 = a[4].parse().unwrap();
     let threads: usize = a[5].parse().unwrap();
     let churn = flags.iter().any(|f| f == "churn");
+    let h = http.then(|| Http { req: format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").repeat(if churn { 1 } else { pipe }).into(), pipe: if churn { 1 } else { pipe }, body: size });
     let start = Instant::now();
     let deadline = start + Duration::from_secs_f64(secs);
     let hs: Vec<_> = (0..threads)
         .map(|t| {
             let addr = a[1].clone();
+            let h = h.clone();
             let conn_tls = tls.then(|| tls_connector(resume));
             let mine = conns / threads + (t < conns % threads) as usize;
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
                 rt.block_on(async {
-                    let js: Vec<_> = (0..mine).map(|_| tokio::spawn(conn(addr.clone(), size, deadline, churn, conn_tls.clone()))).collect();
+                    let js: Vec<_> = (0..mine).map(|_| {
+                        match &h {
+                            Some(h) => tokio::spawn(http_conn(addr.clone(), h.clone(), deadline, churn)),
+                            None => tokio::spawn(conn(addr.clone(), size, deadline, churn, conn_tls.clone())),
+                        }
+                    }).collect();
                     let mut total = 0;
                     for j in js {
                         total += j.await.unwrap()?;
@@ -215,6 +307,9 @@ fn main() {
         i.map_or(0.0, |i| lower(i) as f64 / 1e3)
     };
     println!("{total} {rps:.0} {:.1} {:.1} {:.1}", q(0.5), q(0.99), q(0.999));
+    if http {
+        println!("http response_bytes={}", RESP_BYTES.load(Relaxed));
+    }
     if let Some(n) = NEGOTIATED.get() {
         println!("tls {n} full={} resumed={}", FULL.load(Relaxed), RESUMED.load(Relaxed));
     }

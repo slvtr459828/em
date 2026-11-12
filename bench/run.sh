@@ -4,6 +4,7 @@
 # on rustls/aws-lc-rs, then the memory per idle TLS connection (bench/rss_tls.sh).
 # env: DURATION (s per run, 10), ROUNDS (5), OUT (output dir, bench/out)
 #      ONLY=tls: run only the TLS cells (the verdict table needs ROUNDS >= 9)
+#      ONLY=http: only the HTTP cells (plans/http.md): em-http-* vs nginx, haproxy, h2o (bench/http/); RIVALS does not apply
 #      TLS_PREFIX (an OpenSSL prefix with include/ and lib[64]/: em-tls-* servers are built against it
 #      and run with it on LD_LIBRARY_PATH; bench/tls_libs.sh builds such prefixes)
 #      TLS_TICKETS (0|stateless|stateful), NODELAY (0): passed through to the TLS servers
@@ -17,7 +18,7 @@ DURATION=${DURATION:-10}
 ROUNDS=${ROUNDS:-5}
 OUT=${OUT:-bench/out}
 ONLY=${ONLY:-}
-[[ -z $ONLY || $ONLY == tls ]] || { echo "ONLY=$ONLY: want tls or unset" >&2; exit 2; }
+[[ -z $ONLY || $ONLY == tls || $ONLY == http ]] || { echo "ONLY=$ONLY: want tls, http or unset" >&2; exit 2; }
 ARCH=$(uname -m)
 BIN=build/$ARCH/bench
 RIVALS=${RIVALS:-rust}
@@ -41,6 +42,10 @@ case $RIVALS in
         fi ;;
     *) echo "RIVALS=$RIVALS: want rust, cpp or all" >&2; exit 2 ;;
 esac
+# ONLY=http: em_http (-uring/-epoll: the same binary, backend forced) against the servers that bench/http/ launches
+# or builds (nginx, haproxy: apt; h2o: bench/http/h2o/build.sh). Every rival is epoll and is judged against both em-http-*.
+HTTP_SERVERS=(em-http-uring em-http-epoll nginx-epoll haproxy-epoll h2o-epoll)
+[[ $ONLY != http ]] || SERVERS=("${HTTP_SERVERS[@]}")
 CONNS=(16 256 1024)
 SIZES=(128 4096)
 SRV_CPUS=0 # one server CPU (a single number: see cpu_ticks), 1 worker; client gets 3 CPUs: plans/bench.md
@@ -80,7 +85,19 @@ build_tls_prefix() {
         { echo "TLS_PREFIX=$TLS_PREFIX: em_tls does not build against it (OpenSSL 3.x or AWS-LC)" >&2; return 1; }
 }
 
+build_http() {
+    make bench-em-http HTTP_SSE42=1 >&2
+    local d=build/$ARCH/rel; [[ $ARCH != x86_64 ]] || d=build/$ARCH/rel-sse42 # the Makefile's own dir for HTTP_SSE42=1 (x86_64 only)
+    mkdir -p "$BIN"
+    cp "$d/em_http" "$BIN/em-http-uring"
+    cp "$d/em_http" "$BIN/em-http-epoll"
+    (cd bench/rust && cargo build --release --locked -p client >&2 && cp target/release/client ../../$BIN/client)
+    bench/http/h2o/build.sh "$ROOT/$BIN" >&2
+    command -v nginx >/dev/null && command -v haproxy >/dev/null || { echo "ONLY=http needs nginx and haproxy (apt install nginx haproxy)" >&2; return 1; }
+}
+
 build() {
+    [[ $ONLY != http ]] || { build_http; return; }
     make bench-em bench-em-tls TLS_PREFIX= >&2 # the default build: TLS_PREFIX is built separately below
     mkdir -p "$BIN"
     cp "build/$ARCH/rel/em_echo" "$BIN/em-uring"
@@ -146,6 +163,10 @@ start() { # server port: launches pinned in the background, waits until it accep
     case $1 in monoio-uring|monoio-epoll) cmd=("$BIN/monoio" "$2" "${1#monoio-}" "$WORKERS") ;;
                monoio-rustls-uring|monoio-rustls-epoll) cmd=("$BIN/monoio-rustls" "$2" "${1#monoio-rustls-}" "$WORKERS") ;;
                tokio-rustls-ct) cmd=(env TOKIO_RT=current_thread "$BIN/tokio-rustls" "$2" "$WORKERS") ;; esac
+    case $1 in em-http-uring|em-http-epoll) cmd=(env "EM_BACKEND=${1#em-http-}" "${cmd[@]}") ;;
+               nginx-epoll) cmd=(bench/http/nginx.sh "$2" "$WORKERS") ;; # the launchers exec the server: $pid is the server
+               haproxy-epoll) cmd=(bench/http/haproxy.sh "$2" "$WORKERS") ;;
+               h2o-epoll) cmd=("$BIN/h2o-epoll" "$2" "$WORKERS") ;; esac
     taskset -c $SRV_CPUS "${cmd[@]}" >/dev/null &
     pid=$!
     for _ in {1..100}; do
@@ -191,6 +212,10 @@ run_cell() {
         echo "$srv $mode: $tls" >>"$OUT/tls_info.txt"
         res=$(sed 's/.*full=\([0-9]*\) resumed=\([0-9]*\)/\1 \2/' <<<"$tls" | awk '{ printf "%.3f", $2 / ($1 + $2) }')
     fi
+    # HTTP cells: the client's second line is "http response_bytes=N" (header + body of the first response)
+    if tls=$(sed -n 's/^http response_bytes=//p' "$OUT/rps.tmp") && [[ -n $tls ]]; then
+        echo "$srv $mode: $tls B" >>"$OUT/http_info.txt"
+    fi
     CELL_ROW="$rps,$cols,$p50,$p99,$p999,$res"
 }
 
@@ -201,7 +226,13 @@ build
 mkdir -p "$OUT"
 # echo cells, then one churn cell (connect, one 128 B round-trip, RST; 64 concurrent: plans/m5.md)
 CELLS=()
-if [[ $ONLY != tls ]]; then
+if [[ $ONLY == http ]]; then
+    # size = the expected body length. http: GET / keep-alive; httppipe: 16 requests per write; http4k: GET /4k;
+    # httpchurn: connect + one GET / + RST, 64 concurrent like churn. Each round-trip is one request.
+    for c in "${CONNS[@]}"; do CELLS+=("http $c 13"); done
+    for c in 16 256; do CELLS+=("httppipe $c 13" "http4k $c 4096"); done
+    CELLS+=("httpchurn 64 13")
+elif [[ $ONLY != tls ]]; then
     for c in "${CONNS[@]}"; do for s in "${SIZES[@]}"; do CELLS+=("echo $c $s"); done; done
     CELLS+=("churn 64 128")
 fi
@@ -209,14 +240,16 @@ fi
 # of TLS (table.py). The mode names echotls/churntls keep them apart from the plain cells.
 # churntls: client resumption off (every connection a full handshake); churntlsres: client keeps a
 # session store and resumes (resumed = fraction of resumed handshakes, must be ~1 for both servers).
-CELLS+=("echotls 256 128" "echotls 256 4096" "churntls 64 128" "churntlsres 64 128")
+[[ $ONLY == http ]] || CELLS+=("echotls 256 128" "echotls 256 4096" "churntls 64 128" "churntlsres 64 128")
 echo "round,mode,server,conns,size,rps,client_cpu,server_cpu,us_per_rt,p50_us,p99_us,p999_us,resumed" >"$OUT/results.csv"
 : >"$OUT/tls_info.txt" # what each TLS server negotiated, as the client saw it
+: >"$OUT/http_info.txt"
 port=20000
 for ((r = 1; r <= ROUNDS; r++)); do
     for cell in "${CELLS[@]}"; do
         read -r mode c s <<<"$cell"
-        case $mode in echo) arg=() ;; churn) arg=(churn) ;; echotls) arg=(tls) ;; churntls) arg=(churn tls) ;; churntlsres) arg=(churn tlsres) ;; esac
+        case $mode in echo) arg=() ;; churn) arg=(churn) ;; echotls) arg=(tls) ;; churntls) arg=(churn tls) ;; churntlsres) arg=(churn tlsres) ;;
+                  http) arg=(http) ;; httppipe) arg=(http pipe=16) ;; http4k) arg=(http path=/4k) ;; httpchurn) arg=(churn http) ;; esac
         srvs=("${SERVERS[@]}"); [[ $mode == *tls* ]] && srvs=("${TLS_SERVERS[@]}")
         # the order rotates with the round (round r starts at server r), so no server always runs right
         # after the same other server
@@ -234,11 +267,15 @@ done
 rm -f "$OUT/rps.tmp"
 
 # memory per idle TLS connection (own table), after the cells so a failure here keeps the cell results
-bench/rss_tls.sh | tee "$OUT/rss.md" >&2
+if [[ $ONLY == http ]]; then : >"$OUT/rss.md"; else bench/rss_tls.sh | tee "$OUT/rss.md" >&2; fi
 
 # table.py exits 1 when a check fails (missing rows, mixed negotiation, resumption < 0.95): the summary is
 # still written, then the run fails
 rc=0
-python3 -I bench/table.py "$OUT/results.csv" "${SERVERS[@]}" --tls "${TLS_SERVERS[@]}" ${REF_SERVERS[@]:+--ref "${REF_SERVERS[@]}"} | tee "$OUT/table.md" || rc=$?
-[[ -z ${GITHUB_STEP_SUMMARY:-} ]] || { echo "### echo bench ($ARCH, ${DURATION}s x $ROUNDS rounds)"; cat "$OUT/table.md" "$OUT/rss.md"; } >>"$GITHUB_STEP_SUMMARY"
+if [[ $ONLY == http ]]; then
+    python3 -I bench/table.py "$OUT/results.csv" "${SERVERS[@]}" | tee "$OUT/table.md" || rc=$?
+else
+    python3 -I bench/table.py "$OUT/results.csv" "${SERVERS[@]}" --tls "${TLS_SERVERS[@]}" ${REF_SERVERS[@]:+--ref "${REF_SERVERS[@]}"} | tee "$OUT/table.md" || rc=$?
+fi
+[[ -z ${GITHUB_STEP_SUMMARY:-} ]] || { echo "### $([[ $ONLY == http ]] && echo http || echo echo) bench ($ARCH, ${DURATION}s x $ROUNDS rounds)"; cat "$OUT/table.md" "$OUT/rss.md"; } >>"$GITHUB_STEP_SUMMARY"
 exit "$rc"
