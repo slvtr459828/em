@@ -1,0 +1,95 @@
+/* libFuzzer harness for em_http_serve (make fuzz-http). Each input is the raw byte stream of a
+ * client on a socketpair: write it, shutdown(SHUT_WR), discard the output until EOF. The handler
+ * picks one of several ways to use the API from the request itself (second path byte), so the
+ * body reader, respond, HEAD and the error paths are all reached. Timeouts are off: the only
+ * clock is the peer closing. One em_run per input. */
+#include <errno.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include "../../include/em.h"
+#include "../../include/em_http.h"
+
+#define MAX_IN 4096
+
+static const uint8_t *in_data;
+static size_t in_len;
+static volatile unsigned touched; /* keeps the loops over the request alive */
+
+static int handler(em_http_conn *c, const em_http_req *r, void *arg)
+{
+    (void)arg;
+    static const em_http_header h[2] = { { "Content-Type", 12, "text/plain", 10 },
+                                         { "X-Fuzz", 6, "1", 1 } };
+    unsigned sum = (unsigned)r->minor_version + (unsigned)r->content_length; /* touch the request */
+    for (size_t i = 0; i < r->method_len; i++) sum += (unsigned char)r->method[i];
+    for (size_t i = 0; i < r->path_len; i++) sum += (unsigned char)r->path[i];
+    for (size_t i = 0; i < r->nheaders; i++) { /* a folded line has an empty name (NULL) */
+        const em_http_header *h_ = &r->headers[i];
+        if (h_->name_len) sum += (unsigned char)h_->name[h_->name_len - 1];
+        if (h_->value_len) sum += (unsigned char)h_->value[h_->value_len - 1];
+    }
+
+    touched = sum;
+    unsigned char sel = r->path_len > 1 ? (unsigned char)r->path[1] : 0;
+    char buf[300];
+    size_t total = 0;
+    int mode = sel % 7;
+    if (mode == 1 || mode == 2 || mode == 5) {
+        /* chunk size: 4096 for 1, 1..16 varying for 2, one read for 5 */
+        for (size_t n = 0;; n++) {
+            size_t want = mode == 1 ? sizeof buf : (mode == 2 ? 1 + (n * 7 + sel) % 16 : sizeof buf);
+            ssize_t k = em_http_read_body(c, buf, want);
+            if (k < 0) return (int)k; /* serve answers 413/400/408 itself when we have not responded */
+            if (k == 0 || mode == 5) { total += (size_t)(k > 0 ? k : 0); break; }
+            total += (size_t)k;
+        }
+    }
+    if (mode == 3) return -EIO;
+    if (mode == 6) return 0; /* no response: serve answers 500 */
+    int rc = em_http_respond(c, 200, h, 2, buf, total % sizeof buf);
+    if (mode == 4) { /* second respond and a read after respond: both -EALREADY */
+        if (em_http_respond(c, 200, h, 1, "x", 1) != -EALREADY && rc == 0) __builtin_trap();
+        if (em_http_read_body(c, buf, sizeof buf) != -EALREADY && rc == 0) __builtin_trap();
+    }
+    return rc;
+}
+
+static int conn(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    static const em_http_cfg cfg = { .max_header_bytes = 256, .max_headers = 8,
+                                     .max_body_bytes = 1024, .header_timeout_ns = -1,
+                                     .idle_timeout_ns = -1 };
+    em_http_serve(fd, NULL, &cfg, handler, NULL);
+    em_close(fd);
+    return 0;
+}
+
+static int run(void *arg)
+{
+    (void)arg;
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) __builtin_trap();
+    em_scope sc;
+    em_scope_open(&sc, 0);
+    if (em_spawn(&sc, conn, (void *)(intptr_t)sv[1]) != 0) __builtin_trap();
+    /* the whole input fits the socket buffer, so this cannot block on the server */
+    if (in_len && em_send_all(sv[0], in_data, in_len) != 0) __builtin_trap();
+    em_shutdown(sv[0], SHUT_WR);
+    char sink[4096];
+    while (em_recv(sv[0], sink, sizeof sink) > 0) {}
+    em_close(sv[0]);
+    return em_scope_close(&sc);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+{
+    if (size > MAX_IN) return 0;
+    in_data = data;
+    in_len = size;
+    if (em_run(1, run, NULL) != 0) __builtin_trap();
+    return 0;
+}

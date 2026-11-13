@@ -11,7 +11,7 @@ TESTS := tests/t1_pingpong tests/t2_churn tests/t3_many tests/t4_guard tests/t5_
   tests/t36_resolve tests/t37_resolve_abandon tests/t38_file_read tests/t39_yield_poll
 # em_http (libem_http.a, tests t50..): no OpenSSL needed in M1.
 HTTP_TESTS := tests/t50_http_keepalive tests/t51_http_pipeline tests/t52_http_reject \
-  tests/t53_http_workers
+  tests/t53_http_workers tests/t54_http_body tests/t55_http_expect tests/t56_http_timeout
 TESTS += $(HTTP_TESTS)
 
 # em_tls (libem_tls.a, tests t40..t46) needs OpenSSL. Without it libem and its tests still build;
@@ -139,6 +139,25 @@ bench-em-tls: $(B_REL)/em_tls_echo
 $(B_REL)/em_tls_echo: bench/em_tls_echo.c tests/tls_util.h $(B_REL)/libem_tls.a $(B_REL)/libem.a
 	$(CC) $(CF_REL) $(TLS_CF) -Isrc $< $(B_REL)/libem_tls.a $(B_REL)/libem.a $(TLS_LIBS) -luring -lm -lpthread -o $@
 endif
+
+# libFuzzer + ASan + UBSan on em_http_serve (tests/fuzz/http_fuzz.c), needs clang. Everything is
+# compiled in one go into build/$(ARCH)/fuzz/ (own dir: sanitizer objects never mix with the
+# others). Runs FUZZ_SECONDS on the seed corpus; new inputs go to a work dir, not into the repo.
+# A crash or sanitizer report makes libFuzzer exit nonzero, so the target fails.
+FUZZ_SECONDS ?= 60
+B_FUZZ := build/$(ARCH)/fuzz
+FUZZ_SRC := src/fiber.c src/scope.c src/io.c src/io_uring.c src/io_epoll.c src/pool.c $(ASM) \
+  src/http.c third_party/picohttpparser/picohttpparser.c
+.PHONY: fuzz-http
+$(B_FUZZ)/http_fuzz: tests/fuzz/http_fuzz.c $(FUZZ_SRC) $(wildcard src/*.h) include/em.h include/em_http.h
+	@mkdir -p $(B_FUZZ)
+	clang -std=gnu11 -O1 -g $(WARN) -Iinclude $(HTTP_CF) -fno-omit-frame-pointer \
+	  -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
+	  tests/fuzz/http_fuzz.c $(FUZZ_SRC) -luring -lm -lpthread -o $@
+fuzz-http: $(B_FUZZ)/http_fuzz
+	@rm -rf $(B_FUZZ)/http_work && mkdir -p $(B_FUZZ)/http_work
+	$(B_FUZZ)/http_fuzz -max_total_time=$(FUZZ_SECONDS) -max_len=4096 -print_final_stats=1 \
+	  -artifact_prefix=$(B_FUZZ)/ $(B_FUZZ)/http_work tests/fuzz/corpus/http
 
 clean:
 	rm -rf build

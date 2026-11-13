@@ -26,6 +26,20 @@ jobs:
       - run: make test-asan
       # cargo/rustup come preinstalled on GitHub runners (x86_64 and arm64)
       - run: make test-rust
+      # clang with the libFuzzer runtime and curl are on the runner images; install only if a probe fails
+      - name: clang (libFuzzer) and curl
+        run: |
+          probe() { echo 'int LLVMFuzzerTestOneInput(const unsigned char *d, unsigned long n) { return 0; }' |
+                    clang -x c -fsanitize=fuzzer,address,undefined - -o /dev/null 2>/dev/null; }
+          if ! command -v curl >/dev/null || ! command -v clang >/dev/null || ! probe; then
+            sudo apt-get install -y --no-install-recommends clang curl
+            probe || sudo apt-get install -y --no-install-recommends "libclang-rt-$(clang -dumpversion | cut -d. -f1)-dev"
+            probe
+          fi
+      - name: fuzz http (60 s, ASan + UBSan)
+        run: make fuzz-http FUZZ_SECONDS=60
+      - name: curl smoke
+        run: tests/http_curl.sh
 
   # em_tls against AWS-LC (make TLS_PREFIX): the AWS-LC data path in src/tls.c is only built and
   # tested here. The cache is shared with bench.yml (same key) and keeps the ~147 MB build to once.

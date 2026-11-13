@@ -19,15 +19,21 @@ static int main_fn(void *arg)
     em_scope_open(&dl, em_now() + 20000000000ll);
     http_start(&s, &sc, &port);
 
-    /* body: refused (the body bytes ride along in the same send) */
+    /* a body over max_body_bytes is refused before the handler (the bytes ride along in the same send) */
+    http_cfg.max_body_bytes = 4;
     rejected(port, "POST /x HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", "HTTP/1.1 413 ");
     rejected(port, "POST /x HTTP/1.0\r\nContent-Length: 5\r\n\r\nhello", "HTTP/1.0 413 ");
-    rejected(port, "POST /x HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", "HTTP/1.1 501 ");
+    rejected(port, "POST /x HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n", "HTTP/1.1 413 ");
+    http_cfg.max_body_bytes = 0;
+    rejected(port, "POST /x HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n0\r\n\r\n", "HTTP/1.1 501 ");
+    rejected(port, "POST /x HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n", "HTTP/1.1 501 ");
+    rejected(port, "POST /x HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", "HTTP/1.0 400 ");
     /* smuggling shapes */
     rejected(port, "POST /x HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n", "HTTP/1.1 400 ");
     rejected(port, "POST /x HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!", "HTTP/1.1 400 ");
     rejected(port, "POST /x HTTP/1.1\r\nContent-Length: abc\r\n\r\n", "HTTP/1.1 400 ");
     rejected(port, "POST /x HTTP/1.1\r\nContent-Length: +5\r\n\r\n", "HTTP/1.1 400 ");
+    rejected(port, "GET / HTTP/1.1\r\nX: a\r\n b\r\n\r\n", "HTTP/1.1 400 "); /* obs-fold */
 
     /* header block over the read buffer: exactly 8192 bytes, no end yet -> 431 */
     {

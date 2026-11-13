@@ -25,6 +25,21 @@ static int test_handler(em_http_conn *c, const em_http_req *r, void *arg)
         return em_http_respond(c, 200, &ct, 1, big_body, sizeof big_body - 1);
     if (r->path_len == 3 && !memcmp(r->path, "/4k", 3))
         return em_http_respond(c, 200, &ct, 1, k4_body, sizeof k4_body - 1);
+    if (r->path_len == 5 && !memcmp(r->path, "/echo", 5)) { /* the whole body, read in 1..7 byte steps */
+        static char body[1 << 17];
+        size_t n = 0, step = 1;
+        for (;;) {
+            size_t want = step < sizeof body - n ? step : sizeof body - n;
+            ssize_t k = em_http_read_body(c, body + n, want);
+            if (k < 0) return (int)k;
+            if (!k) break;
+            n += (size_t)k;
+            step = step % 7 + 1;
+        }
+        return em_http_respond(c, 200, &ct, 1, body, n);
+    }
+    if (r->path_len == 7 && !memcmp(r->path, "/noread", 7))
+        return em_http_respond(c, 200, &ct, 1, "noread", 6);
     assert(r->method_len + 1 + r->path_len < sizeof buf);
     memcpy(buf, r->method, r->method_len);
     buf[r->method_len] = ' ';
@@ -144,6 +159,26 @@ static inline void expect_eof(rd_t *r)
     const char *h = NULL, *b = NULL;
     size_t hl = 0, bl = 0;
     assert(rd_response(r, &h, &hl, &b, &bl) == 1);
+}
+
+#define CONT "HTTP/1.1 100 Continue\r\n\r\n"
+
+/* The next bytes must be "100 Continue" (it has no Content-Length, so rd_response cannot read it). */
+static inline void expect_100(rd_t *r)
+{
+    size_t k = sizeof CONT - 1;
+    while (r->len - r->pos < k) {
+        if (r->pos) {
+            memmove(r->buf, r->buf + r->pos, r->len - r->pos);
+            r->len -= r->pos;
+            r->pos = 0;
+        }
+        ssize_t n = em_recv(r->fd, r->buf + r->len, sizeof r->buf - r->len);
+        assert(n > 0);
+        r->len += (size_t)n;
+    }
+    assert(memcmp(r->buf + r->pos, CONT, k) == 0);
+    r->pos += k;
 }
 
 static rd_t *rd_open(uint16_t port)

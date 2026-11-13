@@ -1,0 +1,6 @@
+HEAD /x HTTP/1.1
+Host: x
+
+HEAD / HTTP/1.1
+Host: x
+

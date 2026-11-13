@@ -15,15 +15,40 @@
 /* Upper bound of everything respond writes besides user headers and body: status line with
  * reason (<= 39), Date (37), Content-Length (38), Connection (24), final CRLF (2). */
 #define FIXED_HDR  160u
+/* Chunk-decode window: the one fixed region this file adds to the per-connection malloc. The head
+ * must stay put while the handler runs, so raw chunked bytes cannot be decoded in rbuf (its tail may
+ * be full); phr_decode_chunked rewrites its buffer in place, so raw bytes are received into this
+ * window and decoded there. Never used by requests without a chunked body. */
+#define CWIN_BYTES 8192u
+#define DEF_HDR_TO 30000000000ll
+#define DEF_IDLE   60000000000ll
+#define DRAIN_MAX  65536u   /* an unread Content-Length remainder up to this is drained and the connection kept */
 
 struct em_http_conn {
-    int    fd;
-    int    minor;      /* current request */
-    int    keep;       /* current request: connection stays open after its response */
-    int    responded;
-    int    err;        /* sticky send error */
-    char  *wbuf;
-    size_t wlen;
+    int     fd;
+    int     minor;      /* current request */
+    int     keep;       /* current request: connection stays open after its response */
+    int     responded;
+    int     err;        /* sticky send error */
+    int     head;       /* current request is HEAD: respond sends no body */
+    char   *wbuf;
+    size_t  wlen;
+    /* read side. Request k's head is rbuf[hpos, bpos); its body bytes already received and not yet
+     * read are rbuf[bpos, bend) (Content-Length) or the raw bytes rbuf[bpos, rlen) (chunked). */
+    char   *rbuf;
+    size_t  rcap, rlen, bpos, bend;
+    int64_t idle_ns;    /* 0 = none */
+    uint64_t max_body;
+    int64_t body_left;  /* Content-Length: bytes not yet read by the handler */
+    int     chunked;
+    int     expect;     /* 100 Continue still owed (HTTP/1.1 + Expect: 100-continue + a body) */
+    int     rerr;       /* first read_body error of this request; the connection closes after it */
+    int     rown;       /* rerr is our own idle timeout, not the caller's scope deadline */
+    int     cdone;      /* chunked: terminating chunk and trailers seen */
+    char   *cw;         /* chunk window */
+    size_t  cw_pos, cw_len, cw_left; /* decoded bytes cw[cw_pos, cw_len); then cw_left bytes of the next request */
+    uint64_t cdec;      /* chunked: decoded bytes so far */
+    struct phr_chunked_decoder dec;
 };
 
 /* The user sees phr_header through em_http_header: same layout, enforced here. */
@@ -78,7 +103,9 @@ static const char *reason(int s)
     case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
+    case 408: return "Request Timeout";
     case 413: return "Content Too Large";
+    case 417: return "Expectation Failed";
     case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
     case 501: return "Not Implemented";
@@ -116,7 +143,12 @@ int em_http_respond(em_http_conn *c, int status, const em_http_header *h, size_t
     size_t hub = FIXED_HDR;
     for (size_t i = 0; i < nh; i++) hub += h[i].name_len + h[i].value_len + 4;
     if (hub > WBUF_BYTES) return -EMSGSIZE;
-    int inl = len <= WBUF_BYTES - hub;  /* header and body share one buffer, one send */
+    int inl = !c->head && len <= WBUF_BYTES - hub;  /* header and body share one buffer, one send */
+    /* Decide Connection before the header is written: a body the handler left unread that we
+     * cannot afford to drain ends the connection with this response. */
+    if (c->keep && (c->chunked || c->body_left || c->expect || c->rerr) &&
+        (c->rerr || c->expect || (c->chunked ? !c->cdone : c->body_left > (int64_t)DRAIN_MAX)))
+        c->keep = 0;
     if (WBUF_BYTES - c->wlen < (inl ? hub + len : hub)) {
         int r = flush(c);
         if (r < 0) return r;
@@ -147,6 +179,8 @@ int em_http_respond(em_http_conn *c, int status, const em_http_header *h, size_t
     if (inl) {
         if (len) memcpy(p, body, len);
         c->wlen = (size_t)(p - c->wbuf) + len;
+    } else if (c->head) {
+        c->wlen = (size_t)(p - c->wbuf);
     } else {
         c->wlen = (size_t)(p - c->wbuf);
         int r = flush(c);
@@ -168,6 +202,13 @@ static int ieq(const char *a, size_t n, const char *lit, size_t ln) /* lit is lo
 }
 #define IEQ(a, n, lit) ieq(a, n, lit, sizeof lit - 1)
 
+/* A field value without its optional white space. */
+static void trim(const char **v, size_t *n)
+{
+    while (*n && (**v == ' ' || **v == '\t')) { (*v)++; (*n)--; }
+    while (*n && ((*v)[*n - 1] == ' ' || (*v)[*n - 1] == '\t')) (*n)--;
+}
+
 /* Connection: comma separated tokens. bit 0 = close, bit 1 = keep-alive. */
 static int conn_tokens(const char *v, size_t n)
 {
@@ -182,18 +223,23 @@ static int conn_tokens(const char *v, size_t n)
     return f;
 }
 
-/* 0: fine (no body, *keep set); else the status to answer before closing. */
-static int inspect(const struct phr_header *hs, size_t nh, int minor, int *keep)
+/* 0: fine, *keep / *cl (0 none, -1 chunked, else the length) / *expect set; else the status to
+ * answer before closing. */
+static int inspect(const struct phr_header *hs, size_t nh, int minor, uint64_t max_body,
+                   int *keep, int64_t *cl_out, int *expect)
 {
-    int tokens = 0, te = 0, bad = 0;
+    int tokens = 0, nte = 0, te_chunked = 0, bad = 0, xbad = 0, x100 = 0;
     int64_t cl = -1;
     for (size_t i = 0; i < nh; i++) {
         const struct phr_header *h = &hs[i];
-        if (!h->name) continue; /* obs-fold continuation line */
+        if (!h->name) { bad = 1; continue; } /* obs-fold continuation line: refused (RFC 9112 5.2) */
         if (IEQ(h->name, h->name_len, "connection")) {
             tokens |= conn_tokens(h->value, h->value_len);
         } else if (IEQ(h->name, h->name_len, "transfer-encoding")) {
-            te = 1;
+            const char *v = h->value; size_t n = h->value_len;
+            trim(&v, &n);
+            nte++;
+            te_chunked = IEQ(v, n, "chunked");
         } else if (IEQ(h->name, h->name_len, "content-length")) {
             int64_t v = 0;
             if (!h->value_len) bad = 1;
@@ -204,11 +250,19 @@ static int inspect(const struct phr_header *hs, size_t nh, int minor, int *keep)
             }
             if (cl >= 0 && cl != v) bad = 1; /* repeated with another value */
             cl = v;
+        } else if (IEQ(h->name, h->name_len, "expect")) {
+            const char *v = h->value; size_t n = h->value_len;
+            trim(&v, &n);
+            if (IEQ(v, n, "100-continue")) x100 = 1; else xbad = 1;
         }
     }
-    if (bad || (te && cl >= 0)) return 400;  /* RFC 9112 6.3: smuggling shapes */
-    if (te) return 501;
-    if (cl > 0) return 413;
+    if (bad || (nte && cl >= 0)) return 400;  /* RFC 9112 6.3: smuggling shapes */
+    if (nte && (nte > 1 || !te_chunked)) return 501;
+    if (nte && minor == 0) return 400;        /* chunked does not exist in HTTP/1.0 */
+    if (xbad) return 417;
+    if (cl > 0 && (uint64_t)cl > max_body) return 413;
+    *cl_out = nte ? -1 : cl > 0 ? cl : 0;
+    *expect = x100 && minor && *cl_out;
     *keep = minor ? !(tokens & 1) : (tokens & 3) == 2;
     return 0;
 }
@@ -216,9 +270,139 @@ static int inspect(const struct phr_header *hs, size_t nh, int minor, int *keep)
 /* Answers an error, then the caller closes. The status line uses HTTP/1.minor. */
 static int fail(em_http_conn *c, int status, int minor)
 {
-    c->minor = minor; c->keep = 0; c->responded = 0;
+    c->minor = minor; c->keep = 0; c->responded = 0; c->head = 0;
     int r = em_http_respond(c, status, NULL, 0, NULL, 0);
     return r < 0 ? r : flush(c);
+}
+
+/* ---- waiting and the request body ---- */
+
+/* em_recv that gives up at the absolute deadline dl (0 = none) through a scope. *own = the error
+ * is -ETIMEDOUT and it is ours: the effective deadline is the min of dl and the caller's, so ours
+ * fired only if it is strictly earlier. The caller's -ETIMEDOUT / -ECANCELED stay theirs. */
+static ssize_t wait_recv(int fd, void *buf, size_t len, int64_t dl, int *own)
+{
+    *own = 0;
+    if (!dl) return em_recv(fd, buf, len);
+    em_scope s;
+    em_scope_open(&s, dl);
+    ssize_t n = em_recv(fd, buf, len);
+    if (n == -ETIMEDOUT) *own = !s.parent->deadline || dl < s.parent->deadline;
+    em_scope_close(&s); /* no children: nothing to wait for */
+    return n;
+}
+
+static int64_t idle_deadline(const em_http_conn *c)
+{
+    return c->idle_ns ? em_now() + c->idle_ns : 0;
+}
+
+static ssize_t body_fail(em_http_conn *c, ssize_t e, int own)
+{
+    c->rerr = (int)e;
+    c->rown = own;
+    return e;
+}
+
+ssize_t em_http_read_body(em_http_conn *c, void *buf, size_t len)
+{
+    if (c->err) return c->err;
+    if (c->responded) return -EALREADY;
+    if (c->rerr) return c->rerr;
+    if (!len) return -EINVAL;
+    if (c->expect) { /* earlier pipelined responses go out first, in the same send */
+        static const char k[] = "HTTP/1.1 100 Continue\r\n\r\n";
+        c->expect = 0;
+        if (WBUF_BYTES - c->wlen < sizeof k - 1) {
+            int r = flush(c);
+            if (r < 0) return r;
+        }
+        memcpy(c->wbuf + c->wlen, k, sizeof k - 1);
+        c->wlen += sizeof k - 1;
+        int r = flush(c);
+        if (r < 0) return r;
+    }
+    if (!c->chunked) {
+        if (!c->body_left) return 0;
+        size_t want = (uint64_t)c->body_left < len ? (size_t)c->body_left : len;
+        size_t b = c->bend - c->bpos; /* bytes that came with the head */
+        if (b) {
+            size_t n = b < want ? b : want;
+            memcpy(buf, c->rbuf + c->bpos, n);
+            c->bpos += n;
+            c->body_left -= (int64_t)n;
+            return (ssize_t)n;
+        }
+        int own;
+        ssize_t n = wait_recv(c->fd, buf, want, idle_deadline(c), &own); /* straight into buf, never past the body */
+        if (n <= 0) return body_fail(c, n ? n : -ECONNRESET, own);
+        c->body_left -= n;
+        return n;
+    }
+    for (;;) {
+        if (c->cw_pos < c->cw_len) {
+            size_t n = c->cw_len - c->cw_pos < len ? c->cw_len - c->cw_pos : len;
+            memcpy(buf, c->cw + c->cw_pos, n);
+            c->cw_pos += n;
+            return (ssize_t)n;
+        }
+        if (c->cdone) return 0;
+        /* one raw batch into the window: the bytes that came with the head first, then the socket.
+         * batch <= rcap so that what the decoder leaves of the next request fits rbuf again. */
+        size_t batch = c->rcap < CWIN_BYTES ? c->rcap : CWIN_BYTES, n;
+        if (c->bpos < c->rlen) {
+            n = c->rlen - c->bpos < batch ? c->rlen - c->bpos : batch;
+            memcpy(c->cw, c->rbuf + c->bpos, n);
+            c->bpos += n;
+        } else {
+            int own;
+            ssize_t r = wait_recv(c->fd, c->cw, batch, idle_deadline(c), &own);
+            if (r <= 0) return body_fail(c, r ? r : -ECONNRESET, own);
+            n = (size_t)r;
+        }
+        size_t sz = n;
+        ssize_t r = phr_decode_chunked(&c->dec, c->cw, &sz);
+        if (r == -1) return body_fail(c, -EPROTO, 0);
+        c->cdec += sz;
+        if (c->cdec > c->max_body) return body_fail(c, -EMSGSIZE, 0);
+        if (r >= 0) { c->cdone = 1; c->cw_left = (size_t)r; }
+        c->cw_pos = 0;
+        c->cw_len = sz;
+    }
+}
+
+/* After the handler, connection kept: skip what it did not read and put the next request's bytes
+ * at rbuf[0, rlen). respond made sure a kept connection has a finished chunked body or a
+ * Content-Length remainder <= DRAIN_MAX. 0, 1 = close silently (our idle timeout), or -errno. */
+static int finish_body(em_http_conn *c, size_t *rpos)
+{
+    if (c->chunked) {
+        size_t rest = c->rlen - c->bpos; /* not yet fed to the decoder */
+        memmove(c->rbuf + c->cw_left, c->rbuf + c->bpos, rest);
+        memcpy(c->rbuf, c->cw + c->cw_len, c->cw_left);
+        c->rlen = c->cw_left + rest;
+        *rpos = 0;
+        return 0;
+    }
+    size_t b = c->bend - c->bpos;
+    size_t t = (uint64_t)c->body_left < b ? (size_t)c->body_left : b;
+    c->bpos += t;
+    int64_t skip = c->body_left - (int64_t)t;
+    *rpos = c->bpos;
+    if (!skip) return 0;
+    /* skip > 0: the body went past what was buffered, so nothing else is */
+    int r = flush(c); /* the response must not wait behind a slow body */
+    if (r < 0) return r;
+    c->rlen = *rpos = 0; /* the head is dead: rbuf is scratch */
+    while (skip) {
+        int own;
+        ssize_t n = wait_recv(c->fd, c->rbuf, (uint64_t)skip < c->rcap ? (size_t)skip : c->rcap,
+                              idle_deadline(c), &own);
+        if (n < 0) return own ? 1 : (int)n;
+        if (!n) return -ECONNRESET;
+        skip -= n;
+    }
+    return 0;
 }
 
 int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h, void *arg)
@@ -227,11 +411,17 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
     size_t rcap = cfg && cfg->max_header_bytes ? cfg->max_header_bytes : DEF_RBUF;
     size_t maxh = cfg && cfg->max_headers ? cfg->max_headers : DEF_HDRS;
     unsigned maxreq = cfg ? cfg->max_requests_per_conn : 0;
-    struct phr_header *hs = malloc(maxh * sizeof *hs + WBUF_BYTES + rcap);
+    int64_t hto = !cfg || !cfg->header_timeout_ns ? DEF_HDR_TO : cfg->header_timeout_ns;
+    int64_t ito = !cfg || !cfg->idle_timeout_ns ? DEF_IDLE : cfg->idle_timeout_ns;
+    struct phr_header *hs = malloc(maxh * sizeof *hs + WBUF_BYTES + CWIN_BYTES + rcap);
     if (!hs) return -ENOMEM;
-    em_http_conn c = { .fd = fd, .wbuf = (char *)(hs + maxh) };
-    char *rbuf = c.wbuf + WBUF_BYTES;
-    size_t rpos = 0, rlen = 0, last = 0; /* unparsed bytes are rbuf[rpos, rlen) */
+    em_http_conn c = { .fd = fd, .wbuf = (char *)(hs + maxh), .rcap = rcap,
+                       .idle_ns = ito > 0 ? ito : 0,
+                       .max_body = cfg && cfg->max_body_bytes ? cfg->max_body_bytes : 1u << 20 };
+    c.cw = c.wbuf + WBUF_BYTES;
+    char *rbuf = c.rbuf = c.cw + CWIN_BYTES;
+    size_t rpos = 0, last = 0; /* unparsed bytes are rbuf[rpos, c.rlen) */
+    int64_t hdr_dl = 0;        /* deadline of the head being received, 0 = not started or none */
     unsigned nreq = 0;
     int ret = 0;
 
@@ -240,7 +430,7 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
         const char *m, *path;
         size_t ml, pl, nh = maxh;
         int minor, pret = -2;
-        size_t avail = rlen - rpos;
+        size_t avail = c.rlen - rpos;
         if (avail) {
             pret = phr_parse_request(rbuf + rpos, avail, &m, &ml, &path, &pl, &minor, hs, &nh, last);
             if (pret == -1) { ret = fail(&c, 400, 1); break; }
@@ -250,38 +440,71 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
             last = avail;
             /* About to wait: nothing queued may sit behind a read. */
             if ((ret = flush(&c)) < 0) break;
-            if (rpos == rlen) rpos = rlen = 0;
-            else if (rpos) { memmove(rbuf, rbuf + rpos, avail); rpos = 0; rlen = avail; }
-            ssize_t n = em_recv(fd, rbuf + rlen, rcap - rlen);
-            if (n < 0) { ret = (int)n; break; }
+            if (rpos == c.rlen) rpos = c.rlen = 0;
+            else if (rpos) { memmove(rbuf, rbuf + rpos, avail); rpos = 0; c.rlen = avail; }
+            int64_t dl = 0;
+            if (!avail) dl = idle_deadline(&c);  /* waiting for a request to start */
+            else if (hto > 0) {                  /* a head is partly in: its clock runs from now at the latest */
+                if (!hdr_dl) hdr_dl = em_now() + hto;
+                dl = hdr_dl;
+            }
+            int own;
+            ssize_t n = wait_recv(fd, rbuf + c.rlen, rcap - c.rlen, dl, &own);
+            if (n < 0) { ret = !own ? (int)n : avail ? fail(&c, 408, 1) : 0; break; }
             if (n == 0) { ret = avail ? -ECONNRESET : 0; break; }
-            rlen += (size_t)n;
+            c.rlen += (size_t)n;
             continue;
         }
         last = 0;
+        hdr_dl = 0;
 
-        /* 2. no body in M1; connection semantics */
-        int keep, st = inspect(hs, nh, minor, &keep);
+        /* 2. body framing and connection semantics */
+        int keep, expect;
+        int64_t cl;
+        int st = inspect(hs, nh, minor, c.max_body, &keep, &cl, &expect);
         if (st) { ret = fail(&c, st, minor); break; }
         if (maxreq && ++nreq >= maxreq) keep = 0;
 
         /* 3. the handler */
         em_http_req req = { .method = m, .path = path, .method_len = ml, .path_len = pl,
                             .minor_version = minor, .headers = (const em_http_header *)hs,
-                            .nheaders = nh };
+                            .nheaders = nh, .content_length = cl };
         c.minor = minor; c.keep = keep; c.responded = 0;
+        c.head = ml == 4 && !memcmp(m, "HEAD", 4);
+        c.expect = expect; c.rerr = 0; c.chunked = cl < 0; c.cdone = 0;
+        c.body_left = cl > 0 ? cl : 0;
+        c.bpos = rpos + (size_t)pret;
+        c.bend = cl > 0 && (uint64_t)cl < c.rlen - c.bpos ? c.bpos + (size_t)cl : c.rlen;
+        if (cl < 0) {
+            memset(&c.dec, 0, sizeof c.dec);
+            c.dec.consume_trailer = 1;
+            c.cw_pos = c.cw_len = c.cw_left = 0;
+            c.cdec = 0;
+        } else if (cl == 0) {
+            c.bend = c.bpos;
+        }
         int hr = h(&c, &req, arg);
         if (c.err) { ret = c.err; break; }
         if (hr || !c.responded) {
             /* answered, then failed: that answer stands, no second one; then close */
-            ret = c.responded ? flush(&c) : fail(&c, 500, minor);
-            if (ret >= 0) ret = hr ? hr : -EPROTO;
+            int stt = 0;
+            if (c.responded) ret = flush(&c);
+            else if (c.rerr) { /* a body error the handler left unanswered */
+                stt = c.rerr == -EMSGSIZE ? 413 : c.rerr == -EPROTO ? 400 : c.rerr == -ETIMEDOUT && c.rown ? 408 : 0;
+                ret = stt ? fail(&c, stt, minor) : 0;
+            } else ret = fail(&c, 500, minor);
+            if (ret >= 0) ret = hr ? hr : !c.rerr ? -EPROTO : stt ? 0 : c.rerr;
             break;
         }
-        rpos += (size_t)pret;
-        if (!keep) break;
+        if (!c.keep) break;
+        int fb = finish_body(&c, &rpos);
+        if (fb) { ret = fb < 0 ? fb : 0; break; }
     }
     if (ret >= 0) { int r = flush(&c); if (r < 0) ret = r; } /* the last response(s) */
+    /* DEBT: no lingering close. When we close with request bytes still unread (413 before the
+     * handler, Connection: close over an unread body), the caller's close() makes the kernel send
+     * RST, and a client still sending can lose the response it has not read yet. Remove when serve
+     * drains (bounded in bytes and time) before returning, which needs a real user to size it. */
     free(hs);
     return ret;
 }

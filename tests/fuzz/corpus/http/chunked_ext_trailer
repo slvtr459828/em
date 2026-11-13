@@ -1,0 +1,14 @@
+POST / HTTP/1.1
+Host: x
+Transfer-Encoding: chunked
+
+5;ext=1
+hello
+6
+ world
+0
+X-Trailer: t
+
+GET /z HTTP/1.1
+Host: x
+
