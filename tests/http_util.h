@@ -1,14 +1,30 @@
 #ifndef EM_TEST_HTTP_UTIL_H
 #define EM_TEST_HTTP_UTIL_H
 /* Server side: test_handler answers "<method> <path>" (200, text/plain), with a few special
- * paths. Client side: a raw reader that splits the byte stream into responses. */
+ * paths. Client side: a raw reader that splits the byte stream into responses.
+ * Built with -DHTTP_TLS the same test runs over TLS: the server does em_tls_accept and passes the
+ * em_tls to serve, the client does em_tls_connect and reads/writes through it (rd_send / rd_recv). */
+#include <stdatomic.h>
 #include <stdio.h>
+#ifdef HTTP_TLS
+#include <pthread.h>
+#include "tls_util.h"
+#else
 #include "util.h"
+#endif
 #include "../include/em_http.h"
 
 static em_http_cfg http_cfg; /* read when a connection starts; change it only between servers */
 static char big_body[20001]; /* "/big": 20000 bytes + NUL for strlen in expect_resp */
 static char k4_body[4097];    /* "/4k": 4096 bytes + NUL */
+static char huge_body[16u << 20]; /* "/huge": 16 MiB of zeros, sent from here */
+static _Atomic int http_done; /* serve calls that have returned (their value: http_rc) */
+static _Atomic int http_rc;
+#ifdef HTTP_TLS
+static SSL_CTX *http_sctx, *http_cctx;
+static pthread_once_t http_once = PTHREAD_ONCE_INIT;
+static void http_tls_init(void) { tls_test_ctx(&http_sctx, &http_cctx); }
+#endif
 
 static int test_handler(em_http_conn *c, const em_http_req *r, void *arg)
 {
@@ -23,6 +39,8 @@ static int test_handler(em_http_conn *c, const em_http_req *r, void *arg)
     }
     if (r->path_len == 4 && !memcmp(r->path, "/big", 4))
         return em_http_respond(c, 200, &ct, 1, big_body, sizeof big_body - 1);
+    if (r->path_len == 5 && !memcmp(r->path, "/huge", 5))
+        return em_http_respond(c, 200, &ct, 1, huge_body, sizeof huge_body);
     if (r->path_len == 3 && !memcmp(r->path, "/4k", 3))
         return em_http_respond(c, 200, &ct, 1, k4_body, sizeof k4_body - 1);
     if (r->path_len == 5 && !memcmp(r->path, "/echo", 5)) { /* the whole body, read in 1..7 byte steps */
@@ -50,7 +68,17 @@ static int test_handler(em_http_conn *c, const em_http_req *r, void *arg)
 static int http_conn(void *arg)
 {
     int fd = (int)(intptr_t)arg;
-    em_http_serve(fd, NULL, &http_cfg, test_handler, NULL);
+    em_tls *t = NULL;
+#ifdef HTTP_TLS
+    if (em_tls_accept(&t, http_sctx, fd) < 0) { em_close(fd); return 0; }
+#endif
+    int rc = em_http_serve(fd, t, &http_cfg, test_handler, NULL);
+    atomic_store(&http_rc, rc);
+    atomic_fetch_add(&http_done, 1);
+#ifdef HTTP_TLS
+    em_tls_shutdown(t); /* the caller's close_notify; fails after a lingering close (write side is shut) */
+    em_tls_free(t);
+#endif
     em_close(fd);
     return 0;
 }
@@ -71,6 +99,9 @@ static int http_acceptor(void *arg)
 /* Opens *sc (server scope), listens on 127.0.0.1:*port, starts the acceptor. */
 static void http_start(struct hsrv *s, em_scope *sc, uint16_t *port)
 {
+#ifdef HTTP_TLS
+    pthread_once(&http_once, http_tls_init);
+#endif
     memset(big_body, 'b', sizeof big_body - 1);
     memset(k4_body, 'a', sizeof k4_body - 1);
     em_scope_open(sc, 0);
@@ -88,11 +119,33 @@ static int http_stop(struct hsrv *s)
 
 /* ---- client ---- */
 
-typedef struct { int fd; size_t pos, len; char buf[1 << 16]; } rd_t;
+typedef struct { int fd; em_tls *t; size_t pos, len; char buf[1 << 16]; } rd_t;
 
-static void send_str(int fd, const char *s)
+static int rd_send(rd_t *r, const void *b, size_t n)
 {
-    assert(em_send_all(fd, s, strlen(s)) == 0);
+#ifdef HTTP_TLS
+    return em_tls_send_all(r->t, b, n);
+#else
+    return em_send_all(r->fd, b, n);
+#endif
+}
+
+/* 0 = end. Under TLS a TCP end without close_notify counts as one too: serve never sends it, and a
+ * server that shut the write side (lingering close, send timeout) cannot. A response cut short is
+ * still caught: the readers below treat an end inside a response as an error. */
+static ssize_t rd_recv(rd_t *r, void *b, size_t n)
+{
+#ifdef HTTP_TLS
+    ssize_t k = em_tls_recv(r->t, b, n);
+    return k == -ECONNRESET ? 0 : k;
+#else
+    return em_recv(r->fd, b, n);
+#endif
+}
+
+static void send_str(rd_t *r, const char *s)
+{
+    assert(rd_send(r, s, strlen(s)) == 0);
 }
 
 /* Next response from the stream. 0 = ok (head/body point into r->buf, valid until the next
@@ -122,7 +175,7 @@ static int rd_response(rd_t *r, const char **head, size_t *hlen, const char **bo
             r->pos = 0;
         }
         assert(r->len < sizeof r->buf);
-        ssize_t n = em_recv(r->fd, r->buf + r->len, sizeof r->buf - r->len);
+        ssize_t n = rd_recv(r, r->buf + r->len, sizeof r->buf - r->len);
         if (n < 0) return (int)n;
         if (n == 0) return r->len ? -EIO : 1;
         r->len += (size_t)n;
@@ -173,7 +226,7 @@ static inline void expect_100(rd_t *r)
             r->len -= r->pos;
             r->pos = 0;
         }
-        ssize_t n = em_recv(r->fd, r->buf + r->len, sizeof r->buf - r->len);
+        ssize_t n = rd_recv(r, r->buf + r->len, sizeof r->buf - r->len);
         assert(n > 0);
         r->len += (size_t)n;
     }
@@ -181,16 +234,35 @@ static inline void expect_100(rd_t *r)
     r->pos += k;
 }
 
-static rd_t *rd_open(uint16_t port)
+/* rcvbuf > 0: SO_RCVBUF set before connect, so the window the server sees stays small and what it
+ * sends piles up on its side while this client is not reading. */
+static rd_t *rd_open_rcvbuf(uint16_t port, int rcvbuf)
 {
     rd_t *r = calloc(1, sizeof *r);
-    r->fd = connect_local(port);
+    if (rcvbuf) {
+        struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port),
+                                 .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+        r->fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        assert(r->fd >= 0);
+        assert(setsockopt(r->fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf) == 0);
+        assert(connect(r->fd, (struct sockaddr *)&a, sizeof a) == 0); /* loopback: done in the kernel */
+    } else {
+        r->fd = connect_local(port);
+    }
     assert(r->fd >= 0);
+#ifdef HTTP_TLS
+    assert(em_tls_connect(&r->t, http_cctx, r->fd, "localhost") == 0);
+#endif
     return r;
 }
 
+static inline rd_t *rd_open(uint16_t port) { return rd_open_rcvbuf(port, 0); }
+
 static void rd_close(rd_t *r)
 {
+#ifdef HTTP_TLS
+    em_tls_free(r->t);
+#endif
     em_close(r->fd);
     free(r);
 }

@@ -4,7 +4,7 @@
 static void rejected(uint16_t port, const char *req, const char *status)
 {
     rd_t *r = rd_open(port);
-    send_str(r->fd, req);
+    send_str(r, req);
     expect_resp(r, status, "", "close");
     expect_eof(r);
     rd_close(r);
@@ -42,7 +42,7 @@ static int main_fn(void *arg)
         const char *pre = "GET / HTTP/1.1\r\nX: ";
         memcpy(big, pre, strlen(pre));
         rd_t *r = rd_open(port);
-        assert(em_send_all(r->fd, big, sizeof big) == 0);
+        assert(rd_send(r, big, sizeof big) == 0);
         expect_resp(r, "HTTP/1.1 431 ", "", "close");
         expect_eof(r);
         rd_close(r);
@@ -56,7 +56,7 @@ static int main_fn(void *arg)
         memcpy(big, pre, pl);
         memcpy(big + 8192 - ql, post, ql);
         rd_t *r = rd_open(port);
-        assert(em_send_all(r->fd, big, 8192) == 0);
+        assert(rd_send(r, big, 8192) == 0);
         expect_resp(r, "HTTP/1.1 200 ", "GET /", NULL);
         rd_close(r);
     }
@@ -71,7 +71,7 @@ static int main_fn(void *arg)
     rejected(port, "GET /err HTTP/1.1\r\n\r\n", "HTTP/1.1 500 ");
     {
         rd_t *r = rd_open(port);
-        send_str(r->fd, "GET /ok HTTP/1.1\r\n\r\nGET /noresp HTTP/1.1\r\n\r\nGET /late HTTP/1.1\r\n\r\n");
+        send_str(r, "GET /ok HTTP/1.1\r\n\r\nGET /noresp HTTP/1.1\r\n\r\nGET /late HTTP/1.1\r\n\r\n");
         expect_resp(r, "HTTP/1.1 200 ", "GET /ok", NULL);
         expect_resp(r, "HTTP/1.1 500 ", "", "close");
         expect_eof(r);
@@ -81,7 +81,7 @@ static int main_fn(void *arg)
     /* the handler answered, then failed: its answer goes out (keep-alive header and all), no 500 after it */
     {
         rd_t *r = rd_open(port);
-        send_str(r->fd, "GET /okerr HTTP/1.1\r\n\r\nGET /late HTTP/1.1\r\n\r\n");
+        send_str(r, "GET /okerr HTTP/1.1\r\n\r\nGET /late HTTP/1.1\r\n\r\n");
         expect_resp(r, "HTTP/1.1 200 ", "okerr", NULL);
         expect_eof(r);
         rd_close(r);
@@ -90,16 +90,13 @@ static int main_fn(void *arg)
     /* the peer leaves in the middle of a request: serve ends, nothing else breaks */
     {
         rd_t *r = rd_open(port);
-        send_str(r->fd, "GET /half HTTP/1.1\r\nHo");
+        send_str(r, "GET /half HTTP/1.1\r\nHo");
         rd_close(r);
         r = rd_open(port);
-        send_str(r->fd, "GET /after HTTP/1.1\r\n\r\n");
+        send_str(r, "GET /after HTTP/1.1\r\n\r\n");
         expect_resp(r, "HTTP/1.1 200 ", "GET /after", NULL);
         rd_close(r);
     }
-
-    /* tls is not supported in M1 */
-    assert(em_http_serve(-1, (em_tls *)&s, NULL, test_handler, NULL) == -ENOTSUP);
 
     int r1 = http_stop(&s);
     int r2 = em_scope_close(&dl);

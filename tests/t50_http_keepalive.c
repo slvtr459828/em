@@ -3,7 +3,7 @@
 
 static void get(rd_t *r, const char *req, const char *status, const char *body, const char *conn)
 {
-    send_str(r->fd, req);
+    send_str(r, req);
     expect_resp(r, status, body, conn);
 }
 

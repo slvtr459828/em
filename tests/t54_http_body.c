@@ -8,14 +8,14 @@ static void pause_ms(int ms) { assert(em_sleep_until(em_now() + ms * 1000000ll) 
 /* the handler echoes: "POST /echo" with this request must answer 200 + `body` */
 static void echo(rd_t *r, const char *req, const char *body)
 {
-    send_str(r->fd, req);
+    send_str(r, req);
     expect_resp(r, "HTTP/1.1 200 ", body, NULL);
 }
 
 static void closes(uint16_t port, const char *req, const char *status)
 {
     rd_t *r = rd_open(port);
-    send_str(r->fd, req);
+    send_str(r, req);
     expect_resp(r, status, "", "close");
     expect_eof(r);
     rd_close(r);
@@ -26,7 +26,7 @@ static size_t slurp(rd_t *r, char *out, size_t cap)
 {
     size_t n = 0;
     for (;;) {
-        ssize_t k = em_recv(r->fd, out + n, cap - 1 - n);
+        ssize_t k = rd_recv(r, out + n, cap - 1 - n);
         assert(k >= 0);
         if (!k) break;
         n += (size_t)k;
@@ -48,17 +48,17 @@ static int main_fn(void *arg)
     /* Content-Length: all in the first send; split; none; GET */
     r = rd_open(port);
     echo(r, "POST /echo HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", "hello");
-    send_str(r->fd, "POST /echo HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc");
+    send_str(r, "POST /echo HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc");
     pause_ms(20);
-    send_str(r->fd, "defghij");
+    send_str(r, "defghij");
     expect_resp(r, "HTTP/1.1 200 ", "abcdefghij", NULL);
     echo(r, "POST /echo HTTP/1.1\r\nContent-Length: 0\r\n\r\n", "");
     echo(r, "GET /echo HTTP/1.1\r\n\r\n", "");
     /* pipelined right behind a Content-Length body, then behind a chunked one */
-    send_str(r->fd, "POST /echo HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\n\r\n");
+    send_str(r, "POST /echo HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /next HTTP/1.1\r\n\r\n");
     expect_resp(r, "HTTP/1.1 200 ", "hello", NULL);
     expect_resp(r, "HTTP/1.1 200 ", "GET /next", NULL);
-    send_str(r->fd, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nGET /n2 HTTP/1.1\r\n\r\n");
+    send_str(r, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\nGET /n2 HTTP/1.1\r\n\r\n");
     expect_resp(r, "HTTP/1.1 200 ", "abc", NULL);
     expect_resp(r, "HTTP/1.1 200 ", "GET /n2", NULL);
     rd_close(r);
@@ -72,7 +72,7 @@ static int main_fn(void *arg)
     {
         const char *req = "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3;e\r\nabc\r\n2\r\nde\r\n0\r\nT: 1\r\n\r\n";
         for (const char *p = req; *p; p++) {
-            assert(em_send_all(r->fd, p, 1) == 0);
+            assert(rd_send(r, p, 1) == 0);
             em_yield();
         }
         expect_resp(r, "HTTP/1.1 200 ", "abcde", NULL);
@@ -97,7 +97,7 @@ static int main_fn(void *arg)
         memcpy(req + n, want, 60001); /* with the NUL */
         for (size_t off = 0; off < n + 60000; off += 7000) {
             size_t k = n + 60000 - off < 7000 ? n + 60000 - off : 7000;
-            assert(em_send_all(r->fd, req + off, k) == 0);
+            assert(rd_send(r, req + off, k) == 0);
         }
         expect_resp(r, "HTTP/1.1 200 ", want, NULL);
     }
@@ -106,32 +106,32 @@ static int main_fn(void *arg)
     /* unread body, Content-Length <= 64 KiB: drained, connection kept, next request served */
     r = rd_open(port);
     echo(r, "POST /noread HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello", "noread");
-    send_str(r->fd, "POST /noread HTTP/1.1\r\nContent-Length: 4\r\n\r\nabcdGET /after HTTP/1.1\r\n\r\n");
+    send_str(r, "POST /noread HTTP/1.1\r\nContent-Length: 4\r\n\r\nabcdGET /after HTTP/1.1\r\n\r\n");
     expect_resp(r, "HTTP/1.1 200 ", "noread", NULL);
     expect_resp(r, "HTTP/1.1 200 ", "GET /after", NULL);
     {   /* exactly 64 KiB, arriving after the response */
         static char b[65536];
         memset(b, 'q', sizeof b);
-        send_str(r->fd, "POST /noread HTTP/1.1\r\nContent-Length: 65536\r\n\r\n");
+        send_str(r, "POST /noread HTTP/1.1\r\nContent-Length: 65536\r\n\r\n");
         expect_resp(r, "HTTP/1.1 200 ", "noread", NULL);
-        assert(em_send_all(r->fd, b, sizeof b) == 0);
+        assert(rd_send(r, b, sizeof b) == 0);
         echo(r, "GET /again HTTP/1.1\r\n\r\n", "GET /again");
     }
     rd_close(r);
 
     /* unread Content-Length remainder over 64 KiB, unfinished chunked: Connection: close */
     r = rd_open(port);
-    send_str(r->fd, "POST /noread HTTP/1.1\r\nContent-Length: 65537\r\n\r\nabc");
+    send_str(r, "POST /noread HTTP/1.1\r\nContent-Length: 65537\r\n\r\nabc");
     expect_resp(r, "HTTP/1.1 200 ", "noread", "close");
     expect_eof(r);
     rd_close(r);
     r = rd_open(port);
-    send_str(r->fd, "POST /noread HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n");
+    send_str(r, "POST /noread HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n");
     expect_resp(r, "HTTP/1.1 200 ", "noread", "close");
     expect_eof(r);
     rd_close(r);
     r = rd_open(port); /* even a complete chunked body that nobody read */
-    send_str(r->fd, "POST /noread HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+    send_str(r, "POST /noread HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
     expect_resp(r, "HTTP/1.1 200 ", "noread", "close");
     expect_eof(r);
     rd_close(r);
@@ -159,13 +159,13 @@ static int main_fn(void *arg)
 
     /* the peer leaves in the middle of a body: the server is fine afterwards */
     r = rd_open(port);
-    send_str(r->fd, "POST /echo HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc");
+    send_str(r, "POST /echo HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc");
     rd_close(r);
     r = rd_open(port);
-    send_str(r->fd, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab");
+    send_str(r, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab");
     rd_close(r);
     r = rd_open(port);
-    send_str(r->fd, "POST /noread HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc");
+    send_str(r, "POST /noread HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc");
     expect_resp(r, "HTTP/1.1 200 ", "noread", NULL);
     rd_close(r); /* leaves while the body is being drained */
     r = rd_open(port);
@@ -176,7 +176,7 @@ static int main_fn(void *arg)
     {
         static char out[4096];
         r = rd_open(port);
-        send_str(r->fd, "HEAD /big HTTP/1.1\r\n\r\nHEAD /x HTTP/1.1\r\n\r\nGET /after HTTP/1.1\r\nConnection: close\r\n\r\n");
+        send_str(r, "HEAD /big HTTP/1.1\r\n\r\nHEAD /x HTTP/1.1\r\n\r\nGET /after HTTP/1.1\r\nConnection: close\r\n\r\n");
         size_t n = slurp(r, out, sizeof out);
         assert(strstr(out, "Content-Length: 20000\r\n"));
         assert(strstr(out, "Content-Length: 7\r\n"));

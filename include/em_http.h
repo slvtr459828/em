@@ -10,12 +10,12 @@
  * Transfer-Encoding other than "chunked" 501; Expect other than 100-continue 417; a
  * Content-Length over max_body_bytes 413; a folded header line (obs-fold) 400; a header block
  * over max_header_bytes 431.
- * Not here: TLS (tls must be NULL), streamed responses (one em_http_respond per request). */
+ * Plain or TLS (see em_http_serve). Not here: streamed responses (one em_http_respond per request). */
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
 
-typedef struct em_tls em_tls; /* same type as em_tls.h; must be NULL until TLS lands */
+typedef struct em_tls em_tls; /* same type as em_tls.h */
 
 /* Layout is that of picohttpparser's phr_header (checked in http.c). */
 typedef struct em_http_header {
@@ -47,6 +47,16 @@ typedef struct em_http_cfg {
     int64_t  idle_timeout_ns;         /* wait for the next request on a kept connection, and each
                                        * wait for body bytes; default 60 s; -1 = none. Expiry
                                        * between requests: close without a response */
+    int64_t  send_timeout_ns;         /* a send that moves no byte for this long drops the
+                                       * connection (like nginx send_timeout: a big response to a
+                                       * slow reader that keeps taking data is not cut); default
+                                       * 60 s; -1 = none. Applies to every send serve makes: the
+                                       * response, 100 Continue, error answers. Under TLS each
+                                       * send is at most 64 KiB (em_tls_send_all has no partial
+                                       * result) and has its own deadline, and an expiry breaks the
+                                       * em_tls (its calls then return -EPIPE: close it). No partial
+                                       * response is followed by anything: serve returns -ETIMEDOUT,
+                                       * em_http_respond returns it to the handler first */
 } em_http_cfg;
 
 /* Answers the current request with one response; at most once per request. Adds the status
@@ -80,9 +90,25 @@ ssize_t em_http_read_body(em_http_conn *c, void *buf, size_t len);
 typedef int (*em_http_handler)(em_http_conn *c, const em_http_req *r, void *arg);
 
 /* Serves fd until the peer closes (0), the connection must close (0), or an error (-errno:
- * -ECANCELED/-ETIMEDOUT from the scope, a send/recv error, -ECONNRESET if the peer closed in
- * the middle of a request, the handler's value). Does not close fd. One read buffer per call,
- * nothing allocated per request. tls must be NULL (-ENOTSUP otherwise). */
+ * -ECANCELED/-ETIMEDOUT from the scope or send_timeout, a send/recv error, -ECONNRESET if the peer
+ * closed in the middle of a request, the handler's value). Does not close fd. One read buffer per
+ * call, nothing allocated per request.
+ *
+ * tls: NULL = plain TCP. Otherwise the caller already ran em_tls_accept on fd; serve reads and
+ * writes through em_tls_recv / em_tls_send_all and never sends close_notify, shuts down, frees or
+ * closes it: that stays with the caller. Passing a non-NULL tls requires linking libem_tls (libem_http
+ * itself does not reference OpenSSL: a plain-only program links without it). Over TLS a TCP close
+ * without close_notify between two requests ends serve with 0, not -ECONNRESET.
+ *
+ * Lingering close: when serve ends the connection while the peer may still be sending request
+ * bytes it will not read (413 before the handler; 400/431/501/417 on a request still arriving; a
+ * 500 or a Connection: close answer over an unread body; requests already pipelined behind the last
+ * one max_requests_per_conn allows), close() by the caller would make the kernel
+ * send RST and the client could lose the response. So after the final response serve calls
+ * shutdown(fd, SHUT_WR) on the raw fd and discards what the peer sends until it closes, 2 s or
+ * 1 MiB (whichever first; the caller's scope cancel or deadline also ends it). Under TLS those are
+ * raw bytes and the write side is shut, so a close_notify sent afterwards fails: ignore it. Not
+ * done for normal closes (request fully read), idle and header timeouts, or peer EOF/errors. */
 int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h, void *arg);
 
 #endif

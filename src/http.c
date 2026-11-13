@@ -23,9 +23,24 @@
 #define DEF_HDR_TO 30000000000ll
 #define DEF_IDLE   60000000000ll
 #define DRAIN_MAX  65536u   /* an unread Content-Length remainder up to this is drained and the connection kept */
+#define DEF_SEND   60000000000ll
+#define TLS_CHUNK  65536u   /* em_tls_send_all reports nothing until it is done: bound what one deadline covers */
+/* Lingering close (see linger): a fiber held by a peer that may be hostile, so stricter than nginx
+ * (lingering_timeout 5 s, lingering_time 30 s). 2 s covers a client reacting to the response over a
+ * slow link; 1 MiB is the in-flight data of one RTT at a few hundred Mbit/s, past that it is a flood. */
+#define LINGER_NS  2000000000ll
+#define LINGER_MAX (1u << 20)
+
+/* em_tls.h pulls in OpenSSL, which a plain-HTTP user need not have, so the two calls made here are
+ * declared again, weak: tls != NULL means the caller got it from em_tls_accept and so linked
+ * libem_tls, which binds them; with tls == NULL they are never reached. Keep in step with em_tls.h. */
+ssize_t em_tls_recv(em_tls *t, void *buf, size_t len) __attribute__((weak));
+int     em_tls_send_all(em_tls *t, const void *buf, size_t len) __attribute__((weak));
 
 struct em_http_conn {
     int     fd;
+    em_tls *tls;        /* NULL = plain */
+    int64_t send_ns;    /* 0 = none */
     int     minor;      /* current request */
     int     keep;       /* current request: connection stays open after its response */
     int     responded;
@@ -123,11 +138,30 @@ static char *put_u64(char *p, uint64_t v)
     return p;
 }
 
+/* Every send serve makes. The deadline is per call that makes progress, not per response: a
+ * slow reader that keeps taking bytes is never cut, one that takes none for send_ns is (-ETIMEDOUT,
+ * ours or the caller's scope: both end the connection the same way). TLS goes in TLS_CHUNK pieces. */
+static int send_all(em_http_conn *c, const char *p, size_t len)
+{
+    while (len) {
+        size_t n = c->tls && len > TLS_CHUNK ? TLS_CHUNK : len;
+        em_scope s;
+        if (c->send_ns) em_scope_open(&s, em_now() + c->send_ns);
+        ssize_t r = c->tls ? em_tls_send_all(c->tls, p, n) : em_send(c->fd, p, n);
+        if (c->send_ns) em_scope_close(&s); /* no children: nothing to wait for */
+        if (r < 0) return (int)r;
+        if (c->tls) r = (ssize_t)n;
+        p += r;
+        len -= (size_t)r;
+    }
+    return 0;
+}
+
 static int flush(em_http_conn *c)
 {
     if (c->err) return c->err;
     if (c->wlen) {
-        int r = em_send_all(c->fd, c->wbuf, c->wlen);
+        int r = send_all(c, c->wbuf, c->wlen);
         c->wlen = 0;
         if (r < 0) return c->err = r;
     }
@@ -185,7 +219,7 @@ int em_http_respond(em_http_conn *c, int status, const em_http_header *h, size_t
         c->wlen = (size_t)(p - c->wbuf);
         int r = flush(c);
         if (r < 0) return r;
-        if ((r = em_send_all(c->fd, body, len)) < 0) return c->err = r;
+        if ((r = send_all(c, body, len)) < 0) return c->err = r;
     }
     c->responded = 1;
     return 0;
@@ -280,13 +314,18 @@ static int fail(em_http_conn *c, int status, int minor)
 /* em_recv that gives up at the absolute deadline dl (0 = none) through a scope. *own = the error
  * is -ETIMEDOUT and it is ours: the effective deadline is the min of dl and the caller's, so ours
  * fired only if it is strictly earlier. The caller's -ETIMEDOUT / -ECANCELED stay theirs. */
-static ssize_t wait_recv(int fd, void *buf, size_t len, int64_t dl, int *own)
+static ssize_t recv_some(const em_http_conn *c, void *buf, size_t len)
+{
+    return c->tls ? em_tls_recv(c->tls, buf, len) : em_recv(c->fd, buf, len);
+}
+
+static ssize_t wait_recv(const em_http_conn *c, void *buf, size_t len, int64_t dl, int *own)
 {
     *own = 0;
-    if (!dl) return em_recv(fd, buf, len);
+    if (!dl) return recv_some(c, buf, len);
     em_scope s;
     em_scope_open(&s, dl);
-    ssize_t n = em_recv(fd, buf, len);
+    ssize_t n = recv_some(c, buf, len);
     if (n == -ETIMEDOUT) *own = !s.parent->deadline || dl < s.parent->deadline;
     em_scope_close(&s); /* no children: nothing to wait for */
     return n;
@@ -334,7 +373,7 @@ ssize_t em_http_read_body(em_http_conn *c, void *buf, size_t len)
             return (ssize_t)n;
         }
         int own;
-        ssize_t n = wait_recv(c->fd, buf, want, idle_deadline(c), &own); /* straight into buf, never past the body */
+        ssize_t n = wait_recv(c, buf, want, idle_deadline(c), &own); /* straight into buf, never past the body */
         if (n <= 0) return body_fail(c, n ? n : -ECONNRESET, own);
         c->body_left -= n;
         return n;
@@ -356,7 +395,7 @@ ssize_t em_http_read_body(em_http_conn *c, void *buf, size_t len)
             c->bpos += n;
         } else {
             int own;
-            ssize_t r = wait_recv(c->fd, c->cw, batch, idle_deadline(c), &own);
+            ssize_t r = wait_recv(c, c->cw, batch, idle_deadline(c), &own);
             if (r <= 0) return body_fail(c, r ? r : -ECONNRESET, own);
             n = (size_t)r;
         }
@@ -396,7 +435,7 @@ static int finish_body(em_http_conn *c, size_t *rpos)
     c->rlen = *rpos = 0; /* the head is dead: rbuf is scratch */
     while (skip) {
         int own;
-        ssize_t n = wait_recv(c->fd, c->rbuf, (uint64_t)skip < c->rcap ? (size_t)skip : c->rcap,
+        ssize_t n = wait_recv(c, c->rbuf, (uint64_t)skip < c->rcap ? (size_t)skip : c->rcap,
                               idle_deadline(c), &own);
         if (n < 0) return own ? 1 : (int)n;
         if (!n) return -ECONNRESET;
@@ -405,17 +444,42 @@ static int finish_body(em_http_conn *c, size_t *rpos)
     return 0;
 }
 
-int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h, void *arg)
+/* The peer may still be sending request bytes that nobody will read (a body the handler left
+ * unread, or a chunked one that broke), as opposed to being gone or stalled. */
+static int unread(const em_http_conn *c)
 {
-    if (tls) return -ENOTSUP;
-    size_t rcap = cfg && cfg->max_header_bytes ? cfg->max_header_bytes : DEF_RBUF;
+    if (c->rerr && c->rerr != -EMSGSIZE && c->rerr != -EPROTO) return 0;
+    return c->chunked ? !c->cdone : c->expect || c->body_left > (int64_t)(c->bend - c->bpos);
+}
+
+/* Lingering close, after the final response was flushed and only when unread(): close() with
+ * unread bytes in the socket makes the kernel send RST, which can destroy the response before the
+ * client reads it. So send FIN after the response (SHUT_WR), then discard what the peer still sends
+ * until it ends, LINGER_NS or LINGER_MAX. Raw bytes on the fd, also under TLS (records are not
+ * parsed, no close_notify is sent: the write side is already shut). The caller still closes. */
+static void linger(em_http_conn *c)
+{
+    if (em_shutdown(c->fd, SHUT_WR) < 0) return;
+    em_scope s;
+    em_scope_open(&s, em_now() + LINGER_NS); /* the caller's cancel and deadline still end it earlier */
+    for (size_t left = LINGER_MAX; left; ) {
+        ssize_t n = em_recv(c->fd, c->cw, left < CWIN_BYTES ? left : CWIN_BYTES); /* cw is free here */
+        if (n <= 0) break;
+        left -= (size_t)n;
+    }
+    em_scope_close(&s);
+}
+
+int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h, void *arg)
+{    size_t rcap = cfg && cfg->max_header_bytes ? cfg->max_header_bytes : DEF_RBUF;
     size_t maxh = cfg && cfg->max_headers ? cfg->max_headers : DEF_HDRS;
     unsigned maxreq = cfg ? cfg->max_requests_per_conn : 0;
     int64_t hto = !cfg || !cfg->header_timeout_ns ? DEF_HDR_TO : cfg->header_timeout_ns;
     int64_t ito = !cfg || !cfg->idle_timeout_ns ? DEF_IDLE : cfg->idle_timeout_ns;
+    int64_t sto = !cfg || !cfg->send_timeout_ns ? DEF_SEND : cfg->send_timeout_ns;
     struct phr_header *hs = malloc(maxh * sizeof *hs + WBUF_BYTES + CWIN_BYTES + rcap);
     if (!hs) return -ENOMEM;
-    em_http_conn c = { .fd = fd, .wbuf = (char *)(hs + maxh), .rcap = rcap,
+    em_http_conn c = { .fd = fd, .tls = tls, .send_ns = sto > 0 ? sto : 0, .wbuf = (char *)(hs + maxh), .rcap = rcap,
                        .idle_ns = ito > 0 ? ito : 0,
                        .max_body = cfg && cfg->max_body_bytes ? cfg->max_body_bytes : 1u << 20 };
     c.cw = c.wbuf + WBUF_BYTES;
@@ -424,6 +488,7 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
     int64_t hdr_dl = 0;        /* deadline of the head being received, 0 = not started or none */
     unsigned nreq = 0;
     int ret = 0;
+    int lng = 0;               /* close lingers: the peer may still be sending */
 
     for (;;) {
         /* 1. one complete request head in rbuf[rpos..] */
@@ -433,10 +498,10 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
         size_t avail = c.rlen - rpos;
         if (avail) {
             pret = phr_parse_request(rbuf + rpos, avail, &m, &ml, &path, &pl, &minor, hs, &nh, last);
-            if (pret == -1) { ret = fail(&c, 400, 1); break; }
+            if (pret == -1) { ret = fail(&c, 400, 1); lng = 1; break; }
         }
         if (pret == -2) {
-            if (avail == rcap) { ret = fail(&c, 431, 1); break; }
+            if (avail == rcap) { ret = fail(&c, 431, 1); lng = 1; break; }
             last = avail;
             /* About to wait: nothing queued may sit behind a read. */
             if ((ret = flush(&c)) < 0) break;
@@ -449,8 +514,13 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
                 dl = hdr_dl;
             }
             int own;
-            ssize_t n = wait_recv(fd, rbuf + c.rlen, rcap - c.rlen, dl, &own);
-            if (n < 0) { ret = !own ? (int)n : avail ? fail(&c, 408, 1) : 0; break; }
+            ssize_t n = wait_recv(&c, rbuf + c.rlen, rcap - c.rlen, dl, &own);
+            if (n < 0) {
+                /* TCP closed without close_notify between requests: harmless (HTTP frames its own
+                 * messages), and em_tls_recv cannot tell it from a reset */
+                if (tls && n == -ECONNRESET && !avail) n = 0;
+                else { ret = !own ? (int)n : avail ? fail(&c, 408, 1) : 0; break; }
+            }
             if (n == 0) { ret = avail ? -ECONNRESET : 0; break; }
             c.rlen += (size_t)n;
             continue;
@@ -462,7 +532,7 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
         int keep, expect;
         int64_t cl;
         int st = inspect(hs, nh, minor, c.max_body, &keep, &cl, &expect);
-        if (st) { ret = fail(&c, st, minor); break; }
+        if (st) { ret = fail(&c, st, minor); lng = 1; break; }
         if (maxreq && ++nreq >= maxreq) keep = 0;
 
         /* 3. the handler */
@@ -488,6 +558,7 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
         if (hr || !c.responded) {
             /* answered, then failed: that answer stands, no second one; then close */
             int stt = 0;
+            lng = unread(&c);
             if (c.responded) ret = flush(&c);
             else if (c.rerr) { /* a body error the handler left unanswered */
                 stt = c.rerr == -EMSGSIZE ? 413 : c.rerr == -EPROTO ? 400 : c.rerr == -ETIMEDOUT && c.rown ? 408 : 0;
@@ -496,15 +567,13 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
             if (ret >= 0) ret = hr ? hr : !c.rerr ? -EPROTO : stt ? 0 : c.rerr;
             break;
         }
-        if (!c.keep) break;
+        /* bytes past this request already buffered: the client is pipelining and may still send */
+        if (!c.keep) { lng = unread(&c) || (!c.chunked && c.rlen > c.bend); break; }
         int fb = finish_body(&c, &rpos);
         if (fb) { ret = fb < 0 ? fb : 0; break; }
     }
     if (ret >= 0) { int r = flush(&c); if (r < 0) ret = r; } /* the last response(s) */
-    /* DEBT: no lingering close. When we close with request bytes still unread (413 before the
-     * handler, Connection: close over an unread body), the caller's close() makes the kernel send
-     * RST, and a client still sending can lose the response it has not read yet. Remove when serve
-     * drains (bounded in bytes and time) before returning, which needs a real user to size it. */
+    if (lng && !c.err) linger(&c);
     free(hs);
     return ret;
 }

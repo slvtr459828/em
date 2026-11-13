@@ -13,44 +13,44 @@ static int main_fn(void *arg)
 
     /* the handler reads: 100 first (only the headers are sent), once, then the answer; kept */
     r = rd_open(port);
-    send_str(r->fd, "POST /echo HTTP/1.1\r\nExpect: 100-Continue\r\nContent-Length: 12\r\n\r\n");
+    send_str(r, "POST /echo HTTP/1.1\r\nExpect: 100-Continue\r\nContent-Length: 12\r\n\r\n");
     expect_100(r);
-    send_str(r->fd, "hello, world");
+    send_str(r, "hello, world");
     expect_resp(r, "HTTP/1.1 200 ", "hello, world", NULL); /* no second 100 in front of it */
-    send_str(r->fd, "POST /echo HTTP/1.1\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n");
+    send_str(r, "POST /echo HTTP/1.1\r\nExpect: 100-continue\r\nTransfer-Encoding: chunked\r\n\r\n");
     expect_100(r);
-    send_str(r->fd, "3\r\nabc\r\n0\r\n\r\n");
+    send_str(r, "3\r\nabc\r\n0\r\n\r\n");
     expect_resp(r, "HTTP/1.1 200 ", "abc", NULL);
     /* a pipelined answer still queued goes out before the 100 */
-    send_str(r->fd, "GET /a HTTP/1.1\r\n\r\nPOST /echo HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n");
+    send_str(r, "GET /a HTTP/1.1\r\n\r\nPOST /echo HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\n");
     expect_resp(r, "HTTP/1.1 200 ", "GET /a", NULL);
     expect_100(r);
-    send_str(r->fd, "xyz");
+    send_str(r, "xyz");
     expect_resp(r, "HTTP/1.1 200 ", "xyz", NULL);
     rd_close(r);
 
     /* the handler does not read: no 100 at all, Connection: close */
     r = rd_open(port);
-    send_str(r->fd, "POST /noread HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n");
+    send_str(r, "POST /noread HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\n");
     expect_resp(r, "HTTP/1.1 200 ", "noread", "close");
     expect_eof(r);
     rd_close(r);
 
     /* another Expect value: 417 and close, handler not run */
     r = rd_open(port);
-    send_str(r->fd, "POST /echo HTTP/1.1\r\nExpect: foo\r\nContent-Length: 5\r\n\r\nhello");
+    send_str(r, "POST /echo HTTP/1.1\r\nExpect: foo\r\nContent-Length: 5\r\n\r\nhello");
     expect_resp(r, "HTTP/1.1 417 ", "", "close");
     expect_eof(r);
     rd_close(r);
     r = rd_open(port);
-    send_str(r->fd, "GET / HTTP/1.0\r\nExpect: 100-continue, x\r\n\r\n");
+    send_str(r, "GET / HTTP/1.0\r\nExpect: 100-continue, x\r\n\r\n");
     expect_resp(r, "HTTP/1.0 417 ", "", "close");
     expect_eof(r);
     rd_close(r);
 
     /* HTTP/1.0: no 100, the body is read as usual */
     r = rd_open(port);
-    send_str(r->fd, "POST /echo HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc");
+    send_str(r, "POST /echo HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc");
     expect_resp(r, "HTTP/1.0 200 ", "abc", "close");
     expect_eof(r);
     rd_close(r);

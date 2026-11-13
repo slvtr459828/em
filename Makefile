@@ -9,9 +9,11 @@ TESTS := tests/t1_pingpong tests/t2_churn tests/t3_many tests/t4_guard tests/t5_
   tests/t24_fairness tests/t25_udp_waiters tests/t26_close_wakes tests/t27_backend_env tests/t28_timer_heap tests/t29_fd_reuse tests/t30_outside tests/t31_short_read \
   tests/t32_offload_nostall tests/t33_offload_thread tests/t34_offload_nocancel tests/t35_offload_cap \
   tests/t36_resolve tests/t37_resolve_abandon tests/t38_file_read tests/t39_yield_poll tests/t57_deadline_timer
-# em_http (libem_http.a, tests t50..): no OpenSSL needed in M1.
+# em_http (libem_http.a, tests t50..): plain tests need no OpenSSL; with it each also runs over TLS
+# (HTTP_TLS_TESTS: the same source built with -DHTTP_TLS, see tests/http_util.h).
 HTTP_TESTS := tests/t50_http_keepalive tests/t51_http_pipeline tests/t52_http_reject \
-  tests/t53_http_workers tests/t54_http_body tests/t55_http_expect tests/t56_http_timeout
+  tests/t53_http_workers tests/t54_http_body tests/t55_http_expect tests/t56_http_timeout \
+  tests/t58_http_send_timeout tests/t59_http_linger
 TESTS += $(HTTP_TESTS)
 
 # em_tls (libem_tls.a, tests t40..t46) needs OpenSSL. Without it libem and its tests still build;
@@ -41,7 +43,8 @@ endif
 ifeq ($(TLS_FOUND),yes)
 TLS_TESTS := tests/t40_tls_echo tests/t41_tls_duplex tests/t42_tls_verify tests/t43_tls_truncate \
   tests/t44_tls_cancel tests/t45_tls_workers tests/t46_tls_recv_noblock
-TESTS     += $(TLS_TESTS)
+HTTP_TLS_TESTS := $(addsuffix _tls,$(HTTP_TESTS))
+TESTS     += $(TLS_TESTS) $(HTTP_TLS_TESTS)
 endif
 
 # picohttpparser picks SSE4.2 at compile time. Default is portable; HTTP_SSE42=1 adds -msse4.2 to
@@ -96,6 +99,9 @@ $(1)/libem_tls.a: $(1)/tls.o
 	rm -f $$@ && ar rcs $$@ $$^
 $(addprefix $(1)/,$(notdir $(TLS_TESTS))): $(1)/%: tests/%.c tests/tls_util.h $(1)/libem_tls.a $(1)/libem.a
 	$(CC) $(2) $(TLS_CF) -Isrc $$< $(1)/libem_tls.a $(1)/libem.a $(TLS_LIBS) -luring -lm -lpthread -o $$@
+# libem_http.a only declares em_tls_recv / em_tls_send_all weak: libem_tls.a comes through the test's own references
+$(addprefix $(1)/,$(notdir $(HTTP_TLS_TESTS))): $(1)/%_tls: tests/%.c tests/http_util.h tests/tls_util.h include/em_http.h $(1)/libem_http.a $(1)/libem_tls.a $(1)/libem.a
+	$(CC) $(2) -DHTTP_TLS $(TLS_CF) $$< $(1)/libem_http.a $(1)/libem_tls.a $(1)/libem.a $(TLS_LIBS) -luring -lm -lpthread -o $$@
 endif
 endef
 $(eval $(call rules,$(B_REL),$(CF_REL)))
@@ -107,7 +113,7 @@ BACKENDS ?= uring epoll
 run_tests = set -e; for b in $(BACKENDS); do echo "=== EM_BACKEND=$$b"; \
   for t in $(notdir $(TESTS)); do echo "== $$t"; EM_BACKEND=$$b $(1)/$$t; done; done
 
-no_tls_msg = $(if $(TLS_TESTS),,@echo "SKIPPED: TLS tests t40..t46 and libem_tls (openssl not found by $(PKG_CONFIG))")
+no_tls_msg = $(if $(TLS_TESTS),,@echo "SKIPPED: TLS tests t40..t46, the HTTP tests over TLS and libem_tls (openssl not found by $(PKG_CONFIG))")
 
 test: $(addprefix $(B_REL)/,$(notdir $(TESTS)))
 	$(no_tls_msg)
@@ -130,11 +136,11 @@ bench-em: $(B_REL)/em_echo
 $(B_REL)/em_echo: bench/em_echo.c $(B_REL)/libem.a
 	$(CC) $(CF_REL) $< $(B_REL)/libem.a -luring -lm -lpthread -o $@
 
-bench-em-http: $(B_REL)/em_http
-$(B_REL)/em_http: bench/em_http.c $(B_REL)/libem_http.a $(B_REL)/libem.a
-	$(CC) $(CF_REL) $< $(B_REL)/libem_http.a $(B_REL)/libem.a -luring -lm -lpthread -o $@
-
 ifdef TLS_TESTS
+# bench/em_http.c has a TLS mode (tests/tls_util.h), so it needs OpenSSL and libem_tls
+bench-em-http: $(B_REL)/em_http
+$(B_REL)/em_http: bench/em_http.c tests/tls_util.h $(B_REL)/libem_http.a $(B_REL)/libem_tls.a $(B_REL)/libem.a
+	$(CC) $(CF_REL) $(TLS_CF) -Isrc $< $(B_REL)/libem_http.a $(B_REL)/libem_tls.a $(B_REL)/libem.a $(TLS_LIBS) -luring -lm -lpthread -o $@
 bench-em-tls: $(B_REL)/em_tls_echo
 $(B_REL)/em_tls_echo: bench/em_tls_echo.c tests/tls_util.h $(B_REL)/libem_tls.a $(B_REL)/libem.a
 	$(CC) $(CF_REL) $(TLS_CF) -Isrc $< $(B_REL)/libem_tls.a $(B_REL)/libem.a $(TLS_LIBS) -luring -lm -lpthread -o $@

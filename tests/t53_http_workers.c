@@ -23,7 +23,7 @@ static int client(void *arg)
         char req[96], body[64];
         snprintf(req, sizeof req, "GET /w%d/%d/%d HTTP/1.1\r\nHost: x\r\n\r\n", wid, (int)id, i);
         snprintf(body, sizeof body, "GET /w%d/%d/%d", wid, (int)id, i);
-        send_str(r->fd, req);
+        send_str(r, req);
         expect_resp(r, "HTTP/1.1 200 ", body, NULL);
     }
     rd_close(r);

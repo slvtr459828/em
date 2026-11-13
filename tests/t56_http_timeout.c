@@ -39,7 +39,7 @@ static int main_fn(void *arg)
     /* slowloris: a partial head that stalls -> 408 + close, measured from the first byte */
     r = rd_open(port);
     t0 = em_now();
-    send_str(r->fd, "GET /slow HTTP/1.1\r\nHo");
+    send_str(r, "GET /slow HTTP/1.1\r\nHo");
     expect_resp(r, "HTTP/1.1 408 ", "", "close");
     expect_eof(r);
     assert(since(t0) >= 90 && since(t0) < 2000);
@@ -48,8 +48,8 @@ static int main_fn(void *arg)
     /* a drip that keeps the connection "active" still hits the head deadline */
     r = rd_open(port);
     t0 = em_now();
-    send_str(r->fd, "GET /drip HTTP/1.1\r\n");
-    for (int i = 0; i < 2; i++) { assert(em_sleep_until(em_now() + 40 * MS) == 0); send_str(r->fd, "X: y\r\n"); }
+    send_str(r, "GET /drip HTTP/1.1\r\n");
+    for (int i = 0; i < 2; i++) { assert(em_sleep_until(em_now() + 40 * MS) == 0); send_str(r, "X: y\r\n"); }
     expect_resp(r, "HTTP/1.1 408 ", "", "close");
     expect_eof(r);
     rd_close(r);
@@ -57,19 +57,19 @@ static int main_fn(void *arg)
     /* a head that arrives in time is fine, however long the idle gap before it (idle is 10 s here);
      * the clock starts at its first byte, not at the previous response */
     r = rd_open(port);
-    send_str(r->fd, "GET /a HTTP/1.1\r\n\r\n");
+    send_str(r, "GET /a HTTP/1.1\r\n\r\n");
     expect_resp(r, "HTTP/1.1 200 ", "GET /a", NULL);
     assert(em_sleep_until(em_now() + 150 * MS) == 0);
-    send_str(r->fd, "GET /b HTTP/1.1\r\n\r\n");
+    send_str(r, "GET /b HTTP/1.1\r\n\r\n");
     expect_resp(r, "HTTP/1.1 200 ", "GET /b", NULL);
     rd_close(r);
 
     /* header_timeout -1: a partial head waits (idle_timeout does not apply to it either) */
     http_cfg.header_timeout_ns = -1;
     r = rd_open(port);
-    send_str(r->fd, "GET /h HTTP/1.1\r\nHo");
+    send_str(r, "GET /h HTTP/1.1\r\nHo");
     assert(em_sleep_until(em_now() + 200 * MS) == 0);
-    send_str(r->fd, "st: x\r\n\r\n");
+    send_str(r, "st: x\r\n\r\n");
     expect_resp(r, "HTTP/1.1 200 ", "GET /h", NULL);
     rd_close(r);
 
@@ -77,7 +77,7 @@ static int main_fn(void *arg)
     http_cfg.header_timeout_ns = 10000 * MS;
     http_cfg.idle_timeout_ns = 100 * MS;
     r = rd_open(port);
-    send_str(r->fd, "GET /a HTTP/1.1\r\n\r\n");
+    send_str(r, "GET /a HTTP/1.1\r\n\r\n");
     expect_resp(r, "HTTP/1.1 200 ", "GET /a", NULL);
     t0 = em_now();
     expect_eof(r);
@@ -92,29 +92,29 @@ static int main_fn(void *arg)
     /* stall in the middle of a body (both framings): 408 + close; a slow but steady body passes */
     r = rd_open(port);
     t0 = em_now();
-    send_str(r->fd, "POST /echo HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc");
+    send_str(r, "POST /echo HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc");
     expect_resp(r, "HTTP/1.1 408 ", "", "close");
     expect_eof(r);
     assert(since(t0) >= 90 && since(t0) < 2000);
     rd_close(r);
     r = rd_open(port);
-    send_str(r->fd, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n");
+    send_str(r, "POST /echo HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n");
     expect_resp(r, "HTTP/1.1 408 ", "", "close");
     expect_eof(r);
     rd_close(r);
     r = rd_open(port); /* Expect: the wait for the body starts at the 100 */
-    send_str(r->fd, "POST /echo HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n");
+    send_str(r, "POST /echo HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 4\r\n\r\n");
     expect_100(r);
     expect_resp(r, "HTTP/1.1 408 ", "", "close");
     rd_close(r);
     r = rd_open(port);
-    send_str(r->fd, "POST /echo HTTP/1.1\r\nContent-Length: 6\r\n\r\n");
-    for (int i = 0; i < 6; i++) { assert(em_sleep_until(em_now() + 40 * MS) == 0); send_str(r->fd, "x"); }
+    send_str(r, "POST /echo HTTP/1.1\r\nContent-Length: 6\r\n\r\n");
+    for (int i = 0; i < 6; i++) { assert(em_sleep_until(em_now() + 40 * MS) == 0); send_str(r, "x"); }
     expect_resp(r, "HTTP/1.1 200 ", "xxxxxx", NULL); /* 240 ms in all, no single gap near 100 ms */
     rd_close(r);
     /* a stall while the unread body is drained: closed without a second answer */
     r = rd_open(port);
-    send_str(r->fd, "POST /noread HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc");
+    send_str(r, "POST /noread HTTP/1.1\r\nContent-Length: 10\r\n\r\nabc");
     expect_resp(r, "HTTP/1.1 200 ", "noread", NULL);
     expect_eof(r);
     rd_close(r);
