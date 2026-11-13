@@ -188,3 +188,26 @@ Server ghim 1 CPU. So em-http (uring và epoll) với nginx, haproxy, h2o (cả 
     - arm 1024 epoll: 7,766 us so với 10,944 us.
   - THUA ở đây đến từ độ trải: p50 của em quá nhỏ nên jitter cố định của scheduler làm tỉ số phình lên, không phải em chậm hơn.
 - Bytes mỗi response (`/`): haproxy 78, em 115, nginx/h2o 170. haproxy gửi ít byte nhất mà vẫn thua về CPU.
+
+### M2 trên CI (run 43361502819, commit 2dd7422, 9 vòng, x86 + arm64, `HTTP_SSE42=1` trên x86)
+
+Cùng bố cục với M1. em-http lần này bật timeout mặc định: header 30 s, idle 60 s. Trên uring, deadline đi qua heap của worker, mỗi worker giữ đúng 1 kernel timeout (2dd7422).
+
+- **CPU mỗi request (us/rt):** vẫn không có ô THUA nào, trên mọi đối thủ và cả hai kiến trúc.
+- **Tỉ lệ em/nginx so với M1:**
+  - **uring:** trong khoảng nhiễu giữa hai run, ±0.03 ở x86 và +0.02–0.08 ở arm.
+  - **epoll:** đắt hơn ở các ô nhiều kết nối:
+    - keep-alive 1024: x86 0.73 → 0.81, arm 0.72 → 0.81;
+    - churn arm: 0.86 → 0.94.
+  - Nguyên nhân là timeout mới: mỗi lần recv phải chờ thì push/remove vào heap có tới 1024 phần tử. Đây là trade-off của việc bật timeout mặc định, không phải nợ. Xét lại nếu epoll ở ≥1k kết nối trở thành mục tiêu.
+- **THUA theo luật, chỉ ở trục p99/p50:**
+  - **x86:** pipeline 16 / 16 conns so với h2o, uring 1.09 và epoll 1.08. M1 cũng có ô này (1.06 / 1.05).
+  - **arm:**
+    - pipeline 16 / 256 conns: uring so với haproxy 1.06, so với h2o 1.15; epoll so với h2o 1.14.
+    - churn epoll: so với nginx 1.06, so với haproxy 1.05.
+  - **p99 tuyệt đối của em vẫn thấp nhất ở mọi ô THUA:**
+    - pipeline arm 256: em 2,310–2,638 us; đối thủ 20,578–48,759 us.
+    - churn arm epoll: em 1,212 us; nginx 1,221 us; haproxy 1,475 us.
+  - Như M1, các ô này THUA vì p50 của em quá nhỏ nên tỉ số p99/p50 phình ra.
+  - Ô M1 "arm keep-alive 1024 epoll" giờ không còn THUA.
+- **Thông lượng pipeline 16:** gấp 16–20x nginx, 9–13x h2o.
