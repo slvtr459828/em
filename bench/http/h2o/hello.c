@@ -3,7 +3,9 @@
 // Why a libh2o program, not the h2o binary: h2o serves a file per request (open/fstat/read) and mruby
 // adds an interpreter, so either would charge h2o for something em_http, nginx `return` and haproxy
 // `return` do from memory. Here the body is a static buffer handed to h2o_send: no copy, no file.
-// usage: h2o_hello port [workers]   (workers is accepted for the common launch line; h2o runs 1 thread)
+// usage: h2o_hello port [workers [cert.pem key.pem]]   (workers is accepted for the common launch line; h2o runs 1 thread)
+// With the two PEM files (bench/http/cert.sh) the listener is TLS: OpenSSL, TLS 1.2+, TLS 1.3 suite AES-256-GCM only,
+// group X25519 only, no ALPN (so HTTP/1.1, never h2): the policy bench/http/nginx.sh and haproxy.sh pin too.
 // GET / -> "Hello, World!" (13 B), GET /4k -> 4096 B, both text/plain with Content-Length; else 404.
 #include <errno.h>
 #include <netinet/in.h>
@@ -55,8 +57,8 @@ static void on_accept(h2o_socket_t *listener, const char *err)
 
 int main(int argc, char **argv)
 {
-    if (argc < 2) {
-        fprintf(stderr, "usage: %s port [workers]\n", argv[0]);
+    if (argc < 2 || argc == 4 || argc > 5) {
+        fprintf(stderr, "usage: %s port [workers [cert.pem key.pem]]\n", argv[0]);
         return 2;
     }
     memset(big, 'x', sizeof(big));
@@ -70,6 +72,16 @@ int main(int argc, char **argv)
     h2o_context_init(&ctx, h2o_evloop_create(), &config);
     accept_ctx.ctx = &ctx;
     accept_ctx.hosts = config.hosts;
+    if (argc == 5) {
+        SSL_CTX *ssl = SSL_CTX_new(TLS_server_method());
+        if (ssl == NULL || SSL_CTX_use_certificate_chain_file(ssl, argv[3]) != 1 ||
+            SSL_CTX_use_PrivateKey_file(ssl, argv[4], SSL_FILETYPE_PEM) != 1 || SSL_CTX_set_min_proto_version(ssl, TLS1_2_VERSION) != 1 ||
+            SSL_CTX_set_ciphersuites(ssl, "TLS_AES_256_GCM_SHA384") != 1 || SSL_CTX_set1_groups_list(ssl, "X25519") != 1) {
+            fprintf(stderr, "h2o_hello: TLS setup failed (cert %s, key %s)\n", argv[3], argv[4]);
+            return 1;
+        }
+        accept_ctx.ssl_ctx = ssl;
+    }
 
     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(atoi(argv[1])), .sin_addr.s_addr = htonl(0x7f000001)};
     int one = 1, fd = socket(AF_INET, SOCK_STREAM, 0);

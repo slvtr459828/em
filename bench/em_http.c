@@ -1,19 +1,24 @@
-/* HTTP server for the bench: argv[1] = port, argv[2] = workers (default 1). Same shape as
- * em_echo: each worker listens with SO_REUSEPORT, one fiber per connection.
+/* HTTP server for the bench: argv[1] = port, argv[2] = workers (default 1), argv[3] = "tls" for
+ * HTTP over em_tls. Same shape as em_echo / em_tls_echo: each worker listens with SO_REUSEPORT,
+ * one fiber per connection. TLS: the certificate is generated at startup (tests/tls_util.h); the
+ * bench client accepts any certificate.
  * GET /   -> 200 text/plain "Hello, World!" (13 B)
  * GET /4k -> 200 text/plain 4096 x 'a'
  * POST /echo -> 200, the request body back (tests/http_curl.sh; not a bench cell)
  * else    -> 404 */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "../include/em.h"
 #include "../include/em_http.h"
+#include "../tests/tls_util.h"
 
 static struct sockaddr_in addr;
 static char body4k[4096];
+static SSL_CTX *sctx; /* NULL = plain */
 
 static const em_http_cfg cfg = { .max_body_bytes = 16u << 20 }; /* /echo takes up to 16 MiB */
 
@@ -56,7 +61,19 @@ static int handle(em_http_conn *c, const em_http_req *r, void *arg)
 static int conn(void *arg)
 {
     int fd = (int)(intptr_t)arg;
-    em_http_serve(fd, NULL, &cfg, handle, NULL);
+    if (!sctx) {
+        em_http_serve(fd, NULL, &cfg, handle, NULL);
+    } else {
+        /* the server writes the session tickets, then the response: without NODELAY Nagle holds the
+         * response behind the unacked tickets (as in em_tls_echo.c) */
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &(int){ 1 }, sizeof(int));
+        em_tls *t;
+        if (em_tls_accept(&t, sctx, fd) == 0) {
+            em_http_serve(fd, t, &cfg, handle, NULL);
+            em_tls_shutdown(t);
+            em_tls_free(t);
+        }
+    }
     em_close(fd);
     return 0; /* a dropped connection must not cancel the others */
 }
@@ -82,11 +99,19 @@ static int worker(void *arg)
 
 int main(int argc, char **argv)
 {
-    if (argc < 2 || argc > 3) { fprintf(stderr, "usage: %s port [workers]\n", argv[0]); return 2; }
-    int workers = argc == 3 ? atoi(argv[2]) : 1;
+    if (argc < 2 || argc > 4 || (argc == 4 && strcmp(argv[3], "tls"))) {
+        fprintf(stderr, "usage: %s port [workers] [tls]\n", argv[0]);
+        return 2;
+    }
+    int workers = argc >= 3 ? atoi(argv[2]) : 1;
     addr = (struct sockaddr_in){ .sin_family = AF_INET, .sin_port = htons((uint16_t)atoi(argv[1])),
                                  .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
     memset(body4k, 'a', sizeof body4k);
+    if (argc == 4) {
+        SSL_CTX *cctx;
+        tls_test_ctx(&sctx, &cctx);
+        SSL_CTX_free(cctx);
+    }
     int r = em_run(workers, worker, NULL);
     if (r) fprintf(stderr, "em_run: %d\n", r);
     return r != 0;

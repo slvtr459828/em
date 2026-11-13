@@ -28,7 +28,7 @@ on:
         type: boolean
         default: false
       httponly:
-        description: "bench: only the HTTP cells (ONLY=http, plans/http.md): em-http-* vs nginx, haproxy, h2o; not with tlsonly; rivals does not apply; use rounds >= 9 for the verdicts"
+        description: "bench: only the HTTP cells, plain and TLS (ONLY=http, plans/http.md): em-http-* vs nginx, haproxy, h2o, hyper, Go net/http; not with tlsonly; rivals does not apply; use rounds >= 9 for the verdicts"
         type: boolean
         default: false
       rivals:
@@ -54,12 +54,13 @@ jobs:
     # cpp: 11 plain servers x 7 cells + 12 TLS servers x 4 cells - 1 (go-tls-epoll has no churntlsres) = 124 runs per
     #   round x 5 rounds x 11 s = ~114 min at the defaults; tlsonly 47 x 9 x 11 s = ~78 min + rss_tls (~8 min).
     # all: 18 x 7 + 17 x 4 - 1 = 193 runs per round x 5 x 11 s = ~177 min; tlsonly 67 x 9 x 11 s = ~111 min + rss_tls (~10 min).
-    # httponly: 5 servers x 8 cells x 9 rounds x ~11 s = ~66 min + build (Rust client ~10 min, em_http, h2o from source
-    # ~5 min cold; its build is cached) = well inside the 150 min of the default rivals. Keep rivals=rust with it.
+    # httponly: (7 servers x 8 plain cells + 7 TLS servers x 3 TLS cells) x 9 rounds x ~11.5 s = ~133 min + build (Rust
+    # client and hyper ~10 min, em_http, h2o from source ~5 min cold: its build is cached, the Go toolchain download is
+    # cached too) = ~148 min: over the 150 of the default rivals with no margin, so httponly has its own 200. Keep rivals=rust with it.
     # The native servers add a cold build of ~30 min (photon and its pinned liburing/libaio, asio, libuv, go download,
     # seastar ~3.5 min; a warm cpp-deps cache takes about 5), the Rust build ~10. cpp/all budget 300 min: all at the
     # defaults ~220 min, all tlsonly 9 rounds ~160 min. all with 9 rounds and the plain cells is ~355 min: use tlsonly there.
-    timeout-minutes: ${{ inputs.rivals == 'rust' && 150 || 300 }}
+    timeout-minutes: ${{ inputs.httponly && 200 || inputs.rivals == 'rust' && 150 || 300 }}
     steps:
       - uses: actions/checkout@v4
       - name: deps
@@ -88,15 +89,21 @@ jobs:
           key: cpp-deps-${{ runner.arch }}-${{ hashFiles('bench/cpp/*/build.sh', 'bench/go/build.sh') }}
       - name: http deps
         if: inputs.httponly
-        # nginx and haproxy are launched by bench/http/*.sh, so the packaged services stay off; the rest builds h2o
+        # nginx and haproxy (apt: linked against OpenSSL, TLS included) are launched by bench/http/*.sh, so the packaged
+        # services stay off; build-essential..zlib1g-dev build h2o (libssl-dev, above, gives it TLS); openssl is the CLI
+        # bench/http/cert.sh makes the nginx/haproxy/h2o certificate with; curl..gzip fetch the Go toolchain
+        # (bench/go/build.sh); Rust for the client and hyper is installed above
         run: |
-          sudo apt-get install -y --no-install-recommends nginx haproxy build-essential cmake git pkg-config zlib1g-dev
+          sudo apt-get install -y --no-install-recommends nginx haproxy build-essential cmake git pkg-config zlib1g-dev \
+            openssl curl ca-certificates tar gzip
           sudo systemctl disable --now nginx haproxy || true
       - uses: actions/cache@v4
         if: inputs.httponly
         with:
-          path: build/*/http-deps
-          key: http-deps-${{ runner.arch }}-${{ hashFiles('bench/http/h2o/build.sh') }}
+          path: |
+            build/*/http-deps
+            build/*/cpp-deps/go-*
+          key: http-deps-${{ runner.arch }}-${{ hashFiles('bench/http/h2o/build.sh', 'bench/go/build.sh') }}
       - name: tlslib deps
         if: inputs.tlslib || inputs.awslc
         run: command -v cmake >/dev/null && command -v go >/dev/null || sudo apt-get install -y --no-install-recommends cmake golang-go

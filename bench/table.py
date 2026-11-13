@@ -18,14 +18,18 @@
 # a TLS server without a row in a TLS cell, more than one negotiated (version suite group cert), a
 # resumption ratio < 0.95 in the churn cell with resumption.
 # (j2): the same rule for the plain cells: em-uring / em-epoll against the other plain servers of the same backend.
-# ONLY=http (plans/http.md): the CSV has only http* modes and the servers are em-http-* and nginx-epoll,
-# haproxy-epoll, h2o-epoll. Tables (a)-(c) with ratios vs nginx-epoll and (j3): em-http-uring and em-http-epoll
-# each against EVERY other server (the rivals are epoll-only, so the backend does not pair them), same rule.
+# ONLY=http (plans/http.md): the CSV has only http* modes. Servers: em-http-* and the rivals nginx-epoll, haproxy-epoll,
+# h2o-epoll, hyper-epoll, gohttp-epoll; with --tls their -tls- variants (em-http-tls-*, nginx-tls-epoll, ...) for the
+# httptls and httpchurntls cells. Tables (a)-(c) with ratios vs nginx-epoll (TLS cells: nginx-tls-epoll), plain cells and
+# TLS cells in their own tables, and (j3): em-http-uring and em-http-epoll (TLS cells: em-http-tls-*) each against EVERY
+# other server of the same kind (the rivals are epoll-only, so the backend does not pair them), same rule. The TLS
+# servers must all negotiate one (version suite group cert), else the checks fail; gohttp-tls-epoll is a --ref
+# (Go's TLS 1.3 suite is not configurable: AES-128), printed and never judged.
 import csv, re, statistics, sys
 from collections import defaultdict
 
 REF = set()  # --ref servers
-REF_NOTE = {"go-tls-epoll": "AES-128, 1 ticket"}
+REF_NOTE = {"go-tls-epoll": "AES-128, 1 ticket", "gohttp-tls-epoll": "AES-128, 1 ticket"}
 
 
 def opponents(em, srvs):  # the servers em[-tls]-<backend> is judged against: same backend (emrs-* is not a rival)
@@ -89,14 +93,15 @@ churn = [c for c in cells if c[0] == "churn"]
 echotls = [c for c in cells if c[0] == "echotls"]
 churntls = [c for c in cells if c[0] in ("churntls", "churntlsres")]
 httpc = [c for c in cells if c[0].startswith("http")]
-HTTP_LABEL = {"http": "GET / keep-alive", "httppipe": "GET / pipeline 16", "http4k": "GET /4k keep-alive", "httpchurn": "churn GET / (connect + 1 request + RST)"}
+HTTP_LABEL = {"http": "GET / keep-alive", "httppipe": "GET / pipeline 16", "http4k": "GET /4k keep-alive", "httpchurn": "churn GET / (connect + 1 request + RST)",
+              "httptls": "TLS GET / keep-alive", "httpchurntls": "TLS churn GET / (connect + full handshake + 1 request + RST)"}
 hlab = lambda c: f"{HTTP_LABEL[c[0]]}, {c[1]} conns"
 mode_name = {"churntls": "full handshake, client resumption off", "churntlsres": "resumption on, session store in the client"}
 med = lambda f, cl, srv: statistics.median(col[f][(*cl, srv)].values())
 
 
 def ratio(f, cl, srv, fmt):
-    base = "tokio-rustls" if "tls" in cl[0] else "nginx-epoll" if cl[0].startswith("http") else "tokio-epoll"
+    base = ("nginx-tls-epoll" if "tls" in cl[0] else "nginx-epoll") if cl[0].startswith("http") else "tokio-rustls" if "tls" in cl[0] else "tokio-epoll"
     m, v, b = med(f, cl, srv), col[f][(*cl, srv)], col[f][(*cl, base)]
     rs = [v[r] / b[r] for r in v if r in b]
     rng = f" [{min(rs):.2f}–{max(rs):.2f}]" if len(rs) > 1 and srv != base else ""
@@ -142,9 +147,13 @@ for c in churn:
     ])
 
 if httpc:
-    table("(a) HTTP: requests/s (churn: connections/s), higher is better", "cell", [(hlab(c), lambda v, c=c: ratio("rps", c, v, rps)) for c in httpc])
-    table("(b) HTTP: server CPU us per request (churn: per connection), lower is better", "cell", [(hlab(c), lambda v, c=c: ratio("us_per_rt", c, v, us)) for c in httpc])
-    table("(c) HTTP: p99 latency us (p99/p50) / p999, lower is better (pipeline: latency of the batch of 16)", "cell", [(hlab(c), lambda v, c=c: tail(c, v)) for c in httpc])
+    # the plain cells with the plain servers, the TLS cells with the TLS servers (tls_servers: --tls)
+    for tag, cs, srvs in (("", [c for c in httpc if "tls" not in c[0]], servers), (" over TLS", [c for c in httpc if "tls" in c[0]], tls_servers)):
+        if not cs:
+            continue
+        table(f"(a) HTTP{tag}: requests/s (churn: connections/s), higher is better", "cell", [(hlab(c), lambda v, c=c: ratio("rps", c, v, rps)) for c in cs], srvs)
+        table(f"(b) HTTP{tag}: server CPU us per request (churn: per connection), lower is better", "cell", [(hlab(c), lambda v, c=c: ratio("us_per_rt", c, v, us)) for c in cs], srvs)
+        table(f"(c) HTTP{tag}: p99 latency us (p99/p50) / p999, lower is better (pipeline: latency of the batch of 16)", "cell", [(hlab(c), lambda v, c=c: tail(c, v)) for c in cs], srvs)
     try:  # bytes of the first response (header + body) per server and path, as the client counted them
         seen = sorted({l.strip() for l in open(sys.argv[1].rsplit("/", 1)[0] + "/http_info.txt") if l.strip()})
         print("Response bytes (header + body), as the client counted them:\n" + "".join(f"- {l}\n" for l in seen))
@@ -206,7 +215,7 @@ JUDGED = [("echotls", 256, 128), ("echotls", 256, 4096), ("churntls", 64, 128), 
 fails = []
 all_rounds = {r for d in col["rps"].values() for r in d}
 have = lambda f, cl, v: col[f].get((*cl, v), {})
-if judged_tls:
+if judged_tls and not httpc:
     for cl in JUDGED:
         for v in judged_tls:
             if missing := all_rounds - set(have("rps", cl, v)):
@@ -259,18 +268,32 @@ def lost_cells(heading, who, judged, ems, rivals, opp=opponents, name=name):  # 
     print("\nTHUA: " + ("none" if not lost else "") + "".join(f"\n- {l}" for l in lost))
 
 
-if judged_tls:
+if judged_tls and not httpc:
     lost_cells("(j) lost cells: em-tls against same-backend rivals", "em-tls", JUDGED, ("em-tls-uring", "em-tls-epoll"), judged_tls)
 # plain cells: em-uring / em-epoll against the plain servers of the same backend (not emrs-*, not tokio-rustls)
 if echo + churn:
     lost_cells("(j2) lost cells, plain: em against same-backend rivals", "em", echo + churn, ("em-uring", "em-epoll"), servers)
 if httpc:
-    http_rivals = lambda em, srvs: [v for v in srvs if not v.startswith("em-http-")]  # every rival, whatever the backend
-    for v in servers:
-        for cl in httpc:
-            if missing := all_rounds - set(have("rps", cl, v)):
+    # a rival of em-http-X is a server of the same kind (plain or TLS); the cells decide which ems have rows
+    http_rivals = lambda em, srvs: [v for v in srvs if not v.startswith("em-http-") and v not in REF and ("-tls-" in v) == ("-tls-" in em)]
+    http_servers = lambda cl: tls_servers if "tls" in cl[0] else servers
+    for cl in httpc:
+        for v in http_servers(cl):
+            if v not in REF and (missing := all_rounds - set(have("rps", cl, v))):
                 fails.append(f"missing rows: {v} {name(cl)} rounds {sorted(missing)}")
-    lost_cells("(j3) lost cells, HTTP: em-http against every rival", "em-http", httpc, ("em-http-uring", "em-http-epoll"), servers, http_rivals, hlab)
+    if any("tls" in c[0] for c in httpc):  # one negotiated set (version suite group cert) over the judged TLS servers
+        try:
+            neg = [re.match(r"(\S+) \S+: (.*?) full=\d+ resumed=\d+$", l.strip()) for l in open(info) if l.strip()]
+        except FileNotFoundError:
+            neg = []
+        neg = [m for m in neg if m and m.group(1) not in REF]
+        if len({m.group(2) for m in neg}) != 1:
+            fails.append("tls_info.txt: not exactly one negotiated set: " + "; ".join(sorted({m.group(2) for m in neg})))
+        for v in tls_servers:
+            if v not in REF and not any(m.group(1) == v for m in neg):
+                fails.append(f"tls_info.txt: no line for {v}")
+    lost_cells("(j3) lost cells, HTTP: em-http against every rival", "em-http", httpc, ("em-http-uring", "em-http-epoll", "em-http-tls-uring", "em-http-tls-epoll"),
+               servers + tls_servers, http_rivals, hlab)
 if ref_seen := [v for v in tls_servers if v in REF]:
     print("\nReference only, not judged and not checked: " + "; ".join(f"{v} ({REF_NOTE.get(v, 'reference')})" for v in ref_seen))
 if fails:

@@ -159,6 +159,35 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
     x86-64-v2.
 - `max_requests_per_conn` giữ nguyên như plan.
 
+## Quyết định M3 (2026-11-13)
+
+Trước M3 trả hai nợ của M2.
+
+- **Send timeout.** Thêm `send_timeout_ns`, mặc định 60 s, `-1` là tắt.
+  - Ngữ nghĩa giống `send_timeout` của nginx: chỉ đóng khi một lần send không đi được byte nào trong khoảng đó. Reader chậm mà vẫn nhận thì không bị cắt.
+  - Mỗi `em_send` mở một scope deadline riêng. TLS gửi từng mảnh 64 KiB, vì `em_tls_send_all` không trả kết quả từng phần, nên mỗi mảnh có deadline riêng.
+  - Hết hạn thì serve trả `-ETIMEDOUT` và không gửi thêm gì sau một response dở.
+  - Trade-off: thêm một scope cho mỗi lần send. A/B ở local là 1.005x, nằm trong nhiễu.
+- **Lingering close.** Khi serve đóng kết nối mà peer có thể còn đang gửi, close() sẽ sinh RST và client mất response. Các trường hợp:
+  - 413 trước handler;
+  - 400/431/501/417 khi request còn đang tới;
+  - 500 hoặc `Connection: close` trên body chưa đọc;
+  - request pipeline nằm sau request cuối mà `max_requests_per_conn` cho phép.
+
+  Khi đó serve gọi `shutdown(SHUT_WR)` rồi bỏ byte thô cho đến EOF, tối đa 2 s hoặc 1 MiB. Không linger khi đóng bình thường, khi hết idle/header timeout, hay khi peer EOF/lỗi.
+  - Trade-off: một fiber bị giữ tối đa 2 s cho mỗi kết nối đóng kiểu này.
+- **TLS trong `em_http_serve`.**
+  - Caller tự `em_tls_accept`. Serve đọc/ghi qua `em_tls_recv`/`em_tls_send_all` và không bao giờ shutdown, free hay close tls.
+  - `libem_http` tham chiếu hai hàm đó bằng weak symbol, nên chương trình chỉ dùng plain không phải link OpenSSL.
+  - Peer đóng TCP không kèm close_notify giữa hai request thì serve trả 0.
+  - Các test `t5x` chạy cả bản plain lẫn bản `*_tls` (`-DHTTP_TLS`). curl smoke có thêm https.
+- **Bench M3.**
+  - Thêm ô `httptls 16/256` và `httpchurntls 64`.
+  - Cấu hình TLS cố định cho mọi server: TLS 1.3, AES_256_GCM_SHA384, X25519, cert ECDSA P-256.
+  - Đối thủ mới: hyper (tokio, rustls ở bản TLS) và Go net/http (bản plain). Cả hai đều chịu luật THUA.
+  - **Go TLS chỉ để tham khảo**: crypto/tls không cho ghim cipher suite của TLS 1.3, nên không cùng điều kiện.
+  - `make bench-em-http` giờ link libem_tls, vì binary bench có cả chế độ TLS. Vì thế bench và curl smoke cần OpenSSL hoặc AWS-LC.
+
 ## KHÔNG làm (đợt 1)
 
 - HTTP client. Sẽ làm khi có nhu cầu proxy hoặc gọi API.

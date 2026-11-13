@@ -4,7 +4,8 @@
 # on rustls/aws-lc-rs, then the memory per idle TLS connection (bench/rss_tls.sh).
 # env: DURATION (s per run, 10), ROUNDS (5), OUT (output dir, bench/out)
 #      ONLY=tls: run only the TLS cells (the verdict table needs ROUNDS >= 9)
-#      ONLY=http: only the HTTP cells (plans/http.md): em-http-* vs nginx, haproxy, h2o (bench/http/); RIVALS does not apply
+#      ONLY=http: only the HTTP cells (plans/http.md), plain and TLS: em-http-* vs nginx, haproxy, h2o (bench/http/), hyper
+#      (bench/rust/hyper_http), Go net/http (bench/go/http); RIVALS does not apply; TLS_PREFIX builds em_http's TLS against it
 #      TLS_PREFIX (an OpenSSL prefix with include/ and lib[64]/: em-tls-* servers are built against it
 #      and run with it on LD_LIBRARY_PATH; bench/tls_libs.sh builds such prefixes)
 #      TLS_TICKETS (0|stateless|stateful), NODELAY (0): passed through to the TLS servers
@@ -43,9 +44,12 @@ case $RIVALS in
     *) echo "RIVALS=$RIVALS: want rust, cpp or all" >&2; exit 2 ;;
 esac
 # ONLY=http: em_http (-uring/-epoll: the same binary, backend forced) against the servers that bench/http/ launches
-# or builds (nginx, haproxy: apt; h2o: bench/http/h2o/build.sh). Every rival is epoll and is judged against both em-http-*.
-HTTP_SERVERS=(em-http-uring em-http-epoll nginx-epoll haproxy-epoll h2o-epoll)
-[[ $ONLY != http ]] || SERVERS=("${HTTP_SERVERS[@]}")
+# or builds (nginx, haproxy: apt; h2o: bench/http/h2o/build.sh), hyper and Go net/http. Every rival is epoll and is
+# judged against both em-http-*. Each has a TLS variant (the -tls- names, for the httptls / httpchurntls cells).
+# gohttp-tls-epoll: reference only (crypto/tls picks AES-128 in TLS 1.3 and the suite is not configurable), like go-tls-epoll.
+HTTP_SERVERS=(em-http-uring em-http-epoll nginx-epoll haproxy-epoll h2o-epoll hyper-epoll gohttp-epoll)
+HTTP_TLS_SERVERS=(em-http-tls-uring em-http-tls-epoll nginx-tls-epoll haproxy-tls-epoll h2o-tls-epoll hyper-tls-epoll gohttp-tls-epoll)
+if [[ $ONLY == http ]]; then SERVERS=("${HTTP_SERVERS[@]}"); TLS_SERVERS=("${HTTP_TLS_SERVERS[@]}"); REF_SERVERS=(gohttp-tls-epoll); fi
 CONNS=(16 256 1024)
 SIZES=(128 4096)
 SRV_CPUS=0 # one server CPU (a single number: see cpu_ticks), 1 worker; client gets 3 CPUs: plans/bench.md
@@ -86,12 +90,18 @@ build_tls_prefix() {
 }
 
 build_http() {
-    make bench-em-http HTTP_SSE42=1 TLS_PREFIX= >&2 # M1 has no TLS: the default dir, whatever TLS_PREFIX the run exports
-    local d=build/$ARCH/rel; [[ $ARCH != x86_64 ]] || d=build/$ARCH/rel-sse42 # the Makefile's own dir for HTTP_SSE42=1 (x86_64 only)
+    # em_http with its TLS mode, built in the dir of the run's TLS_PREFIX (the exported variable reaches make);
+    # the dir is asked of make itself (--eval runs before the Makefile is read, the recipe is expanded after)
+    local d
+    d=$(make -s HTTP_SSE42=1 --eval='em-http-dir:; @echo $(B_REL)' em-http-dir)
+    make HTTP_SSE42=1 bench-em-http >&2
     mkdir -p "$BIN"
     cp "$d/em_http" "$BIN/em-http-uring"
     cp "$d/em_http" "$BIN/em-http-epoll"
-    (cd bench/rust && cargo build --release --locked -p client >&2 && cp target/release/client ../../$BIN/client)
+    (cd bench/rust && cargo build --release --locked -p client -p hyper_http >&2 &&
+        cp target/release/client ../../$BIN/client && cp target/release/hyper_http ../../$BIN/hyper-http)
+    bench/go/build.sh "$ROOT/$BIN" http >&2
+    bench/http/cert.sh >/dev/null # once, before the servers: h2o takes the files as arguments
     bench/http/h2o/build.sh "$ROOT/$BIN" >&2
     command -v nginx >/dev/null && command -v haproxy >/dev/null || { echo "ONLY=http needs nginx and haproxy (apt install nginx haproxy)" >&2; return 1; }
 }
@@ -154,7 +164,7 @@ build() {
 }
 
 start() { # server port: launches pinned in the background, waits until it accepts
-    local cmd=("$BIN/$1" "$2" "$WORKERS")
+    local cmd=("$BIN/$1" "$2" "$WORKERS") certdir
     case $1 in em-tls-uring|em-tls-epoll) cmd=(env "EM_BACKEND=${1#em-tls-}" "${cmd[@]}") # same binary, backend forced
                [[ -z ${TLS_PREFIX:-} ]] || cmd=(env "LD_LIBRARY_PATH=$(tls_prefix_lib)" "${cmd[@]}") ;;
                em-uring|em-epoll) cmd=(env "EM_BACKEND=${1#em-}" "${cmd[@]}") ;; esac
@@ -163,10 +173,20 @@ start() { # server port: launches pinned in the background, waits until it accep
     case $1 in monoio-uring|monoio-epoll) cmd=("$BIN/monoio" "$2" "${1#monoio-}" "$WORKERS") ;;
                monoio-rustls-uring|monoio-rustls-epoll) cmd=("$BIN/monoio-rustls" "$2" "${1#monoio-rustls-}" "$WORKERS") ;;
                tokio-rustls-ct) cmd=(env TOKIO_RT=current_thread "$BIN/tokio-rustls" "$2" "$WORKERS") ;; esac
+    # the HTTP servers: the TLS variant is the same binary with a last argument "tls" (h2o: the cert and key files).
+    # The launchers exec the server: $pid is the server.
     case $1 in em-http-uring|em-http-epoll) cmd=(env "EM_BACKEND=${1#em-http-}" "${cmd[@]}") ;;
-               nginx-epoll) cmd=(bench/http/nginx.sh "$2" "$WORKERS") ;; # the launchers exec the server: $pid is the server
+               em-http-tls-uring|em-http-tls-epoll) cmd=(env "EM_BACKEND=${1#em-http-tls-}" "$BIN/em-http-${1#em-http-tls-}" "$2" "$WORKERS" tls) ;;
+               nginx-epoll) cmd=(bench/http/nginx.sh "$2" "$WORKERS") ;;
+               nginx-tls-epoll) cmd=(bench/http/nginx.sh "$2" "$WORKERS" tls) ;;
                haproxy-epoll) cmd=(bench/http/haproxy.sh "$2" "$WORKERS") ;;
-               h2o-epoll) cmd=("$BIN/h2o-epoll" "$2" "$WORKERS") ;; esac
+               haproxy-tls-epoll) cmd=(bench/http/haproxy.sh "$2" "$WORKERS" tls) ;;
+               h2o-epoll) cmd=("$BIN/h2o-epoll" "$2" "$WORKERS") ;;
+               h2o-tls-epoll) certdir=$(bench/http/cert.sh); cmd=("$BIN/h2o-epoll" "$2" "$WORKERS" "$certdir/cert.pem" "$certdir/key.pem") ;;
+               hyper-epoll) cmd=("$BIN/hyper-http" "$2" "$WORKERS") ;;
+               hyper-tls-epoll) cmd=("$BIN/hyper-http" "$2" "$WORKERS" tls) ;;
+               gohttp-epoll) cmd=("$BIN/gohttp" "$2" "$WORKERS") ;;
+               gohttp-tls-epoll) cmd=("$BIN/gohttp" "$2" "$WORKERS" tls) ;; esac
     taskset -c $SRV_CPUS "${cmd[@]}" >/dev/null &
     pid=$!
     for _ in {1..100}; do
@@ -232,6 +252,10 @@ if [[ $ONLY == http ]]; then
     for c in "${CONNS[@]}"; do CELLS+=("http $c 13"); done
     for c in 16 256; do CELLS+=("httppipe $c 13" "http4k $c 4096"); done
     CELLS+=("httpchurn 64 13")
+    # TLS: httptls = GET / keep-alive over TLS (one handshake per connection); httpchurntls = connect + full handshake
+    # (client resumption off) + one GET / + RST, 64 concurrent like churntls. Run by the -tls- servers.
+    for c in 16 256; do CELLS+=("httptls $c 13"); done
+    CELLS+=("httpchurntls 64 13")
 elif [[ $ONLY != tls ]]; then
     for c in "${CONNS[@]}"; do for s in "${SIZES[@]}"; do CELLS+=("echo $c $s"); done; done
     CELLS+=("churn 64 128")
@@ -249,7 +273,8 @@ for ((r = 1; r <= ROUNDS; r++)); do
     for cell in "${CELLS[@]}"; do
         read -r mode c s <<<"$cell"
         case $mode in echo) arg=() ;; churn) arg=(churn) ;; echotls) arg=(tls) ;; churntls) arg=(churn tls) ;; churntlsres) arg=(churn tlsres) ;;
-                  http) arg=(http) ;; httppipe) arg=(http pipe=16) ;; http4k) arg=(http path=/4k) ;; httpchurn) arg=(churn http) ;; esac
+                  http) arg=(http) ;; httppipe) arg=(http pipe=16) ;; http4k) arg=(http path=/4k) ;; httpchurn) arg=(churn http) ;;
+                  httptls) arg=(http tls) ;; httpchurntls) arg=(churn http tls) ;; esac
         srvs=("${SERVERS[@]}"); [[ $mode == *tls* ]] && srvs=("${TLS_SERVERS[@]}")
         # the order rotates with the round (round r starts at server r), so no server always runs right
         # after the same other server
@@ -273,7 +298,7 @@ if [[ $ONLY == http ]]; then : >"$OUT/rss.md"; else bench/rss_tls.sh | tee "$OUT
 # still written, then the run fails
 rc=0
 if [[ $ONLY == http ]]; then
-    python3 -I bench/table.py "$OUT/results.csv" "${SERVERS[@]}" | tee "$OUT/table.md" || rc=$?
+    python3 -I bench/table.py "$OUT/results.csv" "${SERVERS[@]}" --tls "${TLS_SERVERS[@]}" --ref "${REF_SERVERS[@]}" | tee "$OUT/table.md" || rc=$?
 else
     python3 -I bench/table.py "$OUT/results.csv" "${SERVERS[@]}" --tls "${TLS_SERVERS[@]}" ${REF_SERVERS[@]:+--ref "${REF_SERVERS[@]}"} | tee "$OUT/table.md" || rc=$?
 fi

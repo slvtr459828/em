@@ -4,9 +4,9 @@
 # build/$(uname -m)/cpp-deps/go-1.27.3; the distro's Go is never used. Stdlib only, default flags.
 # TLS_PREFIX does not apply: Go uses its own crypto/tls (no libssl).
 # apt (Ubuntu 24.04): curl ca-certificates tar gzip
-# usage: bench/go/build.sh OUTDIR
+# usage: bench/go/build.sh OUTDIR [http]   (http: only the net/http server of ONLY=http, OUTDIR/gohttp; else only the echo servers)
 set -euo pipefail
-[[ $# -eq 1 ]] || { echo "usage: $0 OUTDIR" >&2; exit 2; }
+[[ $# -eq 1 || ${2:-} == http ]] || { echo "usage: $0 OUTDIR [http]" >&2; exit 2; }
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 mkdir -p "$1"
@@ -31,5 +31,10 @@ fi
 
 export GOROOT=$D/go GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOCACHE=$D/cache CGO_ENABLED=0
 cd "$HERE"
-"$GOROOT/bin/go" build -trimpath -o "$OUT/go-epoll" .
-"$GOROOT/bin/go" build -trimpath -tags tls -o "$OUT/go-tls-epoll" .
+if [[ ${2:-} == http ]]; then
+    # one binary: the server is TLS when its 3rd argument is "tls"
+    "$GOROOT/bin/go" build -trimpath -o "$OUT/gohttp" ./http
+else
+    "$GOROOT/bin/go" build -trimpath -o "$OUT/go-epoll" .
+    "$GOROOT/bin/go" build -trimpath -tags tls -o "$OUT/go-tls-epoll" .
+fi

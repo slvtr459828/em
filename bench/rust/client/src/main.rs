@@ -8,11 +8,12 @@
 // churn then counts handshake + round-trip. tlsres: same, but the client keeps a session store and
 // resumes when it can. With either, a second output line says what was negotiated and how many
 // handshakes were full / resumed ("tls <version> <suite> <kx group> <cert key> full=N resumed=M").
-// http (plans/http.md; plain only): `size` is the expected response body length. Each connection sends
+// http (plans/http.md): `size` is the expected response body length. Each connection sends
 // `pipe` (default 1) "GET <path> HTTP/1.1" requests in one write, reads that many responses (httparse),
 // requires status 200 and Content-Length == size, and counts `pipe` round-trips per batch (the batch's
 // latency is recorded for each). churn: connect, one request, RST. A second output line says how big the
-// first response was: "http response_bytes=N" (header + body).
+// first response was: "http response_bytes=N" (header + body). With tls: the same over TLS (a full
+// handshake per connection, as in the echo cells; the keep-alive cell handshakes once per connection).
 // Prints "total_round_trips round_trips_per_sec p50_us p99_us p999_us"; exits 1 if any echo is
 // short or differs. Latency of every round-trip goes into a per-thread log-linear histogram
 // (128 sub-buckets per power of two, < 1% error; fixed array, nothing allocated while measuring).
@@ -24,7 +25,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::client::Resumption;
 use rustls::{ClientConfig, HandshakeKind, DigitallySignedStruct, SignatureScheme};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
@@ -148,8 +149,9 @@ fn bad(m: &str) -> std::io::Error {
 }
 
 // One batch: write all requests, read until `pipe` complete responses arrived and checked.
-async fn http_batch(s: &mut TcpStream, h: &Http, buf: &mut [u8]) -> std::io::Result<()> {
+async fn http_batch<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, h: &Http, buf: &mut [u8]) -> std::io::Result<()> {
     s.write_all(&h.req).await?;
+    s.flush().await?; // TLS: the records are written here
     let (mut len, mut got) = (0, 0);
     while got < h.pipe {
         let n = s.read(&mut buf[len..]).await?;
@@ -189,18 +191,20 @@ async fn http_batch(s: &mut TcpStream, h: &Http, buf: &mut [u8]) -> std::io::Res
     Ok(())
 }
 
-async fn http_conn(addr: String, h: Http, deadline: Instant, churn: bool) -> std::io::Result<u64> {
-    let mut s = Conn::open(&addr, None, churn).await?;
+async fn http_conn(addr: String, h: Http, deadline: Instant, churn: bool, tls: Option<TlsConnector>) -> std::io::Result<u64> {
+    let mut s = Conn::open(&addr, tls.as_ref(), churn).await?;
     let mut buf = vec![0u8; h.pipe * (h.body + 1024)];
     let mut n = 0u64;
     let mut t = Instant::now();
     while t < deadline {
         if churn && n > 0 {
             drop(s);
-            s = Conn::open(&addr, None, true).await?;
+            s = Conn::open(&addr, tls.as_ref(), true).await?;
         }
-        let Conn::Plain(tcp) = &mut s else { unreachable!() };
-        http_batch(tcp, &h, &mut buf).await?;
+        match &mut s {
+            Conn::Plain(c) => http_batch(c, &h, &mut buf).await?,
+            Conn::Tls(c) => http_batch(&mut **c, &h, &mut buf).await?,
+        }
         let t2 = Instant::now();
         HIST.with(|x| x.borrow_mut()[bucket((t2 - t).as_nanos() as u64)] += h.pipe as u64);
         t = t2;
@@ -242,8 +246,7 @@ fn main() {
     let pipe: usize = opt("pipe=").map_or(1, |v| v.parse().unwrap_or(0));
     let path = opt("path=").unwrap_or("/");
     let known = |f: &String| matches!(f.as_str(), "churn" | "tls" | "tlsres" | "http") || f.starts_with("path=") || f.starts_with("pipe=");
-    let tls_flag = flags.iter().any(|f| f == "tls" || f == "tlsres");
-    if a.len() < 6 || !flags.iter().all(known) || pipe == 0 || (!http && (opt("path=").is_some() || opt("pipe=").is_some())) || (http && tls_flag) {
+    if a.len() < 6 || !flags.iter().all(known) || pipe == 0 || (!http && (opt("path=").is_some() || opt("pipe=").is_some())) {
         eprintln!("usage: client addr conns size seconds threads [churn] [tls|tlsres] [http [path=/|/4k] [pipe=N]]");
         std::process::exit(2);
     }
@@ -268,7 +271,7 @@ fn main() {
                 rt.block_on(async {
                     let js: Vec<_> = (0..mine).map(|_| {
                         match &h {
-                            Some(h) => tokio::spawn(http_conn(addr.clone(), h.clone(), deadline, churn)),
+                            Some(h) => tokio::spawn(http_conn(addr.clone(), h.clone(), deadline, churn, conn_tls.clone())),
                             None => tokio::spawn(conn(addr.clone(), size, deadline, churn, conn_tls.clone())),
                         }
                     }).collect();
