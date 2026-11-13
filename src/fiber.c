@@ -364,6 +364,7 @@ static void worker_exit(em_worker *w, int init_ok)
     if (init_ok) {
         if (w->epoll) ep_exit(w); else io_uring_queue_exit(&w->ring);
     }
+    if (init_ok) em_heap_free(w);
     if (w->rt->slot[w->id].done_fd >= 0) close(w->rt->slot[w->id].done_fd);
     w->rt = NULL;
 }
@@ -415,7 +416,7 @@ static void worker_main(em_worker *w)
     /* Abandoned em_resolve jobs still run on the pool and will land on our done list; wait
      * for them (em.h), then no CQE of ours may remain that targets this worker's memory. */
     while (w->jobs) { if (w->epoll) ep_reap(w, 1); else ur_reap(w, 1); }
-    if (!w->epoll) ur_jobs_stop(w);
+    if (!w->epoll) { ur_jobs_stop(w); ur_timer_stop(w); }
     /* Our msg_ring SQEs must complete before the ring can go away, and no ring
      * may go away before every sender is past this point (below). */
     while (w->msg_inflight) ur_reap(w, 1); /* io_uring only: epoll sends none */

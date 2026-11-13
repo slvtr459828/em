@@ -9,7 +9,7 @@
 #include "internal.h"
 
 #define OP_UNCANCELLABLE 1 /* ignore cancel + deadline (close must always run) */
-#define OP_NOLINK        2 /* caller handles the deadline itself (sleep) */
+#define OP_NOLINK        2 /* caller handles the deadline itself (sleep): no entry in the deadline heap */
 
 /* A ring that can't submit/reap leaves ops in flight that point into fiber
  * stacks; unwinding would break I1, so the only safe exit is fail-stop. */
@@ -19,11 +19,11 @@ static void fatal(const char *what, int err)
     abort();
 }
 
-/* Make room for the SQE plus a possible link timeout in one go: a link must not
- * straddle two submits. */
+/* A free SQE. Submitting when the SQ is full is safe at any point: every SQE already queued
+ * is fully prepared (op_end sets data before it queues the timer SQE) and nothing links SQEs. */
 struct io_uring_sqe *ur_sqe_get(em_worker *w)
 {
-    while (io_uring_sq_space_left(&w->ring) < 2) {
+    while (io_uring_sq_space_left(&w->ring) < 1) {
         int r = io_uring_submit(&w->ring);
         if (r < 0 && r != -EBUSY && r != -EAGAIN && r != -EINTR) fatal("io_uring_submit", r);
     }
@@ -76,6 +76,55 @@ void ur_jobs_stop(em_worker *w)
     while (w->jobs_rd != EM_JRD_STOPPED) ur_reap(w, 1);
 }
 
+/* Deadlines: every in-flight op with a scope deadline has an entry (deadline, fiber) in the
+ * worker heap, and the worker has at most ONE kernel timeout (EM_MSG_TIMER) armed, at the heap
+ * minimum or earlier. A later deadline costs a heap push, no SQE. The timeout is moved earlier
+ * with timeout_update (user_data 0: its CQE, e.g. -ENOENT when the timeout just fired, is
+ * ignored; the fire's own CQE re-arms for whatever the heap holds). SQ order guarantees an
+ * update never hits a re-armed timeout. All SQEs read w->tmo_ts at submit and it always holds
+ * the newest target, so they agree. tmo_armed != 0 until the timeout's CQE is reaped. */
+static void timer_set(em_worker *w, int64_t dl)
+{
+    w->tmo_ts.tv_sec = dl / 1000000000;
+    w->tmo_ts.tv_nsec = dl % 1000000000;
+    struct io_uring_sqe *sqe = ur_sqe_get(w);
+    if (w->tmo_armed) {
+        io_uring_prep_timeout_update(sqe, &w->tmo_ts, EM_MSG_TIMER, IORING_TIMEOUT_ABS);
+        io_uring_sqe_set_data64(sqe, 0);
+    } else {
+        io_uring_prep_timeout(sqe, &w->tmo_ts, 0, IORING_TIMEOUT_ABS);
+        io_uring_sqe_set_data64(sqe, EM_MSG_TIMER);
+    }
+    w->tmo_armed = dl;
+}
+
+/* The timeout's CQE was reaped (every op CQE of the batch too, so each fiber left in the heap
+ * is still IOWAIT with a live op): interrupt the expired ones, then re-arm for the next. A fiber
+ * whose op finished meanwhile is gone from the heap, so a fire may find nothing: just re-arms. */
+static void timer_fired(em_worker *w)
+{
+    w->tmo_armed = 0;
+    int64_t now = em_now();
+    while (w->nheap && w->heap[0].deadline <= now) {
+        em_fiber *f = w->heap[0].f;
+        em_heap_remove(w, f);
+        ur_interrupt(w, f); /* op_end turns the -ECANCELED into -ETIMEDOUT */
+    }
+    if (w->nheap) timer_set(w, w->heap[0].deadline);
+}
+
+/* Shutdown: the timeout's CQE must be reaped before the ring goes away. No fiber is left, so
+ * the heap is empty and timer_fired will not re-arm. */
+void ur_timer_stop(em_worker *w)
+{
+    if (!w->tmo_armed) return;
+    assert(w->nheap == 0);
+    struct io_uring_sqe *sqe = ur_sqe_get(w);
+    io_uring_prep_cancel64(sqe, EM_MSG_TIMER, 0);
+    io_uring_sqe_set_data64(sqe, 0);
+    while (w->tmo_armed) ur_reap(w, 1);
+}
+
 void ur_reap(em_worker *w, int block)
 {
     if (!block) {
@@ -90,7 +139,7 @@ void ur_reap(em_worker *w, int block)
     }
     struct io_uring_cqe *cqe;
     unsigned head, n = 0;
-    int cancel_root = 0, jobs_cqe = 0;
+    int cancel_root = 0, jobs_cqe = 0, timer_cqe = 0;
     io_uring_for_each_cqe(&w->ring, head, cqe) {
         n++;
         if (cqe->user_data & 1) { /* not an op pointer */
@@ -98,6 +147,8 @@ void ur_reap(em_worker *w, int block)
                 cancel_root = 1; /* acted on below, once every CQE of the batch is reaped */
             } else if (cqe->user_data == EM_MSG_JOBS) {
                 jobs_cqe = 1;    /* done list is taken below, after the whole batch */
+            } else if (cqe->user_data == EM_MSG_TIMER) {
+                timer_cqe = 1;   /* after the batch: see timer_fired */
             } else {
                 assert(cqe->user_data == EM_MSG_SENT);
                 w->msg_inflight--;
@@ -107,13 +158,15 @@ void ur_reap(em_worker *w, int block)
             continue;
         }
         em_op *op = io_uring_cqe_get_data(cqe);
-        if (!op) continue; /* link timeout / async cancel */
+        if (!op) continue; /* async cancel / timeout update */
         op->res = cqe->res;
         w->inflight--;
         op->f->cur_op = NULL;
+        if (op->f->heap_idx >= 0) em_heap_remove(w, op->f);
         em_make_ready(w, op->f);
     }
     io_uring_cq_advance(&w->ring, n);
+    if (timer_cqe) timer_fired(w);
     if (jobs_cqe) {
         em_jobs_reap(w); /* a CQE with a value or -ECANCELED alike: the list is the truth */
         if (w->jobs_rd == EM_JRD_CANCELLING) w->jobs_rd = EM_JRD_STOPPED; else jobs_arm(w);
@@ -139,29 +192,30 @@ static int op_begin(unsigned flags, struct io_uring_sqe **sqe)
     if (em_scope_is_cancelled(em_W.current)) return -ECANCELED;
     int64_t dl = cur_deadline();
     if (dl && em_now() >= dl) return -ETIMEDOUT;
+    /* op_end's heap push must not fail once the SQE is prepared. */
+    if (dl) {
+        int e = em_heap_reserve(&em_W);
+        if (e) return e;
+    }
     *sqe = ur_sqe_get(&em_W);
     return 0;
 }
 
-/* Phase 2: attach the deadline, submit, park until THIS op's CQE (I1). The op
- * and the timespec live in this frame until then. */
+/* Phase 2: register the deadline, queue, park until THIS op's CQE (I1). The op lives in this
+ * frame until then. */
 static int op_end(struct io_uring_sqe *sqe, unsigned flags)
 {
     em_worker *w = &em_W;
     em_fiber *f = w->current;
     em_op op = { .f = f, .uncancellable = !!(flags & OP_UNCANCELLABLE) };
-    struct __kernel_timespec ts;
     int64_t dl = (flags & (OP_UNCANCELLABLE | OP_NOLINK)) ? 0 : cur_deadline();
 
     io_uring_sqe_set_data(sqe, &op);
     if (dl) {
-        ts.tv_sec = dl / 1000000000;
-        ts.tv_nsec = dl % 1000000000;
-        sqe->flags |= IOSQE_IO_LINK;
-        struct io_uring_sqe *t = io_uring_get_sqe(&w->ring); /* room guaranteed by ur_sqe_get */
-        assert(t);
-        io_uring_prep_link_timeout(t, &ts, IORING_TIMEOUT_ABS);
-        io_uring_sqe_set_data64(t, 0);
+        int e = em_heap_push(w, f, dl);
+        assert(e == 0); /* capacity reserved in op_begin */
+        (void)e;
+        if (!w->tmo_armed || dl < w->tmo_armed) timer_set(w, dl);
     }
     f->cur_op = &op;
     w->inflight++;
@@ -173,8 +227,8 @@ static int op_end(struct io_uring_sqe *sqe, unsigned flags)
      * for recvmsg). io_uring ops never see user signals, so -EINTR here always
      * means "cancelled": one result code for cancel on both backends. */
     if (op.res == -EINTR) op.res = -ECANCELED;
-    /* -ECANCELED with the deadline passed and no scope cancel: our link timeout
-     * fired. Otherwise (e.g. ur_close from another fiber) it stays -ECANCELED. */
+    /* -ECANCELED with the deadline passed and no scope cancel: our deadline
+     * expired (timer_fired). Otherwise (e.g. ur_close from another fiber) it stays -ECANCELED. */
     if (op.res == -ECANCELED && dl && !em_scope_is_cancelled(f) && em_now() >= dl) return -ETIMEDOUT;
     return op.res;
 }

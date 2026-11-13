@@ -8,7 +8,7 @@ TESTS := tests/t1_pingpong tests/t2_churn tests/t3_many tests/t4_guard tests/t5_
   tests/t20_sigterm tests/t21_udp tests/t22_map_cap tests/t23_cancel_exit_race \
   tests/t24_fairness tests/t25_udp_waiters tests/t26_close_wakes tests/t27_backend_env tests/t28_timer_heap tests/t29_fd_reuse tests/t30_outside tests/t31_short_read \
   tests/t32_offload_nostall tests/t33_offload_thread tests/t34_offload_nocancel tests/t35_offload_cap \
-  tests/t36_resolve tests/t37_resolve_abandon tests/t38_file_read tests/t39_yield_poll
+  tests/t36_resolve tests/t37_resolve_abandon tests/t38_file_read tests/t39_yield_poll tests/t57_deadline_timer
 # em_http (libem_http.a, tests t50..): no OpenSSL needed in M1.
 HTTP_TESTS := tests/t50_http_keepalive tests/t51_http_pipeline tests/t52_http_reject \
   tests/t53_http_workers tests/t54_http_body tests/t55_http_expect tests/t56_http_timeout
@@ -74,7 +74,7 @@ $(1)/%.o: src/%.c src/internal.h include/em.h
 $(1)/ctx.o: $(ASM)
 	@mkdir -p $(1)
 	$(CC) $(2) -c $$< -o $$@
-$(1)/libem.a: $(1)/fiber.o $(1)/scope.o $(1)/io.o $(1)/io_uring.o $(1)/io_epoll.o $(1)/pool.o $(1)/ctx.o
+$(1)/libem.a: $(1)/fiber.o $(1)/scope.o $(1)/io.o $(1)/io_uring.o $(1)/io_epoll.o $(1)/timer.o $(1)/pool.o $(1)/ctx.o
 	rm -f $$@ && ar rcs $$@ $$^
 $(1)/%: tests/%.c $(1)/libem.a src/internal.h
 	$(CC) $(2) -Isrc $$< $(1)/libem.a -luring -lm -lpthread -o $$@
@@ -146,7 +146,7 @@ endif
 # A crash or sanitizer report makes libFuzzer exit nonzero, so the target fails.
 FUZZ_SECONDS ?= 60
 B_FUZZ := build/$(ARCH)/fuzz
-FUZZ_SRC := src/fiber.c src/scope.c src/io.c src/io_uring.c src/io_epoll.c src/pool.c $(ASM) \
+FUZZ_SRC := src/fiber.c src/scope.c src/io.c src/io_uring.c src/io_epoll.c src/timer.c src/pool.c $(ASM) \
   src/http.c third_party/picohttpparser/picohttpparser.c
 .PHONY: fuzz-http
 $(B_FUZZ)/http_fuzz: tests/fuzz/http_fuzz.c $(FUZZ_SRC) $(wildcard src/*.h) include/em.h include/em_http.h

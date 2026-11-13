@@ -19,6 +19,7 @@
 #define EM_MSG_CANCEL 1u
 #define EM_MSG_SENT   3u
 #define EM_MSG_JOBS   5u /* user_data of the armed READ on the worker's job-done eventfd */
+#define EM_MSG_TIMER  7u /* user_data of the worker's single deadline timeout */
 
 #define EM_POOL_MAX 64 /* pool threads, process-wide */
 
@@ -105,11 +106,13 @@ typedef struct em_worker {
     size_t    live;     /* fibers not yet DONE */
     int       epoll;    /* backend: 0 = io_uring, 1 = epoll (same for every worker) */
     struct io_uring ring;           /* io_uring */
+    struct __kernel_timespec tmo_ts; /* io_uring: target of the worker timeout; read by the kernel at submit, so it lives here (I1) */
+    int64_t   tmo_armed;            /* io_uring: deadline of the armed worker timeout, 0 = none in flight (its CQE not yet reaped) */
     size_t    inflight; /* io_uring: ops whose CQE has not been reaped; epoll: fibers waiting on an fd or timer */
     int       epfd, evfd;           /* epoll: instance, cross-worker cancel eventfd */
     struct em_fdw *fdt;             /* epoll: fd table, grown by doubling */
     size_t    nfd;
-    struct em_timer *heap;          /* epoll: binary min-heap on deadline */
+    struct em_timer *heap;          /* binary min-heap on deadline (timer.c), both backends */
     size_t    nheap, capheap;
     int       budget;               /* ops/yields left before a non-blocking poll (see em_yield); reset by every poll */
 #ifdef __SANITIZE_ADDRESS__
@@ -179,12 +182,13 @@ void em_pool_join(struct em_pool *p);    /* after every worker is done: stops an
 void em_pool_destroy(struct em_pool *p);
 void em_jobs_reap(em_worker *w);         /* owner: take the done list; wake waiters, free abandoned jobs */
 /* io_uring.c */
-struct io_uring_sqe *ur_sqe_get(em_worker *w);   /* leaves room for a link timeout */
+struct io_uring_sqe *ur_sqe_get(em_worker *w);   /* a free SQE (submits when the SQ is full) */
 void ur_interrupt(em_worker *w, em_fiber *f);    /* f is EM_IOWAIT: submit ASYNC_CANCEL */
 void ur_submit(em_worker *w);
 void ur_reap(em_worker *w, int block);           /* submit, (block: wait for a CQE,) wake fibers */
 void ur_jobs_start(em_worker *w);                /* arm the READ on the done eventfd */
 void ur_jobs_stop(em_worker *w);                 /* cancel it and wait for its CQE (no CQE may outlive the worker) */
+void ur_timer_stop(em_worker *w);                /* same for the worker timeout */
 int  ur_job_wait(int64_t deadline_ns);           /* em_resolve: park until woken by ur_job_wake, the deadline (-ETIME) or cancel */
 void ur_job_wake(em_worker *w, em_fiber *f);
 int     ur_sleep_until(int64_t deadline_ns);
@@ -197,6 +201,11 @@ int     ur_shutdown(int fd, int how);
 int     ur_close(int fd);
 ssize_t ur_recvfrom(int fd, void *buf, size_t len, struct sockaddr *src, socklen_t *srclen);
 ssize_t ur_sendto(int fd, const void *buf, size_t len, const struct sockaddr *dst, socklen_t n);
+/* timer.c */
+int  em_heap_reserve(em_worker *w);                             /* room for one more push: 0 or -ENOMEM */
+int  em_heap_push(em_worker *w, em_fiber *f, int64_t deadline); /* 0 or -ENOMEM */
+void em_heap_remove(em_worker *w, em_fiber *f);                 /* f->heap_idx >= 0 */
+void em_heap_free(em_worker *w);
 /* io_epoll.c */
 int  ep_init(em_worker *w);                      /* 0 or -errno; w->evfd is the cancel eventfd */
 void ep_exit(em_worker *w);

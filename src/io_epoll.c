@@ -33,63 +33,6 @@
 #define EV_WAKE   UINT32_MAX     /* data.u32 of the cancel eventfd (an fd number can't be this) */
 #define EV_JOBS   (UINT32_MAX - 1) /* ... of the job-done eventfd (pool threads write it) */
 
-/* ---- timer heap: binary min-heap on deadline; f->heap_idx makes removal O(log n) ---- */
-
-static void heap_set(em_worker *w, size_t i, struct em_timer t)
-{
-    w->heap[i] = t;
-    t.f->heap_idx = (int)i;
-}
-
-static void heap_up(em_worker *w, size_t i)
-{
-    struct em_timer t = w->heap[i];
-    while (i > 0 && t.deadline < w->heap[(i - 1) / 2].deadline) {
-        heap_set(w, i, w->heap[(i - 1) / 2]);
-        i = (i - 1) / 2;
-    }
-    heap_set(w, i, t);
-}
-
-static void heap_down(em_worker *w, size_t i)
-{
-    struct em_timer t = w->heap[i];
-    for (;;) {
-        size_t c = 2 * i + 1;
-        if (c >= w->nheap) break;
-        if (c + 1 < w->nheap && w->heap[c + 1].deadline < w->heap[c].deadline) c++;
-        if (t.deadline <= w->heap[c].deadline) break;
-        heap_set(w, i, w->heap[c]);
-        i = c;
-    }
-    heap_set(w, i, t);
-}
-
-static int heap_push(em_worker *w, em_fiber *f, int64_t deadline)
-{
-    if (w->nheap == w->capheap) { /* grows with the number of timer waiters; rare, never steady state */
-        size_t n = w->capheap ? w->capheap * 2 : 64;
-        struct em_timer *h = realloc(w->heap, n * sizeof *h);
-        if (!h) return -ENOMEM;
-        w->heap = h;
-        w->capheap = n;
-    }
-    w->heap[w->nheap] = (struct em_timer){ deadline, f };
-    heap_up(w, w->nheap++);
-    return 0;
-}
-
-static void heap_remove(em_worker *w, em_fiber *f)
-{
-    size_t i = (size_t)f->heap_idx;
-    f->heap_idx = -1;
-    struct em_timer last = w->heap[--w->nheap];
-    if (i == w->nheap) return;
-    heap_set(w, i, last);
-    heap_up(w, i);
-    heap_down(w, (size_t)last.f->heap_idx);
-}
-
 /* ---- waiting ---- */
 
 static em_fiber **wlist(em_worker *w, int fd, int dir)
@@ -100,7 +43,7 @@ static em_fiber **wlist(em_worker *w, int fd, int dir)
 /* f stops waiting (it is already off its fd list): hand it res and make it ready. */
 static void wake(em_worker *w, em_fiber *f, int res)
 {
-    if (f->heap_idx >= 0) heap_remove(w, f);
+    if (f->heap_idx >= 0) em_heap_remove(w, f);
     f->wfd = -1;
     f->wake_res = res;
     w->inflight--;
@@ -176,7 +119,7 @@ static int wait_fd(int fd, int dir)
     int e = fd_register(w, fd);
     if (e) return e;
     int64_t dl = f->cur_scope->deadline;
-    if (dl && (e = heap_push(w, f, dl))) return e;
+    if (dl && (e = em_heap_push(w, f, dl))) return e;
     em_fiber **head = wlist(w, fd, dir);
     f->wnext = *head;
     *head = f;
@@ -309,7 +252,7 @@ int ep_sleep_until(int64_t deadline_ns)
     int64_t dl = f->cur_scope->deadline;
     int64_t target = (dl && dl < deadline_ns) ? dl : deadline_ns;
     if (em_now() < target) {
-        if ((e = heap_push(w, f, target))) return e;
+        if ((e = em_heap_push(w, f, target))) return e;
         f->wfd = -1;
         park(w, f);
         if (f->wake_res != -ETIMEDOUT) return f->wake_res; /* -ECANCELED */
@@ -327,7 +270,7 @@ int ep_job_wait(void)
     em_fiber *f = w->current;
     int64_t dl = f->cur_scope->deadline;
     int e;
-    if (dl && (e = heap_push(w, f, dl))) return e;
+    if (dl && (e = em_heap_push(w, f, dl))) return e;
     f->wfd = -1;
     park(w, f);
     return f->wake_res;
@@ -550,5 +493,4 @@ void ep_exit(em_worker *w)
     close(w->evfd);
     close(w->epfd);
     free(w->fdt);
-    free(w->heap);
 }
