@@ -4,6 +4,7 @@
  * body reader, respond, HEAD and the error paths are all reached. Timeouts are off: the only
  * clock is the peer closing. One em_run per input. */
 #include <errno.h>
+#include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -90,6 +91,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     if (size > MAX_IN) return 0;
     in_data = data;
     in_len = size;
-    if (em_run(1, run, NULL) != 0) __builtin_trap();
+    int rc = em_run(1, run, NULL);
+    if (rc != 0) { fprintf(stderr, "em_run = %d\n", rc); __builtin_trap(); }
     return 0;
 }
