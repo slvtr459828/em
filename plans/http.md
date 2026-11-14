@@ -240,3 +240,31 @@ Cùng bố cục với M1. em-http lần này bật timeout mặc định: heade
   - Như M1, các ô này THUA vì p50 của em quá nhỏ nên tỉ số p99/p50 phình ra.
   - Ô M1 "arm keep-alive 1024 epoll" giờ không còn THUA.
 - **Thông lượng pipeline 16:** gấp 16–20x nginx, 9–13x h2o.
+
+### M3 trên CI (run 43468314581, commit 5f5de70, 9 vòng, x86 + arm64, AWS-LC)
+
+Thêm hyper và Go net/http. Các ô TLS chạy TLS 1.3, AES-256-GCM, X25519, ECDSA P-256. Riêng Go dùng AES-128 nên chỉ để tham khảo.
+
+- **Plain, CPU mỗi request:** không có ô THUA nào. em thắng hyper ở mọi ô:
+  - keep-alive: 0.80–0.93x;
+  - pipeline: em tốn 0.41–0.50x CPU mỗi request của hyper;
+  - churn arm: 0.65–0.78x.
+
+  Go tốn 1.6–2.5x CPU của nginx; em thắng Go mọi ô.
+- **TLS, CPU mỗi request:**
+  - Keep-alive: em-uring thắng mọi đối thủ (0.43–0.61x nginx). em-epoll thắng nginx, haproxy, h2o và ngang hyper, trừ một ô.
+  - Churn (bắt tay đầy đủ): em tốn khoảng 0.5x CPU của nginx, haproxy, h2o.
+  - **THUA hyper (rustls), 3 ô:**
+    - TLS churn em-uring: x86 1.11, arm 1.26. Cùng ô đó em-epoll chỉ NGANG (1.04).
+      - Phần chênh nằm ở em_tls trên uring, không ở HTTP. Bench echo cũ (run 43040445180) đã có đúng khoảng cách em-tls-uring/em-tls-epoll ở churntls: x86 265/243, arm 173/145.
+      - Ô này lộ ra vì luật mới so em-uring với mọi đối thủ, kể cả đối thủ chạy epoll.
+    - TLS keep-alive 16 conns em-epoll trên arm: 1.08 [1.00–1.13]. Khoảng này đã biết từ trước: libssl tốn nhiều lệnh hơn rustls mỗi record (plans/bench-cpp.md).
+- **THUA ở trục p99/p50:**
+  - Gồm các ô pipeline, 4k/16 x86, TLS keep-alive trên epoll, keep-alive 1024 epoll arm so với h2o.
+  - p99 tuyệt đối của em vẫn thấp nhất, trừ một ô: TLS 256 conns epoll trên arm, em 3,392 us so với hyper 3,097 us. Ô này cùng gốc với ô CPU THUA ở trên.
+- **x86 epoll đắt hơn M2 khi tính theo tỉ lệ so với nginx:** +0.05–0.11; churn 0.67 → 0.78.
+  - Không kết luận được, vì máy x86 của CI đã đổi: mọi server nhanh hơn 25–35% ở số tuyệt đối. Arm không đổi.
+  - A/B M2 so với M3 ở local quá nhiễu: http 16 epoll 1.12 [1.04–1.23], còn các ô khác < 1.
+  - Thứ M3 thêm vào mỗi request: một `em_now()` và một scope trong `send_all`, cộng thêm lần kiểm deadline trước op.
+  - Cách đo dứt khoát: chạy A/B cả hai binary trong cùng một job CI.
+
