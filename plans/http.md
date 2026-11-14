@@ -268,3 +268,39 @@ Thêm hyper và Go net/http. Các ô TLS chạy TLS 1.3, AES-256-GCM, X25519, EC
   - Thứ M3 thêm vào mỗi request: một `em_now()` và một scope trong `send_all`, cộng thêm lần kiểm deadline trước op.
   - Cách đo dứt khoát: chạy A/B cả hai binary trong cùng một job CI.
 
+
+### A/B M2 / M3 trong cùng job (run 43551619641, `bench/http_ab.sh`, base 160066d, 9 vòng)
+
+new/base CPU server mỗi request, trung vị [min–max]:
+
+- x86: mọi ô SAME, trung vị 1.000–1.030. Ô epoll cao nhất 1.016 (http4k 16). Vậy độ lệch +0.05–0.11 so với nginx giữa M2 và M3 đến từ việc CI đổi máy x86, không phải từ code M3.
+- arm: 15/16 ô SAME (trung vị 1.012–1.065). Một ô WORSE: http4k 16 uring 1.057 [1.032–1.090].
+- Mọi trung vị đều ≥ 1. Đó là giá của timeout M3 (một `em_now()` và một scope mỗi lần send, cộng lần kiểm deadline trước op), khoảng 1–3% trên x86 và 2–6% trên arm. Đây là trade-off đã chọn ở M3: không có timeout gửi thì một peer không đọc giữ kết nối mãi.
+  - Xét lại nếu một ô plain vs đối thủ chuyển sang THUA vì phần này.
+
+### TLS churn trên uring (profile 43550719695, AWS-LC; chẩn đoán local)
+
+- Số lệnh mỗi kết nối bằng nhau giữa hai backend.
+  - x86: `instructions:u` 1.077M / 1.084M, `cycles:u` và `cycles:k` cũng bằng nhau (443k / 448k, 76.6k / 76.6k). Trong profile, rps uring chỉ thấp hơn 1.6%.
+  - arm: `instructions:u` 835k / 842k, `instructions:k` 97k / 96k, nhưng `cycles:k` 160k / 109k (+46%), `cycles:u` 414k / 375k (+10%), `branch-misses:u` 888 / 559.
+- Theo profile arm, phần dư mỗi kết nối nằm chủ yếu trong libcrypto (+5 µs, cùng số lệnh) và `_raw_spin_unlock_irqrestore` (+3 µs). Không có symbol mới nào của io_uring.
+- Syscall mỗi kết nối: uring 4, epoll 11. Không có io-wq, context switch không đáng kể.
+- Local x86 (máy dùng chung, nhiễu 5–10%): uring và epoll hoà.
+  - Thử bỏ lần `recv` luôn EAGAIN ngay sau `flush()` trong `fill()` (~0.93 syscall/kết nối): không đo được lợi ích, đã bỏ.
+- Kết luận: cùng hiện tượng `plans/tls-fix.md` Phần 2 đã ghi, IPC thấp hơn trên VM arm khi chạy uring. Không phải việc thừa trong em_tls hay em_http.
+  - Không sửa. Điều kiện xét lại giữ nguyên: uring churn trên arm thật (không phải VM) vẫn > 1.1x epoll.
+  - THUA hyper ở ô TLS churn em-uring do gốc này. x86 1.11 nằm trong nhiễu giữa các run: profile cho thấy chi phí server process bằng nhau.
+
+### Nợ: fuzz http flake trên CI x86 (ci 43551227180, 43352616779)
+
+- Kịch bản lỗi: `em_run` trả `-ENOMEM` (-12) giữa chừng một lượt fuzz, tại input thứ ~2.6k (lần trước sau ~17 s). Chỉ gặp trên CI x86 (kernel 7.0.0-aws), chưa gặp trên arm.
+- Đã loại:
+  - Không phụ thuộc input: input crash chạy lại 200 lần không lỗi.
+  - Không do memlock: ép uring với memlock 16 KB, `em_run` lặp liên tục không lỗi.
+  - Không tái hiện local: kernel 7.2, 606k input / 4 phút; `em_run` rỗng lặp 200k lần trên cả hai backend đều không lỗi.
+- Nguồn -ENOMEM khả dĩ trong `em_run`:
+  - `io_uring_queue_init` của worker; probe 2 entry đã qua nên không có fallback sang epoll;
+  - `mmap` stack fiber gốc;
+  - `eventfd`.
+  Harness không phân biệt được ba nguồn này.
+- Điều kiện xoá: biết được bước nào trả -ENOMEM (in thêm chẩn đoán khi lỗi), rồi sửa hoặc chứng minh là lỗi môi trường của runner.
