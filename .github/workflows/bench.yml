@@ -31,6 +31,9 @@ on:
         description: "bench: only the HTTP cells, plain and TLS (ONLY=http, plans/http.md): em-http-* vs nginx, haproxy, h2o, hyper, Go net/http; not with tlsonly; rivals does not apply; use rounds >= 9 for the verdicts"
         type: boolean
         default: false
+      httpab:
+        description: "base git ref (e.g. 160066d): run bench/http_ab.sh (em_http at that ref vs this checkout, plain HTTP cells, same job) instead of the bench; empty = off"
+        default: ""
       rivals:
         description: "bench only: rust = the Rust runtimes (default); cpp = em + tokio + C/C++/Go servers (plans/bench-cpp.md); all = both"
         type: choice
@@ -57,12 +60,16 @@ jobs:
     # httponly: (7 servers x 8 plain cells + 7 TLS servers x 3 TLS cells) x 9 rounds x ~11.5 s = ~133 min + build (Rust
     # client and hyper ~10 min, em_http, h2o from source ~5 min cold: its build is cached, the Go toolchain download is
     # cached too) = ~148 min: over the 150 of the default rivals with no margin, so httponly has its own 200. Keep rivals=rust with it.
+    # httpab: 8 cells x 2 backends x 2 versions x 9 rounds x ~11 s = ~53 min + two em_http builds and the client (~12 min
+    # cold): inside the default 150.
     # The native servers add a cold build of ~30 min (photon and its pinned liburing/libaio, asio, libuv, go download,
     # seastar ~3.5 min; a warm cpp-deps cache takes about 5), the Rust build ~10. cpp/all budget 300 min: all at the
     # defaults ~220 min, all tlsonly 9 rounds ~160 min. all with 9 rounds and the plain cells is ~355 min: use tlsonly there.
     timeout-minutes: ${{ inputs.httponly && 200 || inputs.rivals == 'rust' && 150 || 300 }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: ${{ inputs.httpab != '' && 0 || 1 }} # httpab: bench/http_ab.sh checks out the base ref as a worktree
       - name: deps
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liburing-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
@@ -146,6 +153,8 @@ jobs:
               PROF_SERVERS="$(bash -c 'source bench/run.sh && echo "${TLS_SERVERS[*]}"' bench/profile.sh)" \
               PROF_CELLS="tls:256:128 tls:256:4096 churntls:64:128 churntlsres:64:128" \
               PROF_CALLGRAPH=1 PROF_COUNTERS=1 bench/profile.sh
+          elif [[ -n "${{ inputs.httpab }}" ]]; then
+            BASE=${{ inputs.httpab }} DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/http_ab.sh
           elif [[ "${{ inputs.tlsab }}" == true ]]; then
             DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/tls_ab.sh
           elif [[ "${{ inputs.tlslib }}" == true ]]; then
