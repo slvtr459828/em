@@ -55,12 +55,14 @@ Lý do đầy đủ nằm trong [DESIGN.md](DESIGN.md).
 | M5 | Đo sâu: syscall/round-trip và `perf`, khoảng nhiễu qua 5 vòng, latency p99, churn connection, soak 600 s với RSS phẳng | Xong |
 | v0.1 | offload + DNS | Xong |
 | v0.2 | TLS: `em_tls` (OpenSSL/AWS-LC qua BIO tự viết, ngoài `libem`); Rust dùng rustls trên `em::TcpStream` | Xong (CI [42615977691](https://github.com/slvtr459828/em/actions/runs/42615977691)) |
+| HTTP đợt 1 | Server HTTP/1.0 và 1.1: `em_http` (picohttpparser, ngoài `libem`), keep-alive, pipelining, body, giới hạn, timeout, lingering close, plain và TLS | Xong (bench [43468314581](https://github.com/slvtr459828/em/actions/runs/43468314581)) |
 
-Sau v0.2: HTTP, binding Java/JS/Python.
+Tiếp theo: HTTP/2 (đợt 2, nghttp2 + ALPN), binding Java/JS/Python.
 
 ## Build và test
 
-Cần: Linux ≥ 6.1, gcc, make, liburing-devel. Test ASan cần thêm libasan và libubsan. TLS (`libem_tls`, test t40–t46) cần thêm OpenSSL ≥ 3.0 (`libssl-dev`/`openssl-devel`, tìm bằng `pkg-config openssl`; hoặc `make TLS_PREFIX=dir` với một prefix OpenSSL/AWS-LC tự build, xem đầu `include/em_tls.h`); thiếu thì `libem` và test của nó vẫn build, còn `make test` in dòng `SKIPPED: TLS tests ...` (không bỏ qua âm thầm).
+Cần: Linux ≥ 6.1, gcc, make, liburing-devel. Test ASan cần thêm libasan và libubsan. `libem_http` (test t50–t59) không cần gì thêm; bản TLS của các test đó và TLS
+(`libem_tls`, test t40–t46) cần thêm OpenSSL ≥ 3.0 (`libssl-dev`/`openssl-devel`, tìm bằng `pkg-config openssl`; hoặc `make TLS_PREFIX=dir` với một prefix OpenSSL/AWS-LC tự build, xem đầu `include/em_tls.h`); thiếu thì `libem` và test của nó vẫn build, còn `make test` in dòng `SKIPPED: TLS tests ...` (không bỏ qua âm thầm).
 
 ```bash
 make test         # -O2
@@ -230,6 +232,56 @@ lại sau handshake. CPU: bench có thêm
 em-tls-uring/em-tls-epoll/tokio-rustls ở echo 256 × 128, 256 × 4096 và churn 64 × 128, và bảng
 (h) trong `bench/table.py` tính chi phí TLS = µs/round-trip của em-tls trừ của em thường cùng
 ô (chạy bằng workflow `bench`, chưa có số chính thức; số kTLS dựa vào ô 4096, xem `plans/v0.2.md`).
+
+## HTTP
+
+**C/C++:** `include/em_http.h` + `libem_http.a`, server HTTP/1.0 và HTTP/1.1. Parse bằng
+picohttpparser (vendor ở `third_party/`), không cấp phát gì cho mỗi request. Một lời gọi
+`em_http_serve` phục vụ một kết nối trên fiber của nó: parse, gọi handler, ghi response, lặp
+keep-alive. Handler là code đồng bộ.
+
+```c
+static int hello(em_http_conn *c, const em_http_req *r, void *arg)
+{
+    static const em_http_header h[] = { { "Content-Type", 12, "text/plain", 10 } };
+    return em_http_respond(c, 200, h, 1, "Hello, World!", 13);   // body: em_http_read_body trước đó
+}
+
+static int conn(void *arg)                       // một fiber cho mỗi kết nối đã accept
+{
+    int fd = (int)(intptr_t)arg;
+    em_http_serve(fd, NULL, NULL, hello, NULL);  // NULL tls = plain; NULL cfg = mặc định
+    em_close(fd);
+    return 0;
+}
+```
+
+- **Có sẵn:** keep-alive, pipelining (các response gom lại một lần send), body Content-Length và
+  chunked, `Expect: 100-continue`, HEAD. Request bị từ chối được trả lời rồi đóng kết nối:
+  400 (smuggling CL+TE, obs-fold...), 413, 417, 431, 501.
+- **Mặc định an toàn:** header 8 KiB, body 1 MiB, header timeout 30 s, idle 60 s, send timeout
+  60 s (giống `send_timeout` của nginx). Đóng kết nối khi peer còn đang gửi thì linger tối đa
+  2 s / 1 MiB để client không mất response vì RST. Mọi giới hạn nằm trong `em_http_cfg`.
+- **TLS:** caller tự `em_tls_accept` rồi truyền `em_tls *` vào serve. Serve không bao giờ
+  shutdown, free hay close nó. `libem_http` không tham chiếu OpenSSL, nên chương trình chỉ
+  dùng plain không phải link nó.
+- **SIMD:** mặc định build portable. `make HTTP_SSE42=1` bật đường SSE4.2 của picohttpparser
+  trên x86, và bench luôn bật nó.
+- **Không có:** HTTP client, HTTP/2 (đợt 2), WebSocket, router, nén, sendfile. Router và
+  middleware là việc của framework phía trên.
+
+Ví dụ chạy được, gồm plain, TLS, đọc body và nhiều worker: `bench/em_http.c` (`make
+bench-em-http`), được `tests/http_curl.sh` kiểm bằng curl trên CI.
+
+**Đo** (workflow `bench`, `httponly=true`, server 1 CPU, 9 vòng, x86 và arm64; chi tiết ở
+`plans/http.md`):
+- Plain: không ô nào thua nginx, haproxy, h2o, hyper hay Go net/http về CPU mỗi request.
+  Keep-alive tốn 0.63–0.95x CPU của đối thủ. Pipeline 16 cho thông lượng gấp 9–22x.
+- TLS keep-alive: em-uring tốn 0.43–0.61x CPU của nginx. TLS churn (bắt tay đầy đủ) tốn
+  khoảng 0.5x nginx/haproxy/h2o.
+- Ô em thua, đều so với hyper/rustls:
+  - TLS churn trên uring: x86 1.11, arm 1.26; trên epoll thì ngang. Đó là IPC thấp hơn trên VM arm, cùng số lệnh với epoll (`plans/tls-fix.md`).
+  - TLS keep-alive 16 conns trên epoll ở arm: 1.08. libssl tốn nhiều lệnh hơn rustls cho mỗi record (`plans/bench-cpp.md`).
 
 ## Tài liệu
 
