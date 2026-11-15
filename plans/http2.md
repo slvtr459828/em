@@ -44,8 +44,11 @@ trailers để sang đợt sau, khi đã có số đo của đợt này.
 `TLS_PREFIX`.
 - Bắt buộc phiên bản ≥ 1.57 (có chống Rapid Reset, CVE-2023-44487), kiểm lúc compile.
 - Chống CONTINUATION flood (CVE-2024-27983/28182) có từ 1.61. Ubuntu 24.04 đóng gói 1.59.
-  Lúc implement phải kiểm xem bản vá đã được backport chưa, và có test riêng cho trường hợp này
-  (xem mục Kiểm thử).
+  **Giữ sàn 1.57, không nâng lên 1.61 và không kiểm phiên bản cho lỗi này**: distro backport bản
+  vá mà không đổi số phiên bản, nên số phiên bản không trả lời được câu hỏi. Câu trả lời là test
+  `CONTINUATION flood` riêng (xem mục Kiểm thử), chạy trên CI Ubuntu với gói hệ thống. Bản 1.59
+  của Ubuntu chưa được backport thì test đó đỏ và ta biết ngay; lúc đó mới quyết giữa nâng sàn
+  hay tự chặn ở fiber đọc.
 - Đã cân nhắc và loại:
   - Vendor nghttp2: khoảng 30 file C, phải theo dõi CVE thay cho distro.
   - Tự viết h2 và HPACK: sai thì thành lỗ bảo mật, đúng y lý do đợt 1 không tự viết parser.
@@ -138,7 +141,7 @@ OpenSSL.
 - Scope huỷ hoặc deadline của caller: mọi fiber stream đều dừng và serve trả về.
 - Tấn công:
   - Rapid Reset: mở rồi huỷ stream liên tục mà số fiber và RSS vẫn có trần.
-  - CONTINUATION flood: header chia nhỏ vô hạn.
+  - CONTINUATION flood: header chia nhỏ vô hạn (test riêng, xem mục Kiểm thử).
   - HPACK bomb: header nén nhỏ, giải nén ra lớn.
   - SETTINGS flood và PING flood.
 
@@ -149,6 +152,14 @@ OpenSSL.
   dependency.
 - **h2spec** (bộ kiểm conformance chuẩn, binary Go, tải cố định một phiên bản trên CI): chạy
   toàn bộ, mọi mục phải pass. Mục nào bỏ qua phải ghi lý do trong plan.
+- **Test CONTINUATION flood**, tách riêng, tên nói rõ CVE-2024-27983/28182:
+  - Client là byte thô, không phải nghttp2 client (client đúng chuẩn không sinh được frame này):
+    preface, SETTINGS, rồi HEADERS không có END_HEADERS, theo sau là 10.000 frame CONTINUATION
+    nhỏ không bao giờ có END_HEADERS. Gửi ở cả h2c lẫn h2 qua TLS.
+  - Pass khi: server gửi GOAWAY hoặc đóng kết nối trước khi client gửi hết; handler không bao
+    giờ được gọi; RSS của server tăng dưới một trần cố định ghi trong test.
+  - Không skip, không điều kiện theo phiên bản. Chạy trong `make test` trên mọi job CI, nên job
+    Ubuntu kiểm đúng gói 1.59 mà người dùng Ubuntu sẽ link.
 - `curl --http2` và `--http2-prior-knowledge` trong `tests/http_curl.sh`.
 - Fuzz: harness libFuzzer gửi byte thô vào serve qua h2c (preface + frame). Corpus mồi lấy từ
   output của h2spec.
@@ -166,7 +177,8 @@ OpenSSL.
 ## Thứ tự làm
 
 1. **M1:** build `libem_http2.a`, phát hiện ALPN và h2c, mô hình ba loại fiber, GET không body,
-   response trọn gói. Có test, chạy một phần h2spec, bench GET so với nginx và h2o. **Dừng xem số**
+   response trọn gói. Có test, chạy một phần h2spec, bench GET so với nginx và h2o. Test
+   CONTINUATION flood làm ngay ở M1, không đợi M2: kết quả của nó quyết định sàn phiên bản. **Dừng xem số**
    trước khi làm tiếp: nếu chi phí mỗi stream đứng sai chỗ thì sửa kiến trúc trước.
 2. **M2:** body và flow control, giới hạn, timeout, GOAWAY, RST, test tấn công, h2spec đầy đủ,
    fuzz.
