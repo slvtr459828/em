@@ -199,7 +199,7 @@ ifdef H2_TESTS
 # the same program linked with libem_http2: h2 through ALPN, h2c through the preface (bench ONLY=h2)
 bench-em-http2: $(B_REL)/em_http_h2
 $(B_REL)/em_http_h2: bench/em_http.c tests/tls_util.h $(B_REL)/libem_http2.a $(B_REL)/libem_http.a $(B_REL)/libem_tls.a $(B_REL)/libem.a
-	$(CC) $(CF_REL) $(TLS_CF) $(H2_CF) -Isrc -Wl,-u,em_http2_serve $< $(B_REL)/libem_http2.a $(B_REL)/libem_http.a $(B_REL)/libem_tls.a $(B_REL)/libem.a $(H2_LIBS) $(TLS_LIBS) -luring -lm -lpthread -o $@
+	$(CC) $(CF_REL) -DEM_H2 $(TLS_CF) $(H2_CF) -Isrc -Wl,-u,em_http2_serve $< $(B_REL)/libem_http2.a $(B_REL)/libem_http.a $(B_REL)/libem_tls.a $(B_REL)/libem.a $(H2_LIBS) $(TLS_LIBS) -luring -lm -lpthread -o $@
 endif
 bench-em-tls: $(B_REL)/em_tls_echo
 $(B_REL)/em_tls_echo: bench/em_tls_echo.c tests/tls_util.h $(B_REL)/libem_tls.a $(B_REL)/libem.a

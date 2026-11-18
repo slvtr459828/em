@@ -1,9 +1,10 @@
 /* HTTP server for the bench: argv[1] = port, argv[2] = workers (default 1), argv[3] = "tls" for
  * HTTP over em_tls. Same shape as em_echo / em_tls_echo: each worker listens with SO_REUSEPORT,
  * one fiber per connection. TLS: the certificate is generated at startup (tests/tls_util.h); the
- * bench client accepts any certificate. ALPN: "h2" then "http/1.1" (a client that offers none gets
- * none, so the h1 cells are unchanged); h2 and h2c need the binary linked with libem_http2
- * (make bench-em-http2 builds that one: the h2 cells of bench/run.sh ONLY=h2).
+ * bench client accepts any certificate. Built with -DEM_H2 and linked with libem_http2 (make
+ * bench-em-http2, the h2 cells of bench/run.sh ONLY=h2) it selects ALPN "h2" then "http/1.1" and
+ * serves h2c through the preface; the plain build selects no ALPN, since offering "h2" without
+ * libem_http2 would make an h2 client (curl https) talk h2 to an h1 server.
  * GET /   -> 200 text/plain "Hello, World!" (13 B)
  * GET /4k -> 200 text/plain 4096 x 'a'
  * POST /echo -> 200, the request body back (tests/http_curl.sh; not a bench cell)
@@ -113,7 +114,9 @@ int main(int argc, char **argv)
         SSL_CTX *cctx;
         tls_test_ctx(&sctx, &cctx);
         SSL_CTX_free(cctx);
+#ifdef EM_H2
         SSL_CTX_set_alpn_select_cb(sctx, tls_test_alpn, NULL);
+#endif
     }
     int r = em_run(workers, worker, NULL);
     if (r) fprintf(stderr, "em_run: %d\n", r);
