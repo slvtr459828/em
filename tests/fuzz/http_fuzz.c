@@ -9,11 +9,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/eventfd.h>
-#include <sys/mman.h>
-#include <sys/resource.h>
 #include <sys/socket.h>
-#include <liburing.h>
 #include <unistd.h>
 #include "../../include/em.h"
 #include "../../include/em_http.h"
@@ -91,40 +87,18 @@ static int run(void *arg)
     return em_scope_close(&sc);
 }
 
-/* em_run failed (CI has seen -ENOMEM on x86, never locally): redo each step of its setup now and
- * say which one fails, with the memory state. Remove once the cause is known (plans/http.md, Nợ). */
-static void diagnose(void)
+/* Backend epoll unless EM_BACKEND says otherwise. One em_run per input creates and drops an io_uring
+ * ring each time; the kernel frees rings asynchronously and charges them to the user's
+ * RLIMIT_MEMLOCK (8 MiB on CI runners, shared with the tests that ran just before), so ring churn
+ * at fuzzer speed ran out and em_run returned -ENOMEM (ci 43619224492, 43714647516: the 2-entry
+ * probe ring succeeded, the 256/1024 worker ring did not, VmLck 0). Nothing under test depends on
+ * the backend: src/http.c only sees em_recv/em_send. */
+int LLVMFuzzerInitialize(int *argc, char ***argv)
 {
-    struct io_uring r;
-    struct io_uring_params p;
-    memset(&p, 0, sizeof p);
-    p.flags = IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG |
-              IORING_SETUP_SUBMIT_ALL | IORING_SETUP_CQSIZE;
-    p.cq_entries = 1024;
-    int rc = io_uring_queue_init_params(256, &r, &p);
-    fprintf(stderr, "diag: ring(256/1024) = %d\n", rc);
-    if (rc == 0) io_uring_queue_exit(&r);
-    void *m = mmap(NULL, 1u << 20, PROT_READ | PROT_WRITE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_STACK, -1, 0);
-    fprintf(stderr, "diag: mmap 1 MiB = %s (errno %d)\n", m == MAP_FAILED ? "failed" : "ok", errno);
-    if (m != MAP_FAILED) munmap(m, 1u << 20);
-    int fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    fprintf(stderr, "diag: eventfd = %d (errno %d)\n", fd, fd < 0 ? errno : 0);
-    if (fd >= 0) close(fd);
-    struct rlimit rl;
-    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0)
-        fprintf(stderr, "diag: RLIMIT_MEMLOCK cur %llu max %llu\n", (unsigned long long)rl.rlim_cur,
-                (unsigned long long)rl.rlim_max);
-    static const char *const files[] = { "/proc/self/status", "/proc/meminfo" };
-    for (size_t i = 0; i < 2; i++) {
-        FILE *f = fopen(files[i], "r");
-        char line[256];
-        while (f && fgets(line, sizeof line, f))
-            if (!strncmp(line, "Vm", 2) || !strncmp(line, "Mem", 3) || !strncmp(line, "Commit", 6) ||
-                !strncmp(line, "Threads", 7))
-                fprintf(stderr, "diag: %s", line);
-        if (f) fclose(f);
-    }
+    (void)argc;
+    (void)argv;
+    setenv("EM_BACKEND", "epoll", 0);
+    return 0;
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
@@ -133,6 +107,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     in_data = data;
     in_len = size;
     int rc = em_run(1, run, NULL);
-    if (rc != 0) { fprintf(stderr, "em_run = %d (backend %s)\n", rc, em_backend()); diagnose(); __builtin_trap(); }
+    if (rc != 0) { fprintf(stderr, "em_run = %d (backend %s)\n", rc, em_backend()); __builtin_trap(); }
     return 0;
 }

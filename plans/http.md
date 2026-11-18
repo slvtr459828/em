@@ -304,3 +304,19 @@ new/base CPU server mỗi request, trung vị [min–max]:
   - `eventfd`.
   Harness không phân biệt được ba nguồn này.
 - Điều kiện xoá: biết được bước nào trả -ENOMEM (in thêm chẩn đoán khi lỗi), rồi sửa hoặc chứng minh là lỗi môi trường của runner.
+
+### Nợ fuzz http flake: đã trả (ci 43619224492, 43714647516)
+
+Diag cho thấy `io_uring_queue_init(256/1024) = -ENOMEM`, trong khi ring probe 2 entry, `mmap` và
+`eventfd` đều tạo được. VmLck của process bằng 0, RLIMIT_MEMLOCK là 8 MiB.
+- io_uring tính ring vào `locked_vm` của cả user, không phải của process.
+- Kernel giải phóng ring bất đồng bộ.
+- Fuzzer gọi một `em_run` cho mỗi input, và bước test ngay trước đó tạo hàng nghìn ring cùng user.
+- Kết quả: hạn mức memlock bị dùng hết trước khi kernel kịp trả lại.
+
+Sửa: harness chạy epoll (`setenv("EM_BACKEND", "epoll", 0)` trong `LLVMFuzzerInitialize`).
+`src/http.c` chỉ thấy `em_recv`/`em_send`, nên backend không ảnh hưởng tới thứ đang fuzz. Đã bỏ
+phần diag.
+
+Không đổi em: chương trình gọi `em_run` liên tục theo kiểu fuzzer không phải cách dùng thật.
+Giới hạn memlock của io_uring đã được ghi trong README.
