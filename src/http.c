@@ -7,6 +7,7 @@
 #include <time.h>
 #include "em.h"
 #include "em_http.h"
+#include "http_priv.h"
 #include "picohttpparser.h"
 
 #define WBUF_BYTES 8192u
@@ -31,13 +32,16 @@
 #define LINGER_NS  2000000000ll
 #define LINGER_MAX (1u << 20)
 
-/* em_tls.h pulls in OpenSSL, which a plain-HTTP user need not have, so the two calls made here are
- * declared again, weak: tls != NULL means the caller got it from em_tls_accept and so linked
- * libem_tls, which binds them; with tls == NULL they are never reached. Keep in step with em_tls.h. */
-ssize_t em_tls_recv(em_tls *t, void *buf, size_t len) __attribute__((weak));
-int     em_tls_send_all(em_tls *t, const void *buf, size_t len) __attribute__((weak));
+/* Weak, so libem_http does not need OpenSSL: see http_priv.h. Same for HTTP/2: libem_http2.a binds
+ * these when the program links it (nothing here pulls it in: see the Makefile, -Wl,-u,em_http2_serve).
+ * Without it an h2c preface is a 400. */
+#pragma weak em_http2_serve
+#pragma weak em_http2_respond
+#pragma weak em_http2_read_body
 
 struct em_http_conn {
+    int     h2;         /* 0: this struct. An HTTP/2 stream (http2.c) starts with this int set to 1 and is
+                         * what a handler gets as its em_http_conn: respond and read_body hand it over */
     int     fd;
     em_tls *tls;        /* NULL = plain */
     int64_t send_ns;    /* 0 = none */
@@ -79,7 +83,7 @@ _Static_assert(sizeof(em_http_header) == sizeof(struct phr_header) &&
 static __thread struct { time_t sec; char line[40]; } date_cache;
 #define DATE_LEN 37u
 
-static const char *date_line(void)
+const char *em_http_date_line(void)
 {
     time_t now = time(NULL);
     if (now != date_cache.sec || !date_cache.line[0]) {
@@ -129,7 +133,7 @@ static const char *reason(int s)
     }
 }
 
-static char *put_u64(char *p, uint64_t v)
+char *em_http_put_u64(char *p, uint64_t v)
 {
     char t[20];
     int n = 0;
@@ -141,20 +145,25 @@ static char *put_u64(char *p, uint64_t v)
 /* Every send serve makes. The deadline is per call that makes progress, not per response: a
  * slow reader that keeps taking bytes is never cut, one that takes none for send_ns is (-ETIMEDOUT,
  * ours or the caller's scope: both end the connection the same way). TLS goes in TLS_CHUNK pieces. */
-static int send_all(em_http_conn *c, const char *p, size_t len)
+int em_http_send_all(int fd, em_tls *tls, int64_t send_ns, const char *p, size_t len)
 {
     while (len) {
-        size_t n = c->tls && len > TLS_CHUNK ? TLS_CHUNK : len;
+        size_t n = tls && len > TLS_CHUNK ? TLS_CHUNK : len;
         em_scope s;
-        if (c->send_ns) em_scope_open(&s, em_now() + c->send_ns);
-        ssize_t r = c->tls ? em_tls_send_all(c->tls, p, n) : em_send(c->fd, p, n);
-        if (c->send_ns) em_scope_close(&s); /* no children: nothing to wait for */
+        if (send_ns) em_scope_open(&s, em_now() + send_ns);
+        ssize_t r = tls ? em_tls_send_all(tls, p, n) : em_send(fd, p, n);
+        if (send_ns) em_scope_close(&s); /* no children: nothing to wait for */
         if (r < 0) return (int)r;
-        if (c->tls) r = (ssize_t)n;
+        if (tls) r = (ssize_t)n;
         p += r;
         len -= (size_t)r;
     }
     return 0;
+}
+
+static int send_all(em_http_conn *c, const char *p, size_t len)
+{
+    return em_http_send_all(c->fd, c->tls, c->send_ns, p, len);
 }
 
 static int flush(em_http_conn *c)
@@ -171,6 +180,7 @@ static int flush(em_http_conn *c)
 int em_http_respond(em_http_conn *c, int status, const em_http_header *h, size_t nh,
                     const void *body, size_t len)
 {
+    if (c->h2) return em_http2_respond(c, status, h, nh, body, len);
     if (c->err) return c->err;
     if (c->responded) return -EALREADY;
     if (status < 100 || status > 999) return -EINVAL;
@@ -197,7 +207,7 @@ int em_http_respond(em_http_conn *c, int status, const em_http_header *h, size_t
     size_t rl = strlen(rs);
     memcpy(p, rs, rl); p += rl;
     memcpy(p, "\r\n", 2); p += 2;
-    memcpy(p, date_line(), DATE_LEN); p += DATE_LEN;
+    memcpy(p, em_http_date_line(), DATE_LEN); p += DATE_LEN;
     for (size_t i = 0; i < nh; i++) {
         memcpy(p, h[i].name, h[i].name_len); p += h[i].name_len;
         *p++ = ':'; *p++ = ' ';
@@ -205,7 +215,7 @@ int em_http_respond(em_http_conn *c, int status, const em_http_header *h, size_t
         *p++ = '\r'; *p++ = '\n';
     }
     memcpy(p, "Content-Length: ", 16); p += 16;
-    p = put_u64(p, len);
+    p = em_http_put_u64(p, len);
     *p++ = '\r'; *p++ = '\n';
     if (!c->keep) { memcpy(p, "Connection: close\r\n", 19); p += 19; }
     else if (c->minor == 0) { memcpy(p, "Connection: keep-alive\r\n", 24); p += 24; }
@@ -345,6 +355,7 @@ static ssize_t body_fail(em_http_conn *c, ssize_t e, int own)
 
 ssize_t em_http_read_body(em_http_conn *c, void *buf, size_t len)
 {
+    if (c->h2) return em_http2_read_body(c, buf, len);
     if (c->err) return c->err;
     if (c->responded) return -EALREADY;
     if (c->rerr) return c->rerr;
@@ -456,22 +467,34 @@ static int unread(const em_http_conn *c)
  * unread bytes in the socket makes the kernel send RST, which can destroy the response before the
  * client reads it. So send FIN after the response (SHUT_WR), then discard what the peer still sends
  * until it ends, LINGER_NS or LINGER_MAX. Raw bytes on the fd, also under TLS (records are not
- * parsed, no close_notify is sent: the write side is already shut). The caller still closes. */
-static void linger(em_http_conn *c)
+ * parsed, no close_notify is sent: the write side is already shut). The caller still closes.
+ * buf (cap bytes) is scratch. Also used by http2.c. */
+void em_http_linger(int fd, void *buf, size_t cap)
 {
-    if (em_shutdown(c->fd, SHUT_WR) < 0) return;
+    if (em_shutdown(fd, SHUT_WR) < 0) return;
     em_scope s;
     em_scope_open(&s, em_now() + LINGER_NS); /* the caller's cancel and deadline still end it earlier */
     for (size_t left = LINGER_MAX; left; ) {
-        ssize_t n = em_recv(c->fd, c->cw, left < CWIN_BYTES ? left : CWIN_BYTES); /* cw is free here */
+        ssize_t n = em_recv(fd, buf, left < cap ? left : cap);
         if (n <= 0) break;
         left -= (size_t)n;
     }
     em_scope_close(&s);
 }
 
+static void linger(em_http_conn *c)
+{
+    em_http_linger(c->fd, c->cw, CWIN_BYTES); /* cw is free here */
+}
+
 int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h, void *arg)
-{    size_t rcap = cfg && cfg->max_header_bytes ? cfg->max_header_bytes : DEF_RBUF;
+{
+    if (tls && em_http2_serve) { /* tls != NULL: libem_tls is linked, em_tls_alpn is bound */
+        unsigned n;
+        const unsigned char *p = em_tls_alpn(tls, &n);
+        if (p && n == 2 && p[0] == 'h' && p[1] == '2') return em_http2_serve(fd, tls, cfg, h, arg, NULL, 0);
+    }
+    size_t rcap = cfg && cfg->max_header_bytes ? cfg->max_header_bytes : DEF_RBUF;
     size_t maxh = cfg && cfg->max_headers ? cfg->max_headers : DEF_HDRS;
     unsigned maxreq = cfg ? cfg->max_requests_per_conn : 0;
     int64_t hto = !cfg || !cfg->header_timeout_ns ? DEF_HDR_TO : cfg->header_timeout_ns;
@@ -498,7 +521,14 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
         size_t avail = c.rlen - rpos;
         if (avail) {
             pret = phr_parse_request(rbuf + rpos, avail, &m, &ml, &path, &pl, &minor, hs, &nh, last);
-            if (pret == -1) { ret = fail(&c, 400, 1); lng = 1; break; }
+            if (pret == -1) {
+                /* h2c prior knowledge: the client preface starts like a request line with HTTP/2.0 */
+                if (!nreq && avail >= 14 && !memcmp(rbuf + rpos, "PRI * HTTP/2.0", 14) && em_http2_serve) {
+                    ret = em_http2_serve(fd, tls, cfg, h, arg, rbuf + rpos, avail);
+                    break;
+                }
+                ret = fail(&c, 400, 1); lng = 1; break;
+            }
         }
         if (pret == -2) {
             if (avail == rcap) { ret = fail(&c, 431, 1); lng = 1; break; }
@@ -533,12 +563,13 @@ int em_http_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler h
         int64_t cl;
         int st = inspect(hs, nh, minor, c.max_body, &keep, &cl, &expect);
         if (st) { ret = fail(&c, st, minor); lng = 1; break; }
-        if (maxreq && ++nreq >= maxreq) keep = 0;
+        nreq++;
+        if (maxreq && nreq >= maxreq) keep = 0;
 
         /* 3. the handler */
         em_http_req req = { .method = m, .path = path, .method_len = ml, .path_len = pl,
                             .minor_version = minor, .headers = (const em_http_header *)hs,
-                            .nheaders = nh, .content_length = cl };
+                            .nheaders = nh, .content_length = cl, .version = 10 + minor };
         c.minor = minor; c.keep = keep; c.responded = 0;
         c.head = ml == 4 && !memcmp(m, "HEAD", 4);
         c.expect = expect; c.rerr = 0; c.chunked = cl < 0; c.cdone = 0;

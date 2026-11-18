@@ -30,6 +30,8 @@ typedef struct em_http_req {
     const em_http_header *headers;
     size_t nheaders;
     int64_t content_length;               /* body: Content-Length; 0 = no body; -1 = chunked */
+    int version;                          /* 10, 11 (HTTP/1.x) or 20 (HTTP/2, libem_http2.a: :authority is
+                                           * the "host" header, minor_version is 1) */
 } em_http_req;
 
 typedef struct em_http_conn em_http_conn; /* opaque */
@@ -57,6 +59,7 @@ typedef struct em_http_cfg {
                                        * em_tls (its calls then return -EPIPE: close it). No partial
                                        * response is followed by anything: serve returns -ETIMEDOUT,
                                        * em_http_respond returns it to the handler first */
+    unsigned max_concurrent_streams;  /* HTTP/2: SETTINGS_MAX_CONCURRENT_STREAMS; default 100 */
 } em_http_cfg;
 
 /* Answers the current request with one response; at most once per request. Adds the status

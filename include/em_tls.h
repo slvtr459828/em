@@ -77,5 +77,8 @@ int     em_tls_shutdown(em_tls *t);
 void    em_tls_free(em_tls *t);
 /* ALPN, peer certificate, session, SSL_key_update. Owned by t. */
 SSL    *em_tls_ssl(em_tls *t);
+/* The ALPN protocol the handshake selected (not NUL-terminated, *len bytes), NULL if none. Owned by
+ * t. em_http_serve asks this to switch to HTTP/2 ("h2"). */
+const unsigned char *em_tls_alpn(em_tls *t, unsigned *len);
 
 #endif

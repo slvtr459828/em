@@ -415,3 +415,10 @@ void em_tls_free(em_tls *t)
 }
 
 SSL *em_tls_ssl(em_tls *t) { return t->ssl; }
+
+const unsigned char *em_tls_alpn(em_tls *t, unsigned *len)
+{
+    const unsigned char *p;
+    SSL_get0_alpn_selected(t->ssl, &p, len);
+    return p;
+}
