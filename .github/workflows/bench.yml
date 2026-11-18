@@ -31,6 +31,10 @@ on:
         description: "bench: only the HTTP cells, plain and TLS (ONLY=http, plans/http.md): em-http-* vs nginx, haproxy, h2o, hyper, Go net/http; not with tlsonly; rivals does not apply; use rounds >= 9 for the verdicts"
         type: boolean
         default: false
+      h2only:
+        description: "bench: only the HTTP/2 cells, h2c and h2 over TLS (ONLY=h2, plans/http2.md M1): em-h2-* vs nginx and h2o, driven by h2load, plus the em h1 keep-alive reference; not with tlsonly or httponly; rivals does not apply; use rounds >= 9 for the verdicts"
+        type: boolean
+        default: false
       httpab:
         description: "base git ref (e.g. 160066d): run bench/http_ab.sh (em_http at that ref vs this checkout, plain HTTP cells, same job) instead of the bench; empty = off"
         default: ""
@@ -60,12 +64,14 @@ jobs:
     # httponly: (7 servers x 8 plain cells + 7 TLS servers x 3 TLS cells) x 9 rounds x ~11.5 s = ~133 min + build (Rust
     # client and hyper ~10 min, em_http, h2o from source ~5 min cold: its build is cached, the Go toolchain download is
     # cached too) = ~148 min: over the 150 of the default rivals with no margin, so httponly has its own 200. Keep rivals=rust with it.
+    # h2only: 8 cells x 6 servers (em x 2 backends, nginx, h2o, the two em h1 references) = 48 runs per round x 9 rounds
+    # x ~12 s = ~90 min + build (em_http_h2, h2o from source ~5 min cold, cached) = ~100 min.
     # httpab: 8 cells x 2 backends x 2 versions x 9 rounds x ~11 s = ~53 min + two em_http builds and the client (~12 min
     # cold): inside the default 150.
     # The native servers add a cold build of ~30 min (photon and its pinned liburing/libaio, asio, libuv, go download,
     # seastar ~3.5 min; a warm cpp-deps cache takes about 5), the Rust build ~10. cpp/all budget 300 min: all at the
     # defaults ~220 min, all tlsonly 9 rounds ~160 min. all with 9 rounds and the plain cells is ~355 min: use tlsonly there.
-    timeout-minutes: ${{ inputs.httponly && 200 || inputs.rivals == 'rust' && 150 || 300 }}
+    timeout-minutes: ${{ (inputs.httponly || inputs.h2only) && 200 || inputs.rivals == 'rust' && 150 || 300 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -104,8 +110,17 @@ jobs:
           sudo apt-get install -y --no-install-recommends nginx haproxy build-essential cmake git pkg-config zlib1g-dev \
             openssl curl ca-certificates tar gzip
           sudo systemctl disable --now nginx haproxy || true
+      - name: h2 deps
+        if: inputs.h2only
+        # h2load (nghttp2-client) drives the cells; libnghttp2-dev (1.59 on 24.04, floor 1.57) links libem_http2; the rest
+        # as in http deps (nginx is launched by bench/http/nginx.sh, h2o is built from source)
+        run: |
+          sudo apt-get install -y --no-install-recommends nghttp2-client libnghttp2-dev nginx build-essential cmake git \
+            pkg-config zlib1g-dev openssl curl ca-certificates tar gzip
+          sudo systemctl disable --now nginx || true
+          h2load --version
       - uses: actions/cache@v4
-        if: inputs.httponly
+        if: inputs.httponly || inputs.h2only
         with:
           path: |
             build/*/http-deps
@@ -163,8 +178,10 @@ jobs:
             SOAK=${{ inputs.soak }} bench/soak.sh
           else
             [[ "${{ inputs.tlsonly }}" != true || "${{ inputs.httponly }}" != true ]] || { echo "tlsonly and httponly are exclusive" >&2; exit 2; }
+            [[ "${{ inputs.h2only }}" != true ]] || ! [[ "${{ inputs.tlsonly }}" == true || "${{ inputs.httponly }}" == true ]] || { echo "h2only, tlsonly and httponly are exclusive" >&2; exit 2; }
             [[ "${{ inputs.tlsonly }}" != true ]] || export ONLY=tls
             [[ "${{ inputs.httponly }}" != true ]] || export ONLY=http
+            [[ "${{ inputs.h2only }}" != true ]] || export ONLY=h2
             export RIVALS=${{ inputs.rivals }}
             DURATION=${{ inputs.duration }} ROUNDS=${{ inputs.rounds }} bench/run.sh
           fi

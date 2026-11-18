@@ -3,9 +3,11 @@
 // Why a libh2o program, not the h2o binary: h2o serves a file per request (open/fstat/read) and mruby
 // adds an interpreter, so either would charge h2o for something em_http, nginx `return` and haproxy
 // `return` do from memory. Here the body is a static buffer handed to h2o_send: no copy, no file.
-// usage: h2o_hello port [workers [cert.pem key.pem]]   (workers is accepted for the common launch line; h2o runs 1 thread)
+// usage: h2o_hello port [workers [cert.pem key.pem [h2]]]   (workers is accepted for the common launch line; h2o runs 1 thread)
 // With the two PEM files (bench/http/cert.sh) the listener is TLS: OpenSSL, TLS 1.2+, TLS 1.3 suite AES-256-GCM only,
 // group X25519 only, no ALPN (so HTTP/1.1, never h2): the policy bench/http/nginx.sh and haproxy.sh pin too.
+// With the last argument "h2" (ONLY=h2, plans/http2.md) the TLS listener registers ALPN h2 and http/1.1. A plain listener
+// needs no flag: h2o takes the HTTP/2 preface on any port (h2c prior knowledge), which is what the h2c cells use.
 // GET / -> "Hello, World!" (13 B), GET /4k -> 4096 B, both text/plain with Content-Length; else 404.
 #include <errno.h>
 #include <netinet/in.h>
@@ -57,8 +59,9 @@ static void on_accept(h2o_socket_t *listener, const char *err)
 
 int main(int argc, char **argv)
 {
-    if (argc < 2 || argc == 4 || argc > 5) {
-        fprintf(stderr, "usage: %s port [workers [cert.pem key.pem]]\n", argv[0]);
+    int h2 = argc == 6 && strcmp(argv[5], "h2") == 0;
+    if (argc < 2 || argc == 4 || argc > 6 || (argc == 6 && !h2)) {
+        fprintf(stderr, "usage: %s port [workers [cert.pem key.pem [h2]]]\n", argv[0]);
         return 2;
     }
     memset(big, 'x', sizeof(big));
@@ -66,13 +69,14 @@ int main(int argc, char **argv)
 
     h2o_config_init(&config);
     config.http1.req_timeout = 3600 * 1000; // ms; the default 10 s would close idle keep-alive connections
+    config.http2.idle_timeout = 3600 * 1000; // same for h2
     h2o_hostconf_t *hostconf = h2o_config_register_host(&config, h2o_iovec_init(H2O_STRLIT("default")), 65535);
     h2o_pathconf_t *pathconf = h2o_config_register_path(hostconf, "/", 0);
     h2o_create_handler(pathconf, sizeof(h2o_handler_t))->on_req = on_req;
     h2o_context_init(&ctx, h2o_evloop_create(), &config);
     accept_ctx.ctx = &ctx;
     accept_ctx.hosts = config.hosts;
-    if (argc == 5) {
+    if (argc >= 5) {
         SSL_CTX *ssl = SSL_CTX_new(TLS_server_method());
         if (ssl == NULL || SSL_CTX_use_certificate_chain_file(ssl, argv[3]) != 1 ||
             SSL_CTX_use_PrivateKey_file(ssl, argv[4], SSL_FILETYPE_PEM) != 1 || SSL_CTX_set_min_proto_version(ssl, TLS1_2_VERSION) != 1 ||
@@ -80,6 +84,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "h2o_hello: TLS setup failed (cert %s, key %s)\n", argv[3], argv[4]);
             return 1;
         }
+        if (h2)
+            h2o_ssl_register_alpn_protocols(ssl, h2o_alpn_protocols);
         accept_ctx.ssl_ctx = ssl;
     }
 

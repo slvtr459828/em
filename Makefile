@@ -96,7 +96,7 @@ B_ASAN := build/$(ARCH)/asan$(TLS_TAG)$(H2_TAG)$(HTTP_TAG)
 CF_REL  := -std=gnu11 -O2 -g -D_FORTIFY_SOURCE=3 $(WARN) -Iinclude
 CF_ASAN := -std=gnu11 -O1 -g $(WARN) -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer
 
-.PHONY: all test test-asan test-rust bench-em bench-em-tls bench-em-http h2-server print-brel clean
+.PHONY: all test test-asan test-rust bench-em bench-em-tls bench-em-http bench-em-http2 h2-server print-brel clean
 all: $(B_REL)/libem.a $(B_REL)/libem_http.a $(if $(TLS_TESTS),$(B_REL)/libem_tls.a) $(if $(H2_TESTS),$(B_REL)/libem_http2.a)
 print-brel:
 	@echo $(B_REL)
@@ -195,6 +195,12 @@ ifdef TLS_TESTS
 bench-em-http: $(B_REL)/em_http
 $(B_REL)/em_http: bench/em_http.c tests/tls_util.h $(B_REL)/libem_http.a $(B_REL)/libem_tls.a $(B_REL)/libem.a
 	$(CC) $(CF_REL) $(TLS_CF) -Isrc $< $(B_REL)/libem_http.a $(B_REL)/libem_tls.a $(B_REL)/libem.a $(TLS_LIBS) -luring -lm -lpthread -o $@
+ifdef H2_TESTS
+# the same program linked with libem_http2: h2 through ALPN, h2c through the preface (bench ONLY=h2)
+bench-em-http2: $(B_REL)/em_http_h2
+$(B_REL)/em_http_h2: bench/em_http.c tests/tls_util.h $(B_REL)/libem_http2.a $(B_REL)/libem_http.a $(B_REL)/libem_tls.a $(B_REL)/libem.a
+	$(CC) $(CF_REL) $(TLS_CF) $(H2_CF) -Isrc -Wl,-u,em_http2_serve $< $(B_REL)/libem_http2.a $(B_REL)/libem_http.a $(B_REL)/libem_tls.a $(B_REL)/libem.a $(H2_LIBS) $(TLS_LIBS) -luring -lm -lpthread -o $@
+endif
 bench-em-tls: $(B_REL)/em_tls_echo
 $(B_REL)/em_tls_echo: bench/em_tls_echo.c tests/tls_util.h $(B_REL)/libem_tls.a $(B_REL)/libem.a
 	$(CC) $(CF_REL) $(TLS_CF) -Isrc $< $(B_REL)/libem_tls.a $(B_REL)/libem.a $(TLS_LIBS) -luring -lm -lpthread -o $@

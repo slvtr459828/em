@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
 # nginx for bench/run.sh ONLY=http (plans/http.md): `return 200` for the two paths of the common contract,
 # from memory (no file, no upstream), 1 worker, no logs, keep-alive without a request limit.
-# usage: bench/http/nginx.sh port [workers [tls]]; execs nginx in the foreground (apt: nginx). The config is
+# usage: bench/http/nginx.sh port [workers [tls] [h2]]; execs nginx in the foreground (apt: nginx). The config is
 # generated into build/$(uname -m)/bench-http/nginx-$port/. tls: HTTPS with the certificate of bench/http/cert.sh,
 # TLS 1.2+, TLS 1.3 suite AES-256-GCM only, group X25519 only, no ALPN (HTTP/1.1): the policy of every TLS server of the bench.
+# h2 (ONLY=h2, plans/http2.md): the listener also takes HTTP/2: with tls through ALPN, without it as h2c prior knowledge.
+# Written as the `http2` listen parameter, not `http2 on;`: Ubuntu 24.04 ships nginx 1.24, which has no such directive
+# (the parameter is deprecated since 1.25.1 but still accepted).
 set -euo pipefail
 PORT=${1:?usage: $0 port [workers]}
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 D=$ROOT/build/$(uname -m)/bench-http/nginx-$PORT
 mkdir -p "$D"
 listen='' tls=''
-if [[ ${3:-} == tls ]]; then
-    C=$("$ROOT/bench/http/cert.sh")
-    listen=' ssl'
-    tls="ssl_certificate $C/cert.pem; ssl_certificate_key $C/key.pem; ssl_protocols TLSv1.2 TLSv1.3;
-        ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384; ssl_ecdh_curve X25519;"
-elif [[ -n ${3:-} ]]; then echo "usage: $0 port [workers [tls]]" >&2; exit 2; fi
+for a in "${@:3}"; do
+    case $a in
+        tls) C=$("$ROOT/bench/http/cert.sh")
+            listen+=' ssl'
+            tls="ssl_certificate $C/cert.pem; ssl_certificate_key $C/key.pem; ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384; ssl_ecdh_curve X25519;" ;;
+        h2) listen+=' http2' ;;
+        *) echo "usage: $0 port [workers [tls] [h2]]" >&2; exit 2 ;;
+    esac
+done
 # a config token is limited to the 4 KiB parse buffer: the 4096 B body is 4 x 1024 through a variable
 k=$(head -c 1024 /dev/zero | tr '\0' x)
 cat >"$D/nginx.conf" <<CONF

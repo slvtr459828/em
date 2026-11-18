@@ -25,11 +25,16 @@
 # other server of the same kind (the rivals are epoll-only, so the backend does not pair them), same rule. The TLS
 # servers must all negotiate one (version suite group cert), else the checks fail; gohttp-tls-epoll is a --ref
 # (Go's TLS 1.3 suite is not configurable: AES-128), printed and never judged.
+# ONLY=h2 (plans/http2.md, M1): modes h2c, h2c4k, h2tls, h2tls4k (10 streams per connection, h2load); servers em-h2-*,
+# nginx-h2-epoll, h2o-h2-epoll and their -tls- variants, same tables and rule as the http cells with ratios vs nginx-h2-*, and
+# (k): the em-h1-* reference (the same binary driven by h2load --h1, a --ref: printed, never judged) against em-h2-*: server
+# us per stream over us per h1 keep-alive request, the revisit condition of plans/http2.md is > 1.2x.
 import csv, re, statistics, sys
 from collections import defaultdict
 
 REF = set()  # --ref servers
 REF_NOTE = {"go-tls-epoll": "AES-128, 1 ticket", "gohttp-tls-epoll": "AES-128, 1 ticket"}
+REF_NOTE.update({f"em-h1-{t}{b}": "h2load --h1, 1 request in flight per connection" for t in ("", "tls-") for b in ("uring", "epoll")})
 
 
 def opponents(em, srvs):  # the servers em[-tls]-<backend> is judged against: same backend (emrs-* is not a rival)
@@ -92,16 +97,17 @@ echo = [c for c in cells if c[0] == "echo"]
 churn = [c for c in cells if c[0] == "churn"]
 echotls = [c for c in cells if c[0] == "echotls"]
 churntls = [c for c in cells if c[0] in ("churntls", "churntlsres")]
-httpc = [c for c in cells if c[0].startswith("http")]
+httpc = [c for c in cells if c[0].startswith(("http", "h2"))]
 HTTP_LABEL = {"http": "GET / keep-alive", "httppipe": "GET / pipeline 16", "http4k": "GET /4k keep-alive", "httpchurn": "churn GET / (connect + 1 request + RST)",
-              "httptls": "TLS GET / keep-alive", "httpchurntls": "TLS churn GET / (connect + full handshake + 1 request + RST)"}
+              "httptls": "TLS GET / keep-alive", "httpchurntls": "TLS churn GET / (connect + full handshake + 1 request + RST)",
+              "h2c": "h2c GET /, 10 streams/conn", "h2c4k": "h2c GET /4k, 10 streams/conn", "h2tls": "h2 TLS GET /, 10 streams/conn", "h2tls4k": "h2 TLS GET /4k, 10 streams/conn"}
 hlab = lambda c: f"{HTTP_LABEL[c[0]]}, {c[1]} conns"
 mode_name = {"churntls": "full handshake, client resumption off", "churntlsres": "resumption on, session store in the client"}
 med = lambda f, cl, srv: statistics.median(col[f][(*cl, srv)].values())
 
 
 def ratio(f, cl, srv, fmt):
-    base = ("nginx-tls-epoll" if "tls" in cl[0] else "nginx-epoll") if cl[0].startswith("http") else "tokio-rustls" if "tls" in cl[0] else "tokio-epoll"
+    base = ("nginx-%s%sepoll" % ("h2-" if cl[0].startswith("h2") else "", "tls-" if "tls" in cl[0] else "")) if cl[0].startswith(("http", "h2")) else "tokio-rustls" if "tls" in cl[0] else "tokio-epoll"
     m, v, b = med(f, cl, srv), col[f][(*cl, srv)], col[f][(*cl, base)]
     rs = [v[r] / b[r] for r in v if r in b]
     rng = f" [{min(rs):.2f}–{max(rs):.2f}]" if len(rs) > 1 and srv != base else ""
@@ -275,7 +281,7 @@ if echo + churn:
     lost_cells("(j2) lost cells, plain: em against same-backend rivals", "em", echo + churn, ("em-uring", "em-epoll"), servers)
 if httpc:
     # a rival of em-http-X is a server of the same kind (plain or TLS); the cells decide which ems have rows
-    http_rivals = lambda em, srvs: [v for v in srvs if not v.startswith("em-http-") and v not in REF and ("-tls-" in v) == ("-tls-" in em)]
+    http_rivals = lambda em, srvs: [v for v in srvs if not v.startswith(("em-http-", "em-h2-", "em-h1-")) and v not in REF and ("-tls-" in v) == ("-tls-" in em)]
     http_servers = lambda cl: tls_servers if "tls" in cl[0] else servers
     for cl in httpc:
         for v in http_servers(cl):
@@ -283,7 +289,7 @@ if httpc:
                 fails.append(f"missing rows: {v} {name(cl)} rounds {sorted(missing)}")
     if any("tls" in c[0] for c in httpc):  # one negotiated set (version suite group cert) over the judged TLS servers
         try:
-            neg = [re.match(r"(\S+) \S+: (.*?) full=\d+ resumed=\d+$", l.strip()) for l in open(info) if l.strip()]
+            neg = [re.match(r"(\S+) \S+: (.*?)(?: full=\d+ resumed=\d+)?$", l.strip()) for l in open(info) if l.strip()]
         except FileNotFoundError:
             neg = []
         neg = [m for m in neg if m and m.group(1) not in REF]
@@ -292,8 +298,21 @@ if httpc:
         for v in tls_servers:
             if v not in REF and not any(m.group(1) == v for m in neg):
                 fails.append(f"tls_info.txt: no line for {v}")
-    lost_cells("(j3) lost cells, HTTP: em-http against every rival", "em-http", httpc, ("em-http-uring", "em-http-epoll", "em-http-tls-uring", "em-http-tls-epoll"),
+    lost_cells("(j3) lost cells, HTTP: em-http against every rival", "em-http", httpc, ("em-http-uring", "em-http-epoll", "em-http-tls-uring", "em-http-tls-epoll", "em-h2-uring", "em-h2-epoll", "em-h2-tls-uring", "em-h2-tls-epoll"),
                servers + tls_servers, http_rivals, hlab)
+if any(c[0].startswith("h2") for c in httpc):  # (k) per-stream cost against the h1 keep-alive reference, same cell and round
+    print("\n### (k) em per-stream cost (h2) vs per-request cost (h1 keep-alive, h2load --h1), server us\n")
+    print("| cell | backend | h2 us/stream | h1 us/request | h2 / h1 per round, median [min–max] | > 1.2x |")
+    print("|---|---|---|---|---|---|")
+    for cl in (c for c in httpc if c[0].startswith("h2")):
+        for b in ("uring", "epoll"):
+            t = "tls-" if "tls" in cl[0] else ""
+            h2, h1 = have("us_per_rt", cl, f"em-h2-{t}{b}"), have("us_per_rt", cl, f"em-h1-{t}{b}")
+            rs = [h2[r] / h1[r] for r in h2 if r in h1]
+            if rs:
+                print(f"| {hlab(cl)} | {b} | {statistics.median(h2.values()):.2f} | {statistics.median(h1.values()):.2f} | "
+                      f"{statistics.median(rs):.2f} [{min(rs):.2f}–{max(rs):.2f}] | {'revisit' if statistics.median(rs) > 1.2 else 'no'} |")
+    print("\nh1: one request in flight per connection, so the connections hold 1/10 of the h2 in-flight requests; the comparison is of CPU per request, not of load.")
 if ref_seen := [v for v in tls_servers if v in REF]:
     print("\nReference only, not judged and not checked: " + "; ".join(f"{v} ({REF_NOTE.get(v, 'reference')})" for v in ref_seen))
 if fails:
