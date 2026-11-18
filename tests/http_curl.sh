@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
 # Smoke test: bench/em_http (the em HTTP server) against a real client, curl, on every backend in
 # BACKENDS (default "uring epoll"), then the same server over TLS (bench/em_http "tls", curl -k; needs
-# OpenSSL, as building bench/em_http does). Exits non-zero on the first failed check.
+# OpenSSL, as building bench/em_http does), then HTTP/2 against tests/h2_server (curl
+# --http2-prior-knowledge, and --http2 over TLS; needs libnghttp2, and a curl with HTTP2).
+# Exits non-zero on the first failed check.
 # usage: tests/http_curl.sh        BACKENDS=epoll tests/http_curl.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BACKENDS=${BACKENDS:-"uring epoll"}
 ARCH=$(uname -m)
 make -s bench-em-http
-SRV=build/$ARCH/rel/em_http
+BREL=$(make -s print-brel)
+SRV=$BREL/em_http
+H2=
+if make -s h2-server 2>/dev/null && curl --version | grep -q HTTP2; then H2=$BREL/h2_server
+else echo "SKIPPED: HTTP/2 cases (no libnghttp2, no OpenSSL, or curl without HTTP2)"; fi
 T=$(mktemp -d)
 pid=
 cleanup() { [[ -z $pid ]] || kill "$pid" 2>/dev/null || true; rm -rf "$T"; }
@@ -26,7 +32,7 @@ head -c 2097152 /dev/urandom > "$T/body2m"
 
 start() { # start [tls]: sets port, pid
     port=$((20000 + RANDOM % 12000)) # below the ephemeral range (32768+): no clash with a client socket
-    EM_BACKEND=$backend "$SRV" "$port" 1 ${1:-} > "$T/srv.log" 2>&1 &
+    EM_BACKEND=$backend "${bin:-$SRV}" "$port" 1 ${1:-} > "$T/srv.log" 2>&1 &
     pid=$!
     for _ in {1..50}; do
         kill -0 "$pid" 2>/dev/null || fail "server exited during startup"
@@ -89,5 +95,40 @@ for backend in $BACKENDS; do
     $c -H 'Expect: 100-continue' --data-binary @"$T/body2m" -o "$T/o" "$u/echo" || fail "https 100-continue: curl rc=$?"
     check "https Expect: 100-continue 2 MB echo identical" cmp "$T/body2m" "$T/o"
     kill "$pid"; wait "$pid" 2>/dev/null || true; pid=
+
+    [[ -n $H2 ]] || continue
+    bin=$H2
+    start
+    u=http://127.0.0.1:$port
+    c="curl -sS --max-time 20"
+    $c --http2-prior-knowledge -D "$T/h" -o "$T/o" "$u/" || fail "h2c GET: curl rc=$?"
+    [[ $(< "$T/o") == "Hello, World!" ]] && head -1 "$T/h" | grep -q "^HTTP/2 200" || fail "h2c GET: $(head -1 "$T/h")"
+    echo "ok   [$backend] h2c GET"
+    # two URLs in one run: one connection, two streams
+    $c -v --http2-prior-knowledge "$u/" "$u/4k" -o "$T/o1" -o "$T/o4k" 2> "$T/v" || fail "h2c two streams: curl rc=$?"
+    [[ $(< "$T/o1") == "Hello, World!" && $(wc -c < "$T/o4k") == 4096 ]] || fail "h2c two streams: wrong bodies"
+    grep -Eqi "re-?using existing" "$T/v" || fail "h2c two streams: connection not reused"
+    echo "ok   [$backend] h2c two streams on one connection"
+    $c -I --http2-prior-knowledge "$u/4k" > "$T/head" || fail "h2c HEAD: curl rc=$?"
+    grep -q "^HTTP/2 200" "$T/head" && grep -qi '^content-length: 4096' "$T/head" || fail "h2c HEAD: wrong headers: $(cat "$T/head")"
+    echo "ok   [$backend] h2c HEAD: content-length, no body"
+    $c --http1.1 -o "$T/o" "$u/" || fail "h1 on the h2 server: curl rc=$?"
+    [[ $(< "$T/o") == "Hello, World!" ]] || fail "h1 on the h2 server: wrong body"
+    echo "ok   [$backend] h1 on the same port"
+    kill "$pid"; wait "$pid" 2>/dev/null || true; pid=
+
+    start tls
+    u=https://localhost:$port
+    c="curl -sS -k --max-time 20 --resolve localhost:$port:127.0.0.1"
+    $c -v --http2 "$u/" "$u/4k" -o "$T/o1" -o "$T/o4k" 2> "$T/v" || fail "h2 over TLS: curl rc=$?"
+    [[ $(< "$T/o1") == "Hello, World!" && $(wc -c < "$T/o4k") == 4096 ]] || fail "h2 over TLS: wrong bodies"
+    grep -Eqi "ALPN.*(accepted|server accepted to use) h2|using HTTP/2" "$T/v" || fail "h2 over TLS: h2 not negotiated"
+    [[ $(grep -ci "SSL connection using" "$T/v") == 1 ]] || fail "h2 over TLS: handshake done twice"
+    echo "ok   [$backend] h2 over TLS (ALPN, 2 streams, 1 handshake)"
+    $c --http1.1 -o "$T/o" "$u/" || fail "h1 over TLS on the h2 server: curl rc=$?"
+    [[ $(< "$T/o") == "Hello, World!" ]] || fail "h1 over TLS on the h2 server: wrong body"
+    echo "ok   [$backend] h1 over TLS on the same port"
+    kill "$pid"; wait "$pid" 2>/dev/null || true; pid=
+    bin=
 done
 echo "http_curl: all ok ($BACKENDS)"

@@ -6,6 +6,7 @@
  * em_tls to serve, the client does em_tls_connect and reads/writes through it (rd_send / rd_recv). */
 #include <stdatomic.h>
 #include <stdio.h>
+#include <strings.h>
 #ifdef HTTP_TLS
 #include <pthread.h>
 #include "tls_util.h"
@@ -20,10 +21,23 @@ static char k4_body[4097];    /* "/4k": 4096 bytes + NUL */
 static char huge_body[16u << 20]; /* "/huge": 16 MiB of zeros, sent from here */
 static _Atomic int http_done; /* serve calls that have returned (their value: http_rc) */
 static _Atomic int http_rc;
+static _Atomic int handler_calls; /* test_handler entries */
 #ifdef HTTP_TLS
-static SSL_CTX *http_sctx, *http_cctx;
+/* http_cctx offers no ALPN (an h1 client); http_h2ctx is the same trust with ALPN "h2" (tests/h2_util.h) */
+static SSL_CTX *http_sctx, *http_cctx, *http_h2ctx;
 static pthread_once_t http_once = PTHREAD_ONCE_INIT;
-static void http_tls_init(void) { tls_test_ctx(&http_sctx, &http_cctx); }
+static void http_tls_init(void)
+{
+    tls_test_ctx(&http_sctx, &http_cctx);
+    SSL_CTX_set_alpn_select_cb(http_sctx, tls_test_alpn, NULL);
+    http_h2ctx = SSL_CTX_new(TLS_client_method());
+    assert(http_h2ctx);
+    X509_STORE *st = SSL_CTX_get_cert_store(http_cctx);
+    X509_STORE_up_ref(st);
+    SSL_CTX_set_cert_store(http_h2ctx, st);
+    SSL_CTX_set_verify(http_h2ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_alpn_protos(http_h2ctx, (const unsigned char *)"\x02h2", 3);
+}
 #endif
 
 static int test_handler(em_http_conn *c, const em_http_req *r, void *arg)
@@ -31,7 +45,21 @@ static int test_handler(em_http_conn *c, const em_http_req *r, void *arg)
     (void)arg;
     static const em_http_header ct = { "Content-Type", 12, "text/plain", 10 };
     char buf[512];
+    atomic_fetch_add(&handler_calls, 1);
     if (r->path_len == 7 && !memcmp(r->path, "/noresp", 7)) return 0;
+    if (r->path_len == 4 && !memcmp(r->path, "/ver", 4)) { /* version, and the host header if any */
+        size_t n = (size_t)snprintf(buf, sizeof buf, "v=%d host=", r->version);
+        for (size_t i = 0; i < r->nheaders; i++)
+            if (r->headers[i].name_len == 4 && !strncasecmp(r->headers[i].name, "host", 4)) {
+                memcpy(buf + n, r->headers[i].value, r->headers[i].value_len);
+                n += r->headers[i].value_len;
+            }
+        return em_http_respond(c, 200, &ct, 1, buf, n);
+    }
+    if (r->path_len == 5 && !memcmp(r->path, "/slow", 5)) { /* a handler that takes its time */
+        if (em_sleep_until(em_now() + 300000000ll)) return -ECANCELED;
+        return em_http_respond(c, 200, &ct, 1, "slow", 4);
+    }
     if (r->path_len == 4 && !memcmp(r->path, "/err", 4)) return -EIO;
     if (r->path_len == 6 && !memcmp(r->path, "/okerr", 6)) {
         em_http_respond(c, 200, &ct, 1, "okerr", 5);
@@ -143,7 +171,7 @@ static ssize_t rd_recv(rd_t *r, void *b, size_t n)
 #endif
 }
 
-static void send_str(rd_t *r, const char *s)
+static inline void send_str(rd_t *r, const char *s)
 {
     assert(rd_send(r, s, strlen(s)) == 0);
 }
@@ -184,7 +212,7 @@ static int rd_response(rd_t *r, const char **head, size_t *hlen, const char **bo
 
 /* Next response must be `status_line` (prefix of the head, e.g. "HTTP/1.1 200 ") with exactly
  * `body`; conn = value of its Connection header, NULL = no Connection header. */
-static void expect_resp(rd_t *r, const char *status_line, const char *body, const char *conn)
+static inline void expect_resp(rd_t *r, const char *status_line, const char *body, const char *conn)
 {
     const char *h = NULL, *b = NULL;
     size_t hl = 0, bl = 0;

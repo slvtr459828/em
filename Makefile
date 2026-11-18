@@ -13,7 +13,7 @@ TESTS := tests/t1_pingpong tests/t2_churn tests/t3_many tests/t4_guard tests/t5_
 # (HTTP_TLS_TESTS: the same source built with -DHTTP_TLS, see tests/http_util.h).
 HTTP_TESTS := tests/t50_http_keepalive tests/t51_http_pipeline tests/t52_http_reject \
   tests/t53_http_workers tests/t54_http_body tests/t55_http_expect tests/t56_http_timeout \
-  tests/t58_http_send_timeout tests/t59_http_linger
+  tests/t58_http_send_timeout tests/t59_http_linger tests/t62_http_h2c_noh2
 TESTS += $(HTTP_TESTS)
 
 # em_tls (libem_tls.a, tests t40..t46) needs OpenSSL. Without it libem and its tests still build;
@@ -47,6 +47,36 @@ HTTP_TLS_TESTS := $(addsuffix _tls,$(HTTP_TESTS))
 TESTS     += $(TLS_TESTS) $(HTTP_TLS_TESTS)
 endif
 
+# em_http2 (libem_http2.a, tests t60 t61 t63, h2_server) needs nghttp2 >= 1.57 (checked in src/http2.c).
+# pkg-config libnghttp2, or NGHTTP2_PREFIX=dir (include/, lib/ or lib64/), which builds into its own
+# dir like TLS_PREFIX. Without nghttp2 everything else builds and `make test` says the h2 parts were
+# skipped. Over TLS each h2 test is the same source built with -DHTTP_TLS (h2 through ALPN).
+ifneq ($(NGHTTP2_PREFIX),)
+H2_FOUND := yes
+H2_LIBDIR := $(firstword $(wildcard $(NGHTTP2_PREFIX)/lib64/libnghttp2.* $(NGHTTP2_PREFIX)/lib/libnghttp2.*))
+H2_LIBDIR := $(patsubst %/,%,$(dir $(H2_LIBDIR)))
+ifeq ($(H2_LIBDIR),)
+$(error NGHTTP2_PREFIX=$(NGHTTP2_PREFIX): no lib64/libnghttp2.* or lib/libnghttp2.*)
+endif
+H2_CF   := -I$(NGHTTP2_PREFIX)/include
+H2_LIBS := -L$(H2_LIBDIR) -Wl,-rpath,$(H2_LIBDIR) -lnghttp2
+H2_TAG  := -h2-$(notdir $(patsubst %/,%,$(NGHTTP2_PREFIX)))-$(word 1,$(shell echo '$(NGHTTP2_PREFIX)' | cksum))
+else
+H2_FOUND := $(shell $(PKG_CONFIG) --exists libnghttp2 && echo yes)
+ifeq ($(H2_FOUND),yes)
+H2_CF   := $(shell $(PKG_CONFIG) --cflags libnghttp2)
+H2_LIBS := $(shell $(PKG_CONFIG) --libs libnghttp2)
+endif
+endif
+ifeq ($(H2_FOUND),yes)
+H2_TESTS := tests/t60_h2_get tests/t61_h2_streams tests/t63_h2_continuation_flood
+TESTS += $(H2_TESTS)
+ifeq ($(TLS_FOUND),yes)
+H2_TLS_TESTS := $(addsuffix _tls,$(H2_TESTS))
+TESTS += $(H2_TLS_TESTS)
+endif
+endif
+
 # picohttpparser picks SSE4.2 at compile time. Default is portable; HTTP_SSE42=1 adds -msse4.2 to
 # http.c and picohttpparser.c on x86_64 (ignored elsewhere) and builds into its own dir.
 HTTP_CF := -Ithird_party/picohttpparser
@@ -61,13 +91,15 @@ else
 ASM := src/ctx_aarch64.S
 endif
 
-B_REL  := build/$(ARCH)/rel$(TLS_TAG)$(HTTP_TAG)
-B_ASAN := build/$(ARCH)/asan$(TLS_TAG)$(HTTP_TAG)
+B_REL  := build/$(ARCH)/rel$(TLS_TAG)$(H2_TAG)$(HTTP_TAG)
+B_ASAN := build/$(ARCH)/asan$(TLS_TAG)$(H2_TAG)$(HTTP_TAG)
 CF_REL  := -std=gnu11 -O2 -g -D_FORTIFY_SOURCE=3 $(WARN) -Iinclude
 CF_ASAN := -std=gnu11 -O1 -g $(WARN) -Iinclude -fsanitize=address,undefined -fno-omit-frame-pointer
 
-.PHONY: all test test-asan test-rust bench-em bench-em-tls bench-em-http clean
-all: $(B_REL)/libem.a $(B_REL)/libem_http.a $(if $(TLS_TESTS),$(B_REL)/libem_tls.a)
+.PHONY: all test test-asan test-rust bench-em bench-em-tls bench-em-http h2-server print-brel clean
+all: $(B_REL)/libem.a $(B_REL)/libem_http.a $(if $(TLS_TESTS),$(B_REL)/libem_tls.a) $(if $(H2_TESTS),$(B_REL)/libem_http2.a)
+print-brel:
+	@echo $(B_REL)
 
 # $(1)=build dir $(2)=cflags
 define rules
@@ -84,13 +116,24 @@ $(1)/%: tests/%.c $(1)/libem.a src/internal.h
 $(1)/picohttpparser.o: third_party/picohttpparser/picohttpparser.c third_party/picohttpparser/picohttpparser.h
 	@mkdir -p $(1)
 	$(CC) $(2) $(HTTP_CF) -c $$< -o $$@
-$(1)/http.o: src/http.c include/em_http.h include/em.h third_party/picohttpparser/picohttpparser.h
+$(1)/http.o: src/http.c src/http_priv.h include/em_http.h include/em.h third_party/picohttpparser/picohttpparser.h
 	@mkdir -p $(1)
 	$(CC) $(2) $(HTTP_CF) -c $$< -o $$@
 $(1)/libem_http.a: $(1)/http.o $(1)/picohttpparser.o
 	rm -f $$@ && ar rcs $$@ $$^
 $(addprefix $(1)/,$(notdir $(HTTP_TESTS))): $(1)/%: tests/%.c tests/http_util.h include/em_http.h $(1)/libem_http.a $(1)/libem.a
 	$(CC) $(2) $$< $(1)/libem_http.a $(1)/libem.a -luring -lm -lpthread -o $$@
+ifdef H2_TESTS
+$(1)/http2.o: src/http2.c src/http_priv.h include/em_http.h include/em.h
+	@mkdir -p $(1)
+	$(CC) $(2) $(H2_CF) -Isrc -c $$< -o $$@
+$(1)/libem_http2.a: $(1)/http2.o
+	rm -f $$@ && ar rcs $$@ $$^
+# libem_http.a references em_http2_serve weak, and a weak reference extracts nothing from an archive:
+# -u makes the link need it, so http2.o comes in (a program that wants h2 links like this)
+$(addprefix $(1)/,$(notdir $(H2_TESTS))): $(1)/%: tests/%.c tests/http_util.h tests/h2_util.h include/em_http.h $(1)/libem_http2.a $(1)/libem_http.a $(1)/libem.a
+	$(CC) $(2) $(H2_CF) -Wl,-u,em_http2_serve $$< $(1)/libem_http2.a $(1)/libem_http.a $(1)/libem.a $(H2_LIBS) -luring -lm -lpthread -o $$@
+endif
 ifdef TLS_TESTS
 $(1)/tls.o: src/tls.c src/internal.h include/em_tls.h include/em.h
 	@mkdir -p $(1)
@@ -102,6 +145,12 @@ $(addprefix $(1)/,$(notdir $(TLS_TESTS))): $(1)/%: tests/%.c tests/tls_util.h $(
 # libem_http.a only declares em_tls_recv / em_tls_send_all weak: libem_tls.a comes through the test's own references
 $(addprefix $(1)/,$(notdir $(HTTP_TLS_TESTS))): $(1)/%_tls: tests/%.c tests/http_util.h tests/tls_util.h include/em_http.h $(1)/libem_http.a $(1)/libem_tls.a $(1)/libem.a
 	$(CC) $(2) -DHTTP_TLS $(TLS_CF) $$< $(1)/libem_http.a $(1)/libem_tls.a $(1)/libem.a $(TLS_LIBS) -luring -lm -lpthread -o $$@
+ifdef H2_TESTS
+$(addprefix $(1)/,$(notdir $(H2_TLS_TESTS))): $(1)/%_tls: tests/%.c tests/http_util.h tests/h2_util.h tests/tls_util.h include/em_http.h $(1)/libem_http2.a $(1)/libem_http.a $(1)/libem_tls.a $(1)/libem.a
+	$(CC) $(2) -DHTTP_TLS $(TLS_CF) $(H2_CF) -Wl,-u,em_http2_serve $$< $(1)/libem_http2.a $(1)/libem_http.a $(1)/libem_tls.a $(1)/libem.a $(H2_LIBS) $(TLS_LIBS) -luring -lm -lpthread -o $$@
+$(1)/h2_server: tests/h2_server.c tests/tls_util.h $(1)/libem_http2.a $(1)/libem_http.a $(1)/libem_tls.a $(1)/libem.a
+	$(CC) $(2) $(TLS_CF) $(H2_CF) -Isrc -Wl,-u,em_http2_serve $$< $(1)/libem_http2.a $(1)/libem_http.a $(1)/libem_tls.a $(1)/libem.a $(H2_LIBS) $(TLS_LIBS) -luring -lm -lpthread -o $$@
+endif
 endif
 endef
 $(eval $(call rules,$(B_REL),$(CF_REL)))
@@ -113,17 +162,22 @@ BACKENDS ?= uring epoll
 run_tests = set -e; for b in $(BACKENDS); do echo "=== EM_BACKEND=$$b"; \
   for t in $(notdir $(TESTS)); do echo "== $$t"; EM_BACKEND=$$b $(1)/$$t; done; done
 
+no_h2_msg = $(if $(H2_TESTS),,@echo "SKIPPED: HTTP/2 tests t60 t61 t63 and libem_http2 (libnghttp2 not found by $(PKG_CONFIG), set NGHTTP2_PREFIX)")
 no_tls_msg = $(if $(TLS_TESTS),,@echo "SKIPPED: TLS tests t40..t46, the HTTP tests over TLS and libem_tls (openssl not found by $(PKG_CONFIG))")
 
 test: $(addprefix $(B_REL)/,$(notdir $(TESTS)))
 	$(no_tls_msg)
+	$(no_h2_msg)
 	@$(call run_tests,$(B_REL))
 	$(no_tls_msg)
+	$(no_h2_msg)
 
 test-asan: $(addprefix $(B_ASAN)/,$(notdir $(TESTS)))
 	$(no_tls_msg)
+	$(no_h2_msg)
 	@$(call run_tests,$(B_ASAN))
 	$(no_tls_msg)
+	$(no_h2_msg)
 
 # Rust crate: one em_run per test, so tests run one at a time. The panic test runs once more
 # with RUST_BACKTRACE=1 (the unwinder walks up a fiber stack to em_tramp).
@@ -144,6 +198,13 @@ $(B_REL)/em_http: bench/em_http.c tests/tls_util.h $(B_REL)/libem_http.a $(B_REL
 bench-em-tls: $(B_REL)/em_tls_echo
 $(B_REL)/em_tls_echo: bench/em_tls_echo.c tests/tls_util.h $(B_REL)/libem_tls.a $(B_REL)/libem.a
 	$(CC) $(CF_REL) $(TLS_CF) -Isrc $< $(B_REL)/libem_tls.a $(B_REL)/libem.a $(TLS_LIBS) -luring -lm -lpthread -o $@
+endif
+
+# HTTP/2 server for tests/h2spec.sh and tests/http_curl.sh (needs OpenSSL too: it has a TLS mode)
+ifdef TLS_TESTS
+ifdef H2_TESTS
+h2-server: $(B_REL)/h2_server
+endif
 endif
 
 # libFuzzer + ASan + UBSan on em_http_serve (tests/fuzz/http_fuzz.c), needs clang. Everything is

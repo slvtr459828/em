@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liburing-dev libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liburing-dev libssl-dev libnghttp2-dev
       - name: env
         # t3 runs 100k fibers = 200k VMAs; the Ubuntu default (65530) caps em at ~32k
         run: |
@@ -22,8 +22,22 @@ jobs:
           sysctl kernel.io_uring_disabled 2>/dev/null || true
       - name: openssl present (the TLS tests must run in CI, not be skipped)
         run: pkg-config --exists openssl
+      - name: nghttp2 present (the HTTP/2 tests must run in CI, not be skipped)
+        run: pkg-config --exists libnghttp2
       - run: make test
       - run: make test-asan
+      # h2spec 2.6.0, pinned by hash; its release has a linux amd64 binary only, so x86 runner only.
+      # Gating: tests/h2spec.sh fails on any failure except two it lists as KNOWN (they need state nghttp2
+      # does not keep: the peer's preface bytes before the h1/h2 split, and ids of closed streams).
+      - name: h2spec (h2c and h2 over TLS)
+        if: runner.arch == 'X64'
+        run: |
+          d=$(mktemp -d)
+          curl -fsSL -o "$d/h2spec.tgz" https://github.com/summerwind/h2spec/releases/download/v2.6.0/h2spec_linux_amd64.tar.gz
+          echo "157ee0de702e01ad40e752dbf074b366027e550c8e7504f9450da2809e279318  $d/h2spec.tgz" | sha256sum -c -
+          tar -xzf "$d/h2spec.tgz" -C "$d"
+          H2SPEC=$d/h2spec tests/h2spec.sh
+          H2SPEC=$d/h2spec tests/h2spec.sh tls
       # cargo/rustup come preinstalled on GitHub runners (x86_64 and arm64)
       - run: make test-rust
       # clang with the libFuzzer runtime and curl are on the runner images; install only if a probe fails
@@ -52,7 +66,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: deps
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liburing-dev libssl-dev cmake golang-go
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends liburing-dev libssl-dev libnghttp2-dev cmake golang-go
       - name: env
         run: sudo sysctl -w vm.max_map_count=1048576
       - uses: actions/cache@v4
@@ -61,6 +75,8 @@ jobs:
           key: tlslibs-${{ runner.arch }}-${{ hashFiles('bench/tls_libs.sh') }}
       - name: build AWS-LC
         run: BUILD_ONLY=1 LIBS=aws-lc-5.12.0 bench/tls_libs.sh
+      - name: nghttp2 present
+        run: pkg-config --exists libnghttp2
       - run: make test TLS_PREFIX=$PWD/build/$(uname -m)/tlslibs/aws-lc-5.12.0
       # ASan on em_tls and the tests; AWS-LC itself is not instrumented
       - run: make test-asan TLS_PREFIX=$PWD/build/$(uname -m)/tlslibs/aws-lc-5.12.0
@@ -78,6 +94,6 @@ jobs:
         run: |
           docker run --rm -e EM_BACKEND=auto -v "$PWD":/src -w /src ubuntu:24.04 bash -ec '
             apt-get update
-            apt-get install -y --no-install-recommends gcc make libc6-dev liburing-dev libssl-dev pkg-config
-            pkg-config --exists openssl
+            apt-get install -y --no-install-recommends gcc make libc6-dev liburing-dev libssl-dev libnghttp2-dev pkg-config
+            pkg-config --exists openssl libnghttp2
             make test BACKENDS=auto'

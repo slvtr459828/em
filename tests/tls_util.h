@@ -50,4 +50,15 @@ static inline void tls_test_ctx(SSL_CTX **srv, SSL_CTX **cli)
     X509_free(x);
     EVP_PKEY_free(key);
 }
+
+/* SSL_CTX_set_alpn_select_cb for a server that speaks both: h2 if the client offers it, else
+ * http/1.1, else no ALPN at all. */
+static inline int tls_test_alpn(SSL *s, const unsigned char **out, unsigned char *outlen,
+                                const unsigned char *in, unsigned inlen, void *arg)
+{
+    static const unsigned char srv[] = "\x02h2\x08http/1.1";
+    (void)s; (void)arg;
+    return SSL_select_next_proto((unsigned char **)out, outlen, srv, sizeof srv - 1, in, inlen) ==
+           OPENSSL_NPN_NEGOTIATED ? SSL_TLSEXT_ERR_OK : SSL_TLSEXT_ERR_NOACK;
+}
 #endif
