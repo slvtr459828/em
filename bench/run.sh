@@ -278,7 +278,8 @@ run_cell_h2() {
     local srv=$1 port=$2 mode=$3 c=$4
     local TIMEFORMAT='%U %S %R' t t0 t1 u sy wall total rps p50 p99 p999 cols tls=http url=http://127.0.0.1:$port/ log=$OUT/h2load.log
     local a=(-c "$c" -m "$H2_STREAMS" -t "$CLI_THREADS" -D "$DURATION" --log-file="$OUT/h2req.log")
-    [[ $mode != h2tls* ]] || { tls=https; url=https://127.0.0.1:$port/; }
+    # one negotiated set for every server: em prefers AES_128, nginx and h2o AES_256 (tls_info.txt check in table.py)
+    [[ $mode != h2tls* ]] || { tls=https; url=https://127.0.0.1:$port/; a+=(--tls13-ciphers=TLS_AES_256_GCM_SHA384); }
     [[ $mode != *4k ]] || url+=4k
     [[ $srv != em-h1-* ]] || a+=(--h1)
     rm -f "$OUT/h2req.log"
