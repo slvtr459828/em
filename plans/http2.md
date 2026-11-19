@@ -112,6 +112,13 @@ trailers để sang đợt sau, khi đã có số đo của đợt này.
   (HPACK, kiểm tra header, tra map stream, mem_send) và malloc của nó. Fiber mỗi stream không phải chỗ
   tốn: spawn + switch < 1%. Vì vậy không đổi kiến trúc; ngưỡng 1.2x không đạt được chừng nào còn dùng
   nghttp2 (riêng nó đã > 3x h1). h2s dùng lại qua freelist của kết nối (malloc 9 KB không vào tcache).
+- Kết quả M1 (bench 44459030422, h2load -m10, AES-256 cho mọi server): bảng (k) GET nhỏ 1.6–2.2x,
+  GET 4 KiB 0.85–1.5x. CPU em-h2 so với h2o 1.4–2x ở GET nhỏ, thắng nginx mọi ô. Freelist h2s giảm
+  3–15% µs/request trên arm (x86 đổi máy giữa hai run, không so được).
+- **Quyết định (2026-11-19):** chấp nhận tạm. Ngưỡng xét lại đổi thành: chi phí mỗi stream > 2.5x
+  mỗi request h1 cho GET nhỏ, hoặc > 1.5x cho 4 KiB (tức là phần của em, không phải nghttp2, phình ra).
+  Khoảng cách tới h2o là chi phí của nghttp2; trả bằng HPACK và framing tự viết, xếp **sau khi xong
+  các đợt HTTP** (mục KHÔNG làm bên dưới chỉ áp cho đợt 2).
 
 ## API (bản nháp, chốt khi implement)
 
@@ -198,7 +205,8 @@ OpenSSL.
 - **h2c qua `Upgrade: h2c`:** RFC 9113 đã bỏ. Chỉ hỗ trợ prior-knowledge.
 - **Priority:** cả scheme cũ của RFC 7540 lẫn RFC 9218. Gửi theo thứ tự sẵn sàng.
 - HTTP/2 client, HTTP/3.
-- Tự viết HPACK hay framing, vendor nghttp2.
+- Tự viết HPACK hay framing, vendor nghttp2. HPACK và framing tự viết đã xếp lịch: sau các đợt HTTP
+  (xem quyết định ở mục trade-off mỗi stream).
 - Helper ALPN trong libem_http.
 - Rust binding cho em_http.
 
