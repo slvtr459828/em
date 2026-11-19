@@ -107,6 +107,11 @@ trailers để sang đợt sau, khi đã có số đo của đợt này.
 - Mỗi DATA nhận được copy thêm một lần (vào buffer stream).
 - Xét lại cả hai nếu bench cho thấy chi phí mỗi stream > 1.2x chi phí mỗi request h1
   keep-alive.
+- Đo (callgrind, epoll, h2c GET / 13 B, 16 conn x 10 stream): h2 8249 Ir/request, h1 1806 Ir/request,
+  user-space. Phần của em (http2.c, fiber, ctx, scope) khoảng 600 Ir (7%); phần còn lại là nghttp2
+  (HPACK, kiểm tra header, tra map stream, mem_send) và malloc của nó. Fiber mỗi stream không phải chỗ
+  tốn: spawn + switch < 1%. Vì vậy không đổi kiến trúc; ngưỡng 1.2x không đạt được chừng nào còn dùng
+  nghttp2 (riêng nó đã > 3x h1). h2s dùng lại qua freelist của kết nối (malloc 9 KB không vào tcache).
 
 ## API (bản nháp, chốt khi implement)
 

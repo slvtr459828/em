@@ -34,6 +34,9 @@
 /* CONTINUATION frames in one header block (CVE-2024-27983/28182: nghttp2 < 1.62 does not count them,
  * and a distro may or may not have backported the fix). A block of max_header_bytes needs one. */
 #define MAX_CONT    16u
+/* Finished streams a connection keeps for reuse: an h2s is max_header_bytes + max_headers entries, too big
+ * for malloc's thread cache, so malloc/free of one per request cost more than the rest of the callbacks. */
+#define KEEP_STREAMS 16u
 
 struct h2c;
 typedef struct h2s {
@@ -64,7 +67,9 @@ struct h2c {
     em_scope *sc;
     em_fiber *wf;               /* writer, while parked */
     h2s    *streams;            /* every stream still pointed to by nghttp2 or by a fiber */
-    unsigned nstreams, maxstreams, cont;
+    h2s    *cur;                /* the request whose header block is being received (on_header: no map lookup) */
+    h2s    *spare;              /* released streams, linked by next, at most KEEP_STREAMS */
+    unsigned nstreams, nspare, maxstreams, cont;
     size_t  maxh, hcap;
     const void *pre;            /* bytes the h1 side already read */
     size_t  prelen;
@@ -97,7 +102,12 @@ static void release(h2s *st)
     if (st->prev) st->prev->next = st->next; else c->streams = st->next;
     if (st->next) st->next->prev = st->prev;
     c->nstreams--;
-    free(st);
+    if (c->cur == st) c->cur = NULL;
+    if (c->nspare < KEEP_STREAMS) {
+        st->next = c->spare;
+        c->spare = st;
+        c->nspare++;
+    } else free(st);
 }
 
 /* ---- nghttp2 callbacks: never park ---- */
@@ -129,8 +139,13 @@ static int on_begin_headers(nghttp2_session *ses, const nghttp2_frame *f, void *
         nghttp2_submit_rst_stream(ses, NGHTTP2_FLAG_NONE, f->hd.stream_id, NGHTTP2_REFUSED_STREAM);
         return 0;
     }
-    h2s *st = malloc(sizeof *st + c->maxh * sizeof *st->hv + c->hcap);
-    if (!st) return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    h2s *st = c->spare;
+    if (st) {
+        c->spare = st->next;
+        c->nspare--;
+    } else if (!(st = malloc(sizeof *st + c->maxh * sizeof *st->hv + c->hcap))) {
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
     *st = (h2s){ .h2 = 1, .done = 1, .id = f->hd.stream_id, .c = c, .next = c->streams };
     st->hv = (em_http_header *)(st + 1);
     st->hb = (char *)(st->hv + c->maxh);
@@ -138,17 +153,18 @@ static int on_begin_headers(nghttp2_session *ses, const nghttp2_frame *f, void *
     c->streams = st;
     c->nstreams++;
     nghttp2_session_set_stream_user_data(ses, st->id, st);
+    c->cur = st;
     return 0;
 }
 
 static int on_header(nghttp2_session *ses, const nghttp2_frame *f, const uint8_t *name, size_t nl,
                      const uint8_t *val, size_t vl, uint8_t flags, void *ud)
 {
-    (void)flags; (void)ud;
+    (void)flags; (void)ses;
     if (!is_request(f)) return 0;
-    h2s *st = stream_of(ses, f->hd.stream_id);
-    if (!st) return 0; /* refused */
-    struct h2c *c = st->c;
+    struct h2c *c = ud;
+    h2s *st = c->cur; /* a request's header block is contiguous, and on_begin_headers set cur for it */
+    if (!st || st->id != f->hd.stream_id) return 0; /* refused */
     const char *k = (const char *)name;
     size_t room = c->hcap - st->hn;
     if (vl > room || (name[0] != ':' && nl > room - vl)) return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE; /* RST_STREAM */
@@ -409,6 +425,7 @@ int em_http2_serve(int fd, em_tls *tls, const em_http_cfg *cfg, em_http_handler 
     if (!c->ret && drain(c) >= 0 && c->lng) em_http_linger(fd, c->buf, RBUF);
     nghttp2_session_del(c->ses);
     while (c->streams) release(c->streams);
+    while (c->spare) { h2s *st = c->spare; c->spare = st->next; free(st); }
     rc = c->ret;
     free(c);
     return rc;
